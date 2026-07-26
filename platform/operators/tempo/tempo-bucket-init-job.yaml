@@ -1,0 +1,38 @@
+# Creates the MinIO bucket Tempo uses for trace block storage.
+#
+# Not one of Phase-00's three named application buckets (onezox-artifacts,
+# onezox-traces, onezox-backups — see platform/operators/minio/). Note the
+# naming similarity to "onezox-traces" is coincidental context, not the
+# same bucket: onezox-traces is an application-level bucket for arbitrary
+# trace-related artifacts a service might upload directly; this bucket
+# (onezox-tempo-traces) is Tempo's own internal block storage, managed
+# entirely by Tempo itself. Created here alongside Tempo's own manifests,
+# same pattern as Loki's dedicated bucket in Step 22.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tempo-bucket-init
+  namespace: default
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: docker.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              until mc alias set onezox http://minio.default.svc.cluster.local:9000 \
+                    "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do
+                echo "waiting for minio..."
+                sleep 2
+              done
+              mc mb "onezox/onezox-tempo-traces" || echo "bucket already exists"
+              mc encrypt set sse-s3 "onezox/onezox-tempo-traces"

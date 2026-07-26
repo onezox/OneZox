@@ -1,0 +1,172 @@
+================================================================================
+PHASE-12 — EVALUATION & OPTIMIZATION PLATFORM   [MILESTONE M7]
+================================================================================
+Implements Architecture Part M (offline eval + regression gate, shadow traffic,
+online LLM-judge, replay engine, optimizer), Part G.3 (learned routing feed),
+Part N.5 (regression gate in CI/CD). Build stage 7.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Make quality measurable and enforceable. Build the evaluation platform: golden
+datasets + LLM-judge offline eval wired as a REGRESSION GATE in CI (no manifest
+or prompt ships if it regresses quality), shadow traffic comparison, online
+LLM-judge sampling with drift alerts, a deterministic replay engine, and an
+optimizer that proposes quality-per-dollar improvements.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Offline eval: golden datasets + LLM-judge + ground-truth tasks.
+- Regression gate in CI/CD: blocks any manifest/prompt change that regresses the
+  golden eval set (quality equivalent of unit tests).
+- Shadow traffic: mirror a % of live traffic to a new manifest; compare with no
+  user impact.
+- Online LLM-judge: sample live traces, score quality + user-feedback signals,
+  alert on drift (catches silent provider-side model changes).
+- Replay engine: re-run any stored IR (Phase-06 ir_store) against recorded
+  provider outputs for deterministic reproduction + A/B.
+- Optimizer: bandit/RL router trained on (request class -> outcome) to maximize
+  quality-per-dollar; feeds learned routing (enabled in Phase-14).
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- eval-platform service (Python): offline eval, shadow controller, online judge,
+  replay engine, optimizer.
+- Golden dataset store + management.
+- CI regression-gate integration (ci/eval-gate).
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- eval-platform (Python).
+- CI eval-gate step (blocks promotion on regression).
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal:
+- RunOfflineEval(manifest_version, dataset_id) -> scores
+- RegressionGate(manifest_version) -> {pass|fail, deltas}   (CI-invoked)
+- StartShadow(manifest_version, pct) -> shadow_id
+- CompareShadow(shadow_id) -> {baseline_vs_candidate}
+- SampleOnlineJudge() -> quality_scores + drift_alerts
+- Replay(workflow_id) -> deterministic_output               (uses ir_store)
+- OptimizerProposal() -> {request_class -> recommended_routing}
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+CockroachDB / ClickHouse (eval + analytics):
+- golden_dataset     (dataset_id PK, name, version, items_ref)
+- eval_run           (eval_id PK, manifest_version, dataset_id, scores_json, ts)
+- regression_gate    (gate_id PK, manifest_version, result, deltas_json, ts)
+- shadow_run         (shadow_id PK, manifest_version, pct, metrics_json, status)
+- online_judge_score (score_id PK, request_id, quality, drift_flag, ts)
+- optimizer_policy   (policy_id PK, request_class, routing_json, updated_at)
+Uses ir_store + recorded outputs (Phase-06) for replay; traces (Phase-13) for
+sampling substrate.
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- eval-platform on a general pool; GPU access optional for judge models (via
+  Provider Gateway or self-hosted from Phase-11).
+- ClickHouse for scores/analytics at scale (fully wired Phase-13; tables created
+  here).
+- CI runner integration for the regression gate (Part N.5).
+- Shadow traffic mirroring capability at the data-plane/edge (no user impact).
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/
+|-- eval-platform/                # PYTHON
+|   |-- offline/                  # golden sets + LLM-judge
+|   |-- shadow/                   # shadow traffic controller
+|   |-- online_judge/             # live sampling + drift alerts
+|   |-- replay/                   # deterministic reproduction (ir_store)
+|   |-- optimizer/                # bandit/RL router training
+ci/eval-gate/                     # regression gate step
+data/eval-datasets/               # golden datasets
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+CI publishes a new manifest version (Phase-04/05) -> RegressionGate:
+  RunOfflineEval on golden set -> pass/fail. Fail BLOCKS the rollout.
+Promotion path -> StartShadow -> mirror % live traffic to candidate ->
+  CompareShadow -> promote only if metrics win (ties to Argo Rollouts, Phase-05).
+Live traffic -> SampleOnlineJudge -> quality scores + drift alerts.
+Bug/repro -> Replay(workflow_id) -> deterministic output from stored IR.
+Optimizer consumes (request class -> outcome) -> proposes routing (Phase-14
+learned router consumes it).
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-05 (manifests + rollouts to gate/shadow), Phase-06 (IR +
+  recorded outputs for replay), Phase-03+ (live traffic + metering).
+- Downstream: Phase-14 enables the learned router + semantic cache behind the
+  eval gate.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Shadow traffic must not cause user-visible effects or double charges (mirrored,
+  isolated).
+- Eval datasets + scores tenant/PII-scoped as applicable; judge prompts avoid
+  leaking sensitive content across tenants.
+- Replay uses recorded outputs; no live side effects.
+- mTLS for all eval-platform calls; access to gate results restricted to CI +
+  admins (audited via Phase-05 audit_log).
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Create eval/analytics tables; load initial golden datasets.
+2. Deploy eval-platform (offline, shadow, online judge, replay, optimizer).
+3. Wire RegressionGate into CI as a required check before rollout.
+4. Enable shadow traffic mirroring at the data plane/edge.
+5. Enable online-judge sampling + drift alerts.
+6. Validate replay determinism against stored IR.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: eval scoring; gate pass/fail logic; shadow compare; judge sampling;
+  replay determinism; optimizer proposal generation.
+- Integration: a quality-regressing manifest is BLOCKED by the CI gate; a
+  quality-winning candidate passes shadow and is promoted.
+- Determinism: replay of a stored IR reproduces the recorded output exactly.
+- Drift: an induced provider-quality change raises a drift alert.
+- Safety: shadow traffic produces no user-visible effect and no double charges.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+Quality is measurable and enforced: the regression gate blocks quality drops,
+shadow + online judge + replay are operational, and the optimizer proposes
+quality-per-dollar improvements. M7.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Golden datasets + offline LLM-judge eval.
+[ ] Regression gate blocks regressing manifests/prompts in CI.
+[ ] Shadow traffic comparison with no user impact.
+[ ] Online LLM-judge sampling + drift alerts.
+[ ] Deterministic replay engine (stored IR).
+[ ] Optimizer producing routing proposals.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-13)   [GATES MILESTONE M7]
+--------------------------------------------------------------------------------
+1. A regressing change is provably blocked by the CI regression gate.
+2. Shadow + online judge + replay all operate correctly and safely.
+3. Replay reproduces stored IR outputs deterministically.
+4. Optimizer emits a usable routing proposal for Phase-14.
+================================================================================
+END OF PHASE-12.TXT
+================================================================================

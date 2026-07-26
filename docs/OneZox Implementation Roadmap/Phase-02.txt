@@ -1,0 +1,165 @@
+================================================================================
+PHASE-02 — PROVIDER GATEWAY (GO)
+================================================================================
+Implements Architecture Part G.1 (dedicated Provider Gateway replacing litellm),
+Part C (Go for massive outbound fan-out), Part H (execution plane), Part I
+(no new store; uses etcd later), Part P (provider streaming, prefix-cache-aware
+handle). Part of build stage 2 (vertical slice, part 2).
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Build the dedicated Go service that owns all provider concerns: a single fleet-
+wide view of provider rate limits, per-provider circuit breaking, request
+coalescing, and streaming backpressure. This replaces any in-process provider
+library so the fleet coordinates provider usage instead of each pod hammering
+providers blindly.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Provider adapters behind one internal contract: OpenAI, Anthropic, Google
+  (Azure/Bedrock/self-host adapters scaffolded; self-host wired in Phase-11).
+- Fleet-wide quota governor (global view of provider caps, not per-pod).
+- Per-provider circuit breakers with fallback signaling.
+- Request coalescing (dedupe identical in-flight calls).
+- Streaming passthrough with backpressure to the caller.
+- Prefix-cache handle passthrough (provider prompt-cache token surfaced to the
+  scheduler; real KV reuse arrives with self-host in Phase-11).
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- provider-gateway service (Go) with modules from Part Q:
+  adapters/{openai,anthropic,google,azure,bedrock,vllm},
+  quota/, breaker/, coalesce/, stream/, prefixcache/.
+- Global quota governor (shared counters; coordinates fan-out across pods).
+- Adapter interface: normalize provider request/response to internal contract.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- provider-gateway (Go). Replaces the Phase-00 provider-stub.
+- Called by the data plane (Phase-03) via gRPC; for this phase a test harness
+  drives it directly.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal (gRPC):
+- Invoke(worker_ref, messages, params) -> stream(delta)   [proto: provider]
+- InvokeEmbedding(model, input) -> vector                  [used from Phase-10]
+- ProviderHealth() -> {provider, state, headroom}          [feeds scheduler]
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+- No relational tables owned by this phase.
+- Provider API keys are NOT stored here as plaintext. Until Vault exists
+  (Phase-04), inject provider credentials via Kubernetes secrets mounted to the
+  gateway only. From Phase-04 the gateway receives short-lived scoped tokens.
+Redis (ephemeral):
+- provider:{name}:quota:{window}   -> shared counter (fleet-wide governor)
+- provider:{name}:breaker          -> breaker state
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- provider-gw node pool (Part N), Go service, HPA on outbound concurrency vs
+  provider caps (KEDA + global governor arrives fully in Phase-13 scaling; basic
+  HPA now).
+- Redis for shared quota + breaker state.
+- Egress network policy allowing only approved provider endpoints (default-deny
+  egress otherwise, per Part O).
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/
+|-- provider-gateway/             # GO (replaces provider-stub)
+|   |-- adapters/{openai,anthropic,google,azure,bedrock,vllm}
+|   |-- quota/                    # fleet-wide governor
+|   |-- breaker/                  # per-provider circuit breakers
+|   |-- coalesce/                 # in-flight dedupe
+|   |-- stream/                   # streaming passthrough + backpressure
+|   |-- prefixcache/              # provider prompt-cache handle passthrough
+proto/provider/                   # Invoke / InvokeEmbedding / ProviderHealth
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Caller (data plane / test harness) --gRPC Invoke--> provider-gateway:
+  coalesce check -> quota governor (Redis) -> breaker check
+  -> adapter (provider HTTP/2) -> stream deltas back with backpressure
+  -> surface prefix-cache handle + provider headroom to caller.
+Breaker open -> return typed "use fallback" signal (scheduler acts on it later).
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-00 (mesh, Redis, telemetry), Phase-01 (edge exists; not
+  strictly required to build the gateway but required for the vertical slice).
+- Contracts: proto/provider.
+- External: provider APIs (OpenAI/Anthropic/Google) + credentials via K8s secret.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Provider credentials mounted only to provider-gateway; never logged; never
+  passed to the data plane or execution workers.
+- Default-deny egress; allow-list only approved provider endpoints (Part O).
+- mTLS for all inbound gRPC.
+- From Phase-04: credentials become short-lived scoped tokens from Vault; the
+  gateway is the only consumer.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Create egress network policy for approved provider endpoints.
+2. Mount provider credentials via K8s secret to provider-gateway only.
+3. Deploy provider-gateway to provider-gw pool via Argo CD.
+4. Configure Redis keys for quota + breaker.
+5. Run the test harness to validate Invoke streaming against one provider.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: each adapter's request/response normalization; quota decrement;
+  breaker open/half-open/close; coalescing of identical calls.
+- Integration: streamed completion from one real provider end-to-end.
+- Resilience: induced provider failure trips breaker and emits fallback signal;
+  quota exhaustion throttles rather than errors.
+- Concurrency: high parallel fan-out respects the fleet-wide cap (not per-pod).
+- Security: credentials never appear in logs/traces; egress to a non-approved
+  host is blocked.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+A dedicated provider layer that streams from real providers, coordinates rate
+limits fleet-wide, breaks and signals fallback on provider failure, coalesces
+duplicate calls, and surfaces prefix-cache handles — all behind one internal
+contract.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] OpenAI/Anthropic/Google adapters normalized behind one contract.
+[ ] Fleet-wide quota governor enforced via shared Redis counters.
+[ ] Circuit breakers with fallback signaling.
+[ ] Request coalescing.
+[ ] Streaming passthrough with backpressure.
+[ ] Prefix-cache handle surfaced.
+[ ] Credentials isolated to the gateway; egress allow-list enforced.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-03)
+--------------------------------------------------------------------------------
+1. Streamed completion from a real provider via Invoke, end-to-end, metered.
+2. Breaker + fallback signal + fleet-wide quota all demonstrated under fault
+   injection.
+3. Credential isolation and egress allow-list verified.
+4. Gateway telemetry (per-provider latency, breaker state, headroom) visible.
+================================================================================
+END OF PHASE-02.TXT
+================================================================================

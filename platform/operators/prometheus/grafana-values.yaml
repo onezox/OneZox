@@ -1,0 +1,57 @@
+# Grafana — Helm values for local Phase-00 development.
+# Chart: grafana/grafana, version 10.5.15 (app v12.3.1).
+#
+# Admin password stored as a plain value here per Phase-00's explicit
+# allowance: "Secrets via Kubernetes secrets now" (Vault arrives Phase-04).
+# Dev-only placeholder, not a real credential.
+adminUser: admin
+adminPassword: onezox-local-dev-only
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# No persistence: dashboards aren't created this phase, and this is a
+# throwaway local cell — losing Grafana's own state on pod restart is an
+# acceptable trade-off here (see chat explanation for the production
+# difference).
+persistence:
+  enabled: false
+
+# Auto-provisions Prometheus, Loki, and Tempo as Grafana data sources at
+# install time, rather than requiring a manual UI step — matches this whole
+# plan's reproducibility standard (Part N: destroy + re-apply yields an
+# identical cell). Service names match each chart's own convention:
+# Prometheus uses "<release-name>-server" (prometheus-community/prometheus);
+# Loki's plain service (not loki-gateway) works directly since
+# auth_enabled is false (Step 22); Tempo's service name equals its release
+# name (Step 23), query port 3200.
+#
+# Not wired here: trace-to-logs/metrics correlation (tracesToLogsV2 etc.)
+# -- that needs explicit, stable uid values pinned on each datasource so
+# Tempo can reference Loki/Prometheus by UID, which means touching the
+# already-verified Loki/Prometheus config too. Out of scope for "add Tempo
+# as a data source" -- left as a clean follow-up rather than half-wired.
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        url: http://prometheus-server.default.svc.cluster.local
+        access: proxy
+        isDefault: true
+      - name: Loki
+        type: loki
+        url: http://loki.default.svc.cluster.local:3100
+        access: proxy
+        isDefault: false
+      - name: Tempo
+        type: tempo
+        url: http://tempo.default.svc.cluster.local:3200
+        access: proxy
+        isDefault: false

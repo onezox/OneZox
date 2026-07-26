@@ -1,0 +1,196 @@
+================================================================================
+PHASE-09 — MEMORY SERVICE (PYTHON): POSTGRES + QDRANT   [MILESTONE M4]
+================================================================================
+Implements Architecture Part F.5 (dedicated Memory Service owning the three
+tiers), Part I (Postgres text-of-truth, Qdrant embeddings), Part B (execution-
+plane service), Part N.4 (memory DR), Part O (tenant isolation). Build stage 5,
+part 2. Completes M4 (stateful domains owned by dedicated services).
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Stand up the dedicated Memory Service as the single owner of AI memory. The AI
+engine stays completely stateless: it asks the Memory Service for RELEVANT
+memories only, and submits new memories ASYNCHRONOUSLY. PostgreSQL is the source
+of truth for memory text; Qdrant stores embeddings. The service owns storage,
+retrieval, embeddings, the vector DB, indexing, updates, deletion, decay, and
+tenant isolation. The three-tier memory model (working/episodic/semantic) is
+owned here.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Memory retrieval: tenant-filtered hybrid search (dense + graph) returning a
+  relevant slice, never the whole store.
+- Asynchronous memory writes: engine submits new memories over NATS; embedding +
+  indexing happen off the request hot path.
+- Embeddings: pluggable via the Provider Gateway (frontier embedding API or
+  self-hosted from Phase-11).
+- Three-tier model (Part F.5), owned by the service:
+  * WORKING: in-request/ephemeral (Redis/in-proc) — the only tier the engine
+    holds transiently DURING a request; evaporates at request end.
+  * EPISODIC: per-session/per-user (FoundationDB + vector index).
+  * SEMANTIC: long-term/cross-session (Postgres text-of-truth + Qdrant + graph).
+- Promotion: explicit, summarized (never raw dumping) to prevent context rot.
+- Updates, deletion (GDPR-aligned), and decay (TTL + relevance) owned here.
+- Tenant isolation as a single chokepoint at the data-access boundary.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- memory-service (Python) with modules (Part Q):
+  retrieve/, write/, update/, delete/, decay/, embeddings/, tenant_isolation/,
+  stores/{postgres_text_of_truth, qdrant_embeddings, graph}.
+- Promotion/consolidation pipeline (working -> episodic -> semantic).
+- Async ingestion consumer (NATS) for memory writes.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- memory-service (Python). New execution-plane service, sibling to Chat Service.
+- Qdrant cluster (deployed via operator) for embeddings.
+- Dedicated Postgres store (memory text-of-truth) — logically the relational
+  store from Part I used by the Memory Service.
+- (Episodic tier uses FoundationDB from Phase-06; graph store may use Neo4j/
+  Memgraph per Part I when relationships are needed.)
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Memory Service (gRPC + async):
+- RetrieveMemories(identity, query, k) -> relevant_memories   (tenant-filtered)
+- SubmitMemory(identity, memory)  [ASYNC via NATS]            (engine write path)
+- UpdateMemory(identity, memory_id, patch) -> status
+- DeleteMemory(identity, memory_id | scope) -> status         (GDPR-aligned)
+- (internal) PromoteMemory(session) / DecayScan()             (background)
+identity = org_id/user_id/project_id (+ session for episodic).
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+PostgreSQL (SEMANTIC source of truth for memory text):
+- memory_text     (memory_id PK, org_id, user_id, project_id, text, kind,
+                   created_at, updated_at, decay_score, ttl_at)
+- memory_link     (memory_id, related_memory_id, relation)   -- optional graph mirror
+Qdrant (embeddings):
+- collection: memory_embeddings  (vector + payload{memory_id, org_id, user_id,
+                   project_id, kind}) — payload filtered by tenant on every query
+FoundationDB (EPISODIC per-session/per-user):
+- episodic_memory (session_id, memory_id -> summary + vector ref)
+Redis (WORKING, ephemeral):
+- workingmem is request-scoped (already used by data plane); memory-service does
+  NOT persist working memory — it evaporates at request end.
+Graph store (optional, Part I) for relationship links when needed.
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- memory-service node pool (Part N): Python service, KEDA/HPA on
+  retrieve/write queue depth.
+- Qdrant cluster via operator (payload filtering + quantization per Part F.3).
+- Postgres (memory text-of-truth); FoundationDB (episodic) from Phase-06.
+- NATS JetStream for async memory writes (fully wired in Phase-13; the write
+  subject is created here).
+- Embedding compute via Provider Gateway (self-hosted embedding lands Phase-11).
+- Cilium mTLS to the AI engine.
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/
+|-- memory-service/               # PYTHON — single owner of AI memory
+|   |-- retrieve/                 # hybrid search, tenant-filtered
+|   |-- write/                    # embed + index (async consumer)
+|   |-- update/
+|   |-- delete/                   # GDPR-aligned
+|   |-- decay/                    # TTL + relevance decay
+|   |-- embeddings/               # pluggable via Provider Gateway
+|   |-- tenant_isolation/         # single chokepoint filter
+|   |-- stores/{postgres_text_of_truth, qdrant_embeddings, graph}
+platform/operators/qdrant/        # Qdrant operator manifests
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+AI Engine --RetrieveMemories(identity, query, k)--> memory-service:
+  tenant_isolation filter -> hybrid search (Qdrant dense + graph) ->
+  fetch text from Postgres -> return RELEVANT slice (not everything).
+AI Engine --SubmitMemory(identity, memory) [NATS async]--> memory-service:
+  write consumer -> embed (Provider Gateway) -> index in Qdrant + store text in
+  Postgres -> promotion pipeline may consolidate working->episodic->semantic.
+Background: DecayScan applies TTL + relevance decay; PromoteMemory summarizes.
+Engine remains stateless: it holds only working memory during a request.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-03 (stateless engine that calls the service), Phase-04 (Vault
+  for any credentials; manifests/pricing for embedding worker refs), Phase-06
+  (FoundationDB for episodic).
+- NATS async fully operational in Phase-13; the async write path is defined here
+  and can run on JetStream once available (interim: durable queue).
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Tenant isolation is a SINGLE CHOKEPOINT: every read/write filtered by
+  org_id/user_id/project_id at the data-access boundary (Part F.5 / Part O);
+  cross-tenant leakage is a P0 boundary.
+- Deletion is GDPR-aligned (removes text-of-truth + embeddings + episodic refs).
+- Embeddings carry tenant payload; queries always filter by tenant.
+- Forgetting by design: TTL + relevance decay + explicit user delete.
+- mTLS for engine calls; no provider credentials in the service (uses Provider
+  Gateway for embeddings).
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Deploy Qdrant via operator; create memory_embeddings collection.
+2. Create memory_text/memory_link (Postgres) + episodic_memory (FDB).
+3. Deploy memory-service; wire embeddings via Provider Gateway.
+4. Create the NATS subject for async SubmitMemory (or interim durable queue).
+5. Point the AI engine at RetrieveMemories (read) + SubmitMemory (async write).
+6. Enable promotion + decay background jobs.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: retrieval filtering; embedding+index; update; delete; decay scoring;
+  promotion summarization.
+- Integration: engine retrieves a relevant slice; engine submits a memory async
+  and it becomes retrievable after indexing.
+- Statelessness: engine holds no durable memory; killing an engine pod loses no
+  memory (all durable state in the service).
+- Async: memory write does NOT block answer generation (off hot path).
+- Isolation: cross-tenant retrieval is impossible (chokepoint enforced).
+- Forgetting: TTL/decay removes stale memories; explicit delete removes text +
+  embedding + episodic ref.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+AI memory is owned end-to-end by the Memory Service (Postgres text-of-truth +
+Qdrant embeddings), with the three-tier model, async writes, tenant isolation,
+and decay. The engine stays stateless and only retrieves relevant slices — M4.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Memory Service is the single owner of AI memory.
+[ ] Postgres = memory text source of truth; Qdrant = embeddings.
+[ ] Three tiers (working/episodic/semantic) owned by the service.
+[ ] Engine retrieves RELEVANT slices only; submits writes ASYNC.
+[ ] Promotion is explicit + summarized; decay + GDPR delete implemented.
+[ ] Tenant isolation enforced as a single chokepoint.
+[ ] Engine remains fully stateless.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-10)   [GATES MILESTONE M4]
+--------------------------------------------------------------------------------
+1. Engine retrieves relevant memories and submits new ones asynchronously.
+2. Async write path never blocks the streamed response.
+3. Statelessness proven: engine pod loss loses no memory.
+4. Tenant-isolation chokepoint + GDPR deletion + decay verified.
+================================================================================
+END OF PHASE-09.TXT
+================================================================================

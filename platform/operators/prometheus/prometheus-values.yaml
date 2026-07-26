@@ -1,0 +1,41 @@
+# Prometheus — Helm values for local Phase-00 development.
+# Chart: prometheus-community/prometheus, version 29.19.0 (server v3.13.1).
+#
+# Standalone chart, not kube-prometheus-stack: disabling alertmanager,
+# kube-state-metrics, node-exporter, and pushgateway, none of which Phase-00
+# calls for (no alerting, no cluster-node monitoring this phase). Keeps the
+# footprint scoped to exactly what Part L asks for — a metrics backend the
+# OTel Collector can feed and Grafana can query.
+
+alertmanager:
+  enabled: false
+
+kube-state-metrics:
+  enabled: false
+
+prometheus-node-exporter:
+  enabled: false
+
+prometheus-pushgateway:
+  enabled: false
+
+server:
+  persistentVolume:
+    enabled: true
+    size: 4Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Scrapes the OTel Collector's `prometheus` exporter (Step 20,
+# platform/operators/otel/values.yaml) — the pull side of the push/pull
+# handoff: Collector exposes /metrics, Prometheus scrapes it here.
+extraScrapeConfigs: |
+  - job_name: 'otel-collector'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['otel-collector-opentelemetry-collector.default.svc.cluster.local:8889']

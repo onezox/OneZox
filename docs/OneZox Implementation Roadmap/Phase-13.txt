@@ -1,0 +1,178 @@
+================================================================================
+PHASE-13 — OBSERVABILITY, COST CENTER, EVENT BUS, QUEUES, ANALYTICS
+================================================================================
+Implements Architecture Part L (observability as infrastructure), Part J (event
+bus Redpanda + queues NATS JetStream), Part I (ClickHouse analytics), Part S
+(cost/perf consolidation), Part R (trace/cost panels). MILESTONE M8. Build
+stage 8.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Fully wire observability and the data movement backbone: per-node cost tracing,
+a durable event bus (Redpanda) for usage/billing/analytics/audit/eval sampling,
+fast fan-out queues (NATS JetStream) for ingest/embed/summarize/memory-write
+jobs, and ClickHouse analytics powering admin dashboards. Every span carries the
+AI-specific cost/quality fields end-to-end.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- AI-specific observability (Part L): every span carries tokens_in, tokens_out,
+  orchestration_tokens, usd_cost, provider, model_version, cache_hit, node_id,
+  eval_score.
+- Cost traceable to the node (which agent/tool spent the money).
+- Event bus (Redpanda, Kafka API): durable, replayable streams for usage,
+  billing, analytics, audit, eval sampling (at-least-once, long retention).
+- Work queues (NATS JetStream): fast fan-out for ingest/embed/summarize +
+  Memory Service async writes (Phase-09) + async ingestion (Phase-10).
+- ClickHouse analytics: usage/cost/latency/token analytics at billions of rows;
+  near-real-time admin dashboards + batch analytics.
+- Trace explorer + cost center wired into the admin panel (Part R).
+- Semantic monitoring (quality regression via online-judge sampling from P12).
+- Golden signals per SLO (latency p50/p95/p99 per model, error rate per provider,
+  saturation, cost drift, quality drift).
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- OTel pipeline finalized across ALL services (edge, data plane, provider gw,
+  memory, chat, sandbox, GPU, eval).
+- Redpanda cluster (event bus) + topic schemas.
+- NATS JetStream (work queues) subjects finalized (memory-write, ingest, embed,
+  summarize).
+- ClickHouse cluster + ingestion from the event bus.
+- Admin panel trace explorer + cost center panels (Part R) populated.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- Redpanda (event bus).
+- NATS JetStream (queues) — promoted to fully-wired from earlier interim usage.
+- ClickHouse (analytics).
+- Trace explorer + cost center (admin panel modules).
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal / streaming:
+- Event bus topics: usage.events, billing.events, audit.events, eval.samples.
+- Queue subjects: memory.write, ingest.jobs, embed.jobs, summarize.jobs.
+Admin (extends Phase-05 admin-api):
+- getTraceExplorer(filters) -> traces (with cost/quality fields)
+- getCostCenter(org_id, range) -> cost breakdown by node/agent/tool/model
+- getGoldenSignals(model_ref) -> {latency, error_rate, saturation, cost/quality drift}
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+ClickHouse:
+- usage_analytics    (org_id, request_id, tokens_in, tokens_out, orch_tokens,
+                      usd_cost, model_version, provider, cache_hit, node_id, ts)
+- latency_analytics  (request_id, stage, latency_ms, model_ref, ts)
+- cost_center        (org_id, node_id, agent_id, tool_ref, usd_cost, ts)
+Redpanda:
+- topics: usage.events, billing.events, audit.events, eval.samples (retention +
+  partitions per Part J)
+NATS JetStream:
+- streams/subjects: memory.write, ingest.jobs, embed.jobs, summarize.jobs
+(Metrics remain in Prometheus + Thanos/Mimir from Phase-00; traces in the
+tracing backend; long-term aggregation via Thanos/Mimir.)
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- Redpanda cluster via operator (Part J).
+- NATS JetStream cluster (Part J).
+- ClickHouse cluster via operator (Part I).
+- Prometheus + Thanos/Mimir already from Phase-00; ensure long-retention +
+  multi-region aggregation config.
+- OTel Collector scaled for full-fleet span volume.
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+platform/operators/{redpanda,clickhouse,nats}/   # operators
+admin-panel/app/{traces,cost}/                    # trace explorer + cost center
+libs/otel/                                        # finalized span schema (cost/quality)
+data/dbt/                                         # ClickHouse models/marts
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+All services -> OTel Collector -> tracing/metrics backend (spans carry cost +
+  quality fields).
+Metering + events -> Redpanda topics (usage/billing/audit/eval) -> ClickHouse
+  ingestion -> admin dashboards (near real time) + batch analytics.
+Async jobs -> NATS JetStream subjects: memory.write (Phase-09), ingest.jobs +
+  embed.jobs + summarize.jobs (Phase-10) -> consumers (ingest-workers, memory
+  write consumer).
+Admin panel -> admin-api -> ClickHouse/traces for trace explorer + cost center +
+  golden signals.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phases 03-12 (all services must emit spans + events; async subjects
+  used by Phase-09/10 are finalized here), Phase-05 (admin-api to extend).
+- Downstream: Phase-14 relies on this observability for DR/chaos validation.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Event streams + analytics tenant-scoped; no cross-tenant cost/trace exposure.
+- audit.events immutable + long-retention (compliance).
+- Access to trace explorer + cost center restricted by admin RBAC (Phase-05),
+  actions audited.
+- mTLS for bus/queue/analytics traffic; PII minimized in analytics rows.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Deploy Redpanda, NATS JetStream, ClickHouse via operators.
+2. Finalize OTel span schema (cost/quality fields) across all services.
+3. Create event topics + queue subjects; migrate Phase-09/10 async paths onto
+   JetStream.
+4. Wire ClickHouse ingestion from the event bus; build dbt models.
+5. Populate admin trace explorer + cost center + golden-signal panels.
+6. Validate end-to-end cost-to-node attribution.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: span field completeness; topic/subject config; ClickHouse ingestion;
+  dashboard queries.
+- Integration: a request's cost is attributable to the exact node/agent/tool in
+  the cost center; usage flows request -> Redpanda -> ClickHouse -> dashboard.
+- Async: memory.write + ingest jobs flow over JetStream with at-least-once
+  delivery; consumers idempotent.
+- Golden signals: latency/error/saturation/cost/quality drift render per model.
+- Isolation: no cross-tenant cost/trace leakage.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+Full observability with per-node cost attribution, a durable event bus, fast
+fan-out queues, and ClickHouse-powered dashboards — every span carries cost and
+quality. M8.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Spans carry tokens/cost/provider/model_version/cache_hit/node_id/eval_score.
+[ ] Cost traceable to node/agent/tool (cost center).
+[ ] Redpanda event bus (usage/billing/audit/eval) operational.
+[ ] NATS JetStream queues (memory.write/ingest/embed/summarize) operational.
+[ ] ClickHouse analytics + near-real-time dashboards.
+[ ] Trace explorer + golden signals in admin panel.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-14)   [GATES MILESTONE M8]
+--------------------------------------------------------------------------------
+1. A request's cost is attributable to the exact node/agent/tool.
+2. Event bus + queues carry usage/async jobs reliably (at-least-once, idempotent).
+3. Dashboards + golden signals render per model in near real time.
+4. No cross-tenant cost/trace exposure.
+================================================================================
+END OF PHASE-13.TXT
+================================================================================

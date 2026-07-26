@@ -1,0 +1,169 @@
+================================================================================
+PHASE-04 — CONTROL PLANE: REGISTRY, MANIFESTS, ETCD, VAULT
+================================================================================
+Implements Architecture Part B (control plane), Part G.2 (model registry +
+versioned immutable manifests), Part I (etcd for config/service discovery,
+Vault for secrets), Part A (live-DB-row -> versioned manifest redesign). Build
+stage 3, part 1.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Replace static/inline model config with a real control plane: a model registry
+whose entries are signed, versioned, immutable manifests distributed via etcd
+and cached at the edge, plus HashiCorp Vault as the single home for provider
+keys (issuing short-lived scoped tokens to the Provider Gateway). Mutating a
+live model config is eliminated as an outage class.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Model registry: virtual models (e.g. onezox, onezox-ultra) defined as manifests.
+- Versioned immutable manifests: each change is a new signed version, never an
+  in-place edit.
+- Config distribution via etcd watch/stream; edge + data plane cache manifests.
+- Vault integration: provider keys stored in Vault; Provider Gateway receives
+  short-lived scoped tokens instead of static secrets.
+- Policy + pricing config surfaced from the control plane (consumed by scheduler
+  cost-gating in Phase-06 and billing).
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- control-plane service with modules (Part Q):
+  registry/, rollout/ (rollout controller wiring; canary UX in Phase-05),
+  quota/, policy/, pricing/.
+- Vault integration layer (dynamic short-lived credentials).
+- etcd-backed manifest store + watch distribution + edge cache.
+- Manifest signing (Sigstore) + verification on load.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- control-plane (off hot path).
+- Vault (provisioned + integrated).
+- etcd (deployed for config/service discovery).
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal (gRPC / control):
+- RegisterModelManifest(manifest) -> version_id
+- GetModelManifest(model_ref, version?) -> manifest
+- ListModels() -> [model_ref, active_version]      (now backs GET /v1/models)
+- IssueProviderToken(scope) -> short_lived_token   (Vault-backed; gateway only)
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+CockroachDB (control-plane owned):
+- model_manifest      (version_id PK, model_ref, spec_json, signature,
+                       created_by, created_at, status)          -- immutable rows
+- model_active        (model_ref PK, active_version_id, updated_at)
+- policy              (policy_id PK, org_id, rules_json, updated_at)
+- pricing             (pricing_id PK, model_ref, unit_costs_json, effective_at)
+etcd:
+- /onezox/manifests/{model_ref}/{version_id}    -> distributed manifest
+- /onezox/active/{model_ref}                     -> active version pointer
+Vault:
+- secret/provider/{name}                         -> provider credentials
+- dynamic scoped token issuance for provider-gateway
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- etcd cluster (Part I) via operator.
+- HashiCorp Vault (HA) with audit logging.
+- control-plane runs on a general/control pool (off the hot path).
+- Sigstore signing keys managed for manifest signing.
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/
+|-- control-plane/
+|   |-- registry/                 # model manifests CRUD (create = new version)
+|   |-- rollout/                  # rollout controller wiring (canary UX in P05)
+|   |-- quota/                    # tenant/model quota config
+|   |-- policy/                   # policy rules
+|   |-- pricing/                  # per-model unit costs
+platform/operators/etcd/          # etcd operator manifests
+platform/                         # Vault deploy + policies
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Admin/CI --RegisterModelManifest--> control-plane:
+  validate + sign (Sigstore) -> write model_manifest (immutable) ->
+  set model_active -> publish to etcd -> edge + data plane update cached manifest.
+Provider Gateway --IssueProviderToken--> Vault (via control-plane policy) ->
+  short-lived scoped token (no static provider secret in the fleet).
+GET /v1/models now served from ListModels() (registry), not a static list.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-00 (Cockroach, mesh, Sigstore in CI), Phase-03 (a running
+  slice whose static model ref is replaced by a manifest).
+- Consumers updated: edge-gateway (Phase-01) caches manifests; provider-gateway
+  (Phase-02) switches to Vault tokens.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Provider keys never leave the control plane boundary; Provider Gateway gets
+  only short-lived scoped tokens (Part O).
+- Manifests are signed; execution/data planes verify signatures before use.
+- Vault audit logging on; least-privilege Vault policies per consumer.
+- etcd access restricted; manifests immutable (new version, never mutate).
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Deploy etcd + Vault via operators; enable Vault audit log.
+2. Apply model_manifest/model_active/policy/pricing migrations.
+3. Deploy control-plane; load provider keys into Vault.
+4. Switch provider-gateway from K8s secret to Vault short-lived tokens.
+5. Register onezox + onezox-ultra manifests; publish to etcd.
+6. Point edge GET /v1/models and data-plane model binding at the registry.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: manifest versioning (new version per change), signing/verification,
+  active-pointer update, pricing/policy reads.
+- Integration: data plane resolves a model via manifest and serves a request;
+  provider-gateway authenticates using a Vault-issued token.
+- Immutability: attempt to mutate an existing manifest version is rejected.
+- Security: unsigned/tampered manifest is refused; provider key never present
+  outside control plane/Vault.
+- Distribution: manifest publish propagates to edge cache within SLA.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+Virtual models exist as signed, versioned, immutable manifests distributed via
+etcd; the Provider Gateway runs on short-lived Vault tokens. The slice from
+Phase-03 now serves via the registry, not static config.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Model registry with immutable versioned manifests.
+[ ] Manifest signing + verification on load.
+[ ] etcd distribution + edge/data-plane manifest cache.
+[ ] Vault holds provider keys; gateway uses short-lived scoped tokens.
+[ ] policy + pricing config available to consumers.
+[ ] GET /v1/models served from the registry.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-05)
+--------------------------------------------------------------------------------
+1. A request is served using a registry manifest (no static model config left).
+2. Provider Gateway authenticates exclusively via Vault-issued short-lived
+   tokens.
+3. Manifest immutability + signature verification enforced and tested.
+4. Manifest publish -> edge cache propagation verified.
+================================================================================
+END OF PHASE-04.TXT
+================================================================================

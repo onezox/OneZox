@@ -1,0 +1,194 @@
+================================================================================
+PHASE-10 — CONTEXT + HYBRID RETRIEVAL + GPU RERANK + CACHE TIERS   [MILESTONE M5]
+================================================================================
+Implements Architecture Part F.1 (context management), Part F.2 (hybrid
+retrieval + rerank + knapsack packing), Part F.3 (Qdrant/pgvector), Part F.4
+(embeddings), Part F.6 (7 cache tiers), Part I (OpenSearch lexical). Completes
+build stage 5. MILESTONE M5 (quality layer).
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Build the context and retrieval subsystems that determine answer quality: async
+ingestion off the hot path, typed parsing, semantic-boundary chunking, a hybrid
+multi-channel retriever (lexical + dense + structural + recency + tool-aware), a
+GPU cross-encoder reranker, knapsack budget packing, contextual retrieval, and
+the seven cache tiers. Feeds the engine and works alongside the Memory Service.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Context management (Part F.1): ingest (stream, MIME detect) -> parse (typed
+  per source: code AST/import graph, PDF layout, DB schema) -> chunk (semantic
+  boundary, never split a symbol) -> dedupe (hash exact + MinHash near) ->
+  multi-granularity store (L0 corpus manifest, L1 file summaries, L2 section
+  summaries, L3 raw chunks, L4 spans).
+- Async ingestion off the hot path: large corpora go to execution-plane ingest
+  workers via the work queue; request waits on ready-signal or streams partials.
+- Hybrid retrieval (Part F.2): BM25 (OpenSearch) + dense (vector DB) + structural
+  (code/call/import graph) + recency + tool-aware -> candidate union.
+- GPU cross-encoder rerank + MMR diversity (the biggest quality lever).
+- Knapsack budget packing: maximize relevance under token budget with required-
+  chunk + diversity constraints.
+- Contextual retrieval: prepend an LLM-generated context blurb to each chunk
+  before embedding (done once at index time, cached).
+- Seven cache tiers (Part F.6): raw-content, parse, embedding, summary,
+  retrieval, prefix/prompt, semantic response.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- data-plane modules (Part Q): context/{ingest,parse,chunk,dedupe,store},
+  retrieval/{lexical,dense,structural,rerank,pack}.
+- Ingest worker pool (execution plane) consuming the work queue.
+- Cache layer implementing the seven tiers with documented keys (Part F.6).
+- Contextual-retrieval indexing step (LLM blurb per chunk, cached).
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- ingest-workers (execution plane) for async corpus ingestion.
+- OpenSearch cluster (lexical/BM25) deployed via operator.
+- GPU rerank worker is provisioned here; the embed/rerank GPU service is fully
+  hardened in Phase-11 (this phase may use a frontier reranker via Provider
+  Gateway until self-hosted GPU lands).
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal:
+- Ingest(corpus_ref) -> {ingest_id, ready_signal}       (async)
+- Retrieve(query, budget, filters) -> packed_context     (hybrid + rerank + pack)
+- Rerank(query, candidates) -> ranked                    (GPU cross-encoder)
+Consumes: Provider Gateway InvokeEmbedding (Phase-02) for dense vectors.
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+Vector DB (Part F.3):
+- Start on pgvector (one less system) OR Qdrant collection corpus_embeddings
+  (vector + payload{tenant, corpus_id, granularity}) — payload filtered by
+  tenant + corpus on every query. (Qdrant already available from Phase-09.)
+OpenSearch (lexical):
+- index: corpus_lexical  (BM25 over chunks + metadata)
+Object store / multi-granularity store:
+- L0 corpus_manifest, L1 file_summaries, L2 section_summaries, L3 raw_chunks,
+  L4 spans  (as objects/records keyed by corpus_id + granularity)
+Cache tiers (Part F.6) — keys:
+- raw-content: content hash
+- parse: hash + parser version
+- embedding: chunk hash + model version
+- summary: chunk hash + summarizer + prompt version
+- retrieval: query fingerprint + corpus hash
+- prefix/prompt: model + provider + prefix hash
+- semantic response: request embedding similarity
+(Cache storage: Redis/Dragonfly for hot tiers; object store for large artifacts.)
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- gpu-embed-rerank node pool (Part N) for the cross-encoder reranker.
+- OpenSearch cluster via operator.
+- Vector DB (pgvector to start, Qdrant at scale — available from Phase-09).
+- Work queue for async ingestion (NATS JetStream; fully wired Phase-13, subject
+  created here; interim durable queue acceptable).
+- Redis/Dragonfly for hot cache tiers; object store for large cache artifacts.
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/data-plane/
+|-- context/{ingest,parse,chunk,dedupe,store}
+|-- retrieval/{lexical,dense,structural,rerank,pack}
+services/
+|-- embed-rerank/                 # GPU embedding + cross-encoder (hardened P11)
+|-- ingest-workers/               # async corpus ingestion (execution plane)
+platform/operators/opensearch/    # OpenSearch operator manifests
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Large corpus -> Ingest(corpus_ref) -> work queue -> ingest-workers:
+  parse (typed) -> chunk (semantic boundary) -> dedupe -> contextual blurb (LLM,
+  cached) -> embed (Provider Gateway) -> index (vector DB + OpenSearch) ->
+  multi-granularity store -> ready_signal.
+Request -> Retrieve(query, budget, filters):
+  lexical + dense + structural + recency + tool-aware -> candidate union ->
+  GPU cross-encoder rerank + MMR -> knapsack pack under token budget ->
+  packed_context -> planner/scheduler (Phase-06/07).
+Caches consulted at each stage (raw/parse/embedding/summary/retrieval/prefix/
+semantic-response) to skip repeated work.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-09 (Memory Service + Qdrant available; retrieval complements
+  memory), Phase-06/07 (planner/scheduler consume packed context), Phase-02
+  (embeddings via Provider Gateway).
+- Downstream: Phase-11 hardens the GPU embed/rerank service and self-hosted
+  embedding.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- All retrieval filtered by tenant + corpus (payload filters); no cross-tenant
+  candidates (Part O).
+- DB parsing uses schema introspection + stats, NEVER raw rows (Part F.1).
+- Cache keys include tenant/corpus scoping to prevent cross-tenant cache hits.
+- mTLS across ingest/retrieval/rerank calls.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Deploy OpenSearch; create corpus_lexical index.
+2. Create vector collection (pgvector or Qdrant corpus_embeddings).
+3. Deploy ingest-workers + context pipeline; wire the work queue.
+4. Deploy retrieval pipeline + GPU rerank worker.
+5. Implement the seven cache tiers with the documented keys.
+6. Enable contextual-retrieval indexing (LLM blurb per chunk, cached).
+7. Wire Retrieve() into the planner/scheduler context step.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: parse per source type; semantic-boundary chunking (no split symbols);
+  dedupe (exact + near); knapsack packing under budget; each cache tier hit/miss.
+- Integration: ingest a large corpus async; retrieve with hybrid channels; GPU
+  rerank reorders candidates; packed context respects the token budget.
+- Quality: cross-encoder rerank measurably improves top-k relevance vs bi-encoder
+  only; contextual retrieval reduces retrieval failures.
+- Hot path: large corpus ingestion does NOT block the request (async, ready-
+  signal / partial streaming).
+- Isolation: retrieval never returns another tenant's chunks; no cross-tenant
+  cache hits.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+A production retrieval stack: async ingestion, hybrid multi-channel retrieval,
+GPU cross-encoder rerank, knapsack packing, contextual retrieval, and seven
+cache tiers — the layer that drives real answer quality. M5.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Async ingestion off the hot path (ingest workers + queue).
+[ ] Typed parse + semantic-boundary chunk + dedupe + multi-granularity store.
+[ ] Hybrid retrieval: lexical + dense + structural + recency + tool-aware.
+[ ] GPU cross-encoder rerank + MMR diversity.
+[ ] Knapsack budget packing.
+[ ] Contextual retrieval (cached blurb per chunk).
+[ ] Seven cache tiers implemented with documented keys.
+[ ] Tenant + corpus isolation everywhere.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-11)   [GATES MILESTONE M5]
+--------------------------------------------------------------------------------
+1. A large corpus is ingested asynchronously and retrieved via all hybrid
+   channels with GPU rerank and budget-packed output.
+2. Rerank + contextual retrieval demonstrably improve quality.
+3. All seven cache tiers function and are tenant-scoped.
+4. Ingestion never blocks the request hot path; isolation verified.
+================================================================================
+END OF PHASE-10.TXT
+================================================================================

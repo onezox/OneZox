@@ -1,0 +1,69 @@
+# =========================
+# Nx
+# =========================
+.nx/installation
+.nx/cache
+.nx/workspace-data
+.nx/self-healing
+.nx/migrate-runs
+.nx/polygraph
+
+# =========================
+# Claude Code
+# =========================
+.claude/worktrees
+.claude/settings.local.json
+
+# =========================
+# Rust
+# =========================
+/target
+
+# =========================
+# Python
+# =========================
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# =========================
+# Terraform
+# =========================
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+terraform.tfvars
+terraform.tfvars.json
+
+# Keep provider lock file for reproducible Terraform versions
+!.terraform.lock.hcl
+
+# =========================
+# Local Kubernetes
+# =========================
+platform/terraform/cells/local/onezox-dev-config
+*kubeconfig*
+*.kubeconfig
+
+# =========================
+# Secrets & Keys
+# =========================
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# =========================
+# Cosign (private only)
+# =========================
+.tooling/cosign/cosign.key
+.tooling/cosign/cosign.password
+
+# Public verification key is intentionally tracked
+!platform/security/cosign/cosign.pub

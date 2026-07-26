@@ -1,0 +1,47 @@
+# One-time cluster bootstrap: forms the 6 StatefulSet pods into an actual
+# Redis Cluster (3 masters + 3 replicas). Codified as a Job rather than a
+# manual kubectl exec so the bootstrap step is reproducible, not tribal
+# knowledge — consistent with Part N's "destroy + re-apply yields an
+# identical cell" requirement. Waits for all 6 pods to answer PING before
+# calling `redis-cli --cluster create`; safe to leave applied since it only
+# ever runs to completion once (Jobs don't re-run on their own).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-cluster-init
+  namespace: default
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: redis-cluster-init
+          image: redis:8.2.3-alpine
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              NODES="redis-cluster-0.redis-cluster-headless.default.svc.cluster.local \
+                     redis-cluster-1.redis-cluster-headless.default.svc.cluster.local \
+                     redis-cluster-2.redis-cluster-headless.default.svc.cluster.local \
+                     redis-cluster-3.redis-cluster-headless.default.svc.cluster.local \
+                     redis-cluster-4.redis-cluster-headless.default.svc.cluster.local \
+                     redis-cluster-5.redis-cluster-headless.default.svc.cluster.local"
+
+              echo "Waiting for all 6 redis-cluster pods to answer PING..."
+              for host in $NODES; do
+                until redis-cli -h "$host" ping | grep -q PONG; do
+                  echo "  waiting for $host..."
+                  sleep 2
+                done
+              done
+
+              ADDRS=""
+              for host in $NODES; do
+                ADDRS="$ADDRS ${host}:6379"
+              done
+
+              echo "All nodes reachable. Forming cluster..."
+              redis-cli --cluster create $ADDRS --cluster-replicas 1 --cluster-yes

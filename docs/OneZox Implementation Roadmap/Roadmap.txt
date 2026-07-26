@@ -1,0 +1,219 @@
+================================================================================
+ONEZOX AI ORCHESTRATION ENGINE — IMPLEMENTATION ROADMAP
+================================================================================
+Master build plan derived from OneZox v2 Architecture.
+This file is the index and sequencing authority for the whole build.
+
+This roadmap implements the existing v2 architecture EXACTLY as written.
+It does not redesign, optimize, or change any technology choice. Each phase
+file below implements a specific slice of the architecture and is
+self-contained: a team can build a phase from its file alone.
+
+--------------------------------------------------------------------------------
+HOW TO READ THIS ROADMAP
+--------------------------------------------------------------------------------
+- Phases are numbered Phase-00 .. Phase-14.
+- Build strictly in numeric order unless the dependency graph explicitly
+  allows parallelism.
+- Every phase ends with an Exit Criteria gate. Do not start phase N+1 until
+  phase N's exit criteria pass.
+- The architecture document (OneZox-v2-Architecture.md) remains the design
+  source of truth. These files are the build instructions for it.
+
+--------------------------------------------------------------------------------
+THE THREE PLANES (context for every phase)
+--------------------------------------------------------------------------------
+CONTROL PLANE   — model registry, config-as-code manifests, Vault, policy,
+                  rollout controller. Off the hot path.
+DATA PLANE      — edge gateway, planner, scheduler, context manager, retrieval,
+                  aggregator/verifier, streaming fan-in. The brain.
+EXECUTION PLANE — Provider Gateway, Tool Sandbox (Firecracker), GPU inference,
+                  embed/rerank, KV/prefix cache, Memory Service, Chat Service.
+
+--------------------------------------------------------------------------------
+COMPLETE PHASE LIST (BUILD ORDER)
+--------------------------------------------------------------------------------
+Phase-00  Foundation: monorepo, proto/buf, Terraform, one cell, Cockroach,
+          Redis, object store, OpenTelemetry from line one.
+Phase-01  Vertical slice part 1 — Rust edge gateway (auth, rate limit,
+          admission, normalize, meter, SSE streaming relay).
+Phase-02  Vertical slice part 2 — Provider Gateway (Go): adapters, quota,
+          circuit breaker, coalescing, streaming backpressure.
+Phase-03  Vertical slice part 3 — Data Plane fast path (Python): complexity
+          classifier, template DAG, scheduler bind, streamed + metered.
+          END OF PHASE-03 = SHIPPABLE PRODUCT.
+Phase-04  Control plane: model registry, versioned immutable manifests,
+          config distribution (etcd), Vault integration.
+Phase-05  Admin panel + Model Studio + Argo Rollouts canary + admin-api.
+Phase-06  Deliberate path: Workflow IR, LLM planner, cost gate, scheduler
+          advanced binding, Temporal durable execution.
+Phase-07  Multi-agent orchestration: access lists, blackboard, aggregator,
+          adversarial verifier, synthesizer.
+Phase-08  Chat Service (Go): ScyllaDB primary, Redis hot cache, S3 cold
+          archive; conversations, messages, attachments, pagination,
+          retention, archiving, deletion.
+Phase-09  Memory Service (Python): Postgres text-of-truth, Qdrant embeddings,
+          three-tier memory, retrieve/write/update/delete/decay, tenant
+          isolation, async ingestion.
+Phase-10  Context + retrieval: ingest workers, hybrid retrieval (BM25 +
+          dense + structural + recency), GPU cross-encoder rerank, knapsack
+          packing, contextual retrieval, 7 cache tiers.
+Phase-11  Execution plane hardening: Firecracker microVM sandbox, self-hosted
+          GPU inference (vLLM/SGLang), embed/rerank GPU services.
+Phase-12  Evaluation platform: golden datasets, offline eval + regression
+          gate in CI, shadow traffic, online LLM-judge, replay engine,
+          optimizer.
+Phase-13  Observability + cost center + trace explorer fully wired; event bus
+          (Redpanda) + queues (NATS JetStream) + analytics (ClickHouse).
+Phase-14  Multi-cell -> multi-region active-active + DR drills + chaos +
+          learned router + semantic cache + on-prem/enterprise packaging +
+          SDKs + docs + playground. FINAL PRODUCTION LAUNCH.
+
+--------------------------------------------------------------------------------
+DEPENDENCY GRAPH
+--------------------------------------------------------------------------------
+Phase-00  (root — no dependencies)
+   |
+   v
+Phase-01  depends on 00
+   |
+   v
+Phase-02  depends on 00, 01
+   |
+   v
+Phase-03  depends on 00, 01, 02      <-- SHIPPABLE MILESTONE
+   |
+   +---------------------------+
+   v                           v
+Phase-04 depends on 00,03      (Phase-08 may start in parallel after 03 —
+   |                            see note below)
+   v
+Phase-05 depends on 04
+   |
+   v
+Phase-06 depends on 03, 04, 05
+   |
+   v
+Phase-07 depends on 06
+   |
+   v
+Phase-08 depends on 03            (Chat Service; website integration)
+   |
+   v
+Phase-09 depends on 03, 04        (Memory Service; needs Vault from 04)
+   |
+   v
+Phase-10 depends on 09            (retrieval feeds + is fed by memory)
+   |
+   v
+Phase-11 depends on 03, 07        (sandbox needed by multi-agent tool calls)
+   |
+   v
+Phase-12 depends on 05, 06        (eval gate needs manifests + IR + replay)
+   |
+   v
+Phase-13 depends on 03..12        (observability wires across all services)
+   |
+   v
+Phase-14 depends on ALL           (multi-region + launch)
+
+ALLOWED PARALLELISM (only if team capacity permits, dependencies still hold):
+- Phase-08 (Chat Service) can begin once Phase-03 is green; it does not need
+  the deliberate path (06/07). Sequence it after 07 in the single-track build,
+  but a second team may start it right after 03.
+- Phase-11 (sandbox + GPU) can begin skeleton work after Phase-03, but its
+  integration test requires Phase-07 (multi-agent tool calls).
+- Do NOT parallelize 04 before 03, 06 before 05, 10 before 09, or 14 before
+  everything.
+
+--------------------------------------------------------------------------------
+MILESTONES
+--------------------------------------------------------------------------------
+M0  Foundation green        — end of Phase-00. One cell up, telemetry flowing,
+                              CI builds all languages, Terraform reproducible.
+M1  SHIPPABLE PRODUCT       — end of Phase-03. A user can hit an OpenAI-compatible
+                              endpoint, get a streamed answer from one frontier
+                              model, fully authenticated, rate-limited, metered.
+M2  SAFE MODEL OPS          — end of Phase-05. Virtual models created as versioned
+                              manifests via admin Model Studio and rolled out by
+                              canary with metric-based auto-rollback.
+M3  MULTI-AGENT ENGINE      — end of Phase-07. Deliberate path with typed IR,
+                              durable Temporal execution, multi-agent isolation,
+                              adversarial verification.
+M4  STATEFUL DOMAINS        — end of Phase-09. Chat history and AI memory each
+                              owned by a dedicated service with its own store;
+                              engine remains stateless.
+M5  QUALITY LAYER           — end of Phase-10. Hybrid retrieval + rerank + caching
+                              driving real answer quality.
+M6  SECURE EXECUTION        — end of Phase-11. Firecracker isolation + self-hosted
+                              GPU support models.
+M7  MEASURABLE QUALITY      — end of Phase-12. Regression gate blocks quality
+                              drops; shadow + online judge + replay operational.
+M8  FULL OBSERVABILITY      — end of Phase-13. Cost-per-node tracing, analytics,
+                              event bus and queues fully wired.
+M9  PRODUCTION LAUNCH       — end of Phase-14. Multi-region active-active, DR
+                              drilled, chaos-tested, SDKs + docs shipped.
+
+--------------------------------------------------------------------------------
+ESTIMATED IMPLEMENTATION SEQUENCE (relative effort, not calendar promises)
+--------------------------------------------------------------------------------
+Treat each unit as one integration-complete increment ending in its exit gate.
+Sizes are relative complexity weights (S/M/L/XL), for sequencing only.
+
+Phase-00  M     foundation
+Phase-01  M     edge gateway
+Phase-02  L     provider gateway (fan-out, breakers, streaming)
+Phase-03  L     data plane fast path  -> M1 SHIPPABLE
+Phase-04  M     registry + manifests + etcd + Vault
+Phase-05  M     admin panel + rollouts -> M2
+Phase-06  XL    IR + planner + scheduler + Temporal
+Phase-07  L     multi-agent + verifier -> M3
+Phase-08  L     Chat Service (Scylla + Redis + S3)
+Phase-09  L     Memory Service (Postgres + Qdrant) -> M4
+Phase-10  XL    context + hybrid retrieval + rerank + caches -> M5
+Phase-11  L     Firecracker + self-hosted GPU -> M6
+Phase-12  L     eval platform -> M7
+Phase-13  M     observability + analytics + buses -> M8
+Phase-14  XL    multi-region + DR + chaos + SDKs + launch -> M9
+
+Critical path: 00 -> 01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07 -> (08,09) ->
+10 -> 11 -> 12 -> 13 -> 14.
+
+--------------------------------------------------------------------------------
+BUILD ORDER PRINCIPLES (from the architecture, applied here)
+--------------------------------------------------------------------------------
+1. Plane separation and typed proto contracts exist from Phase-00, so every
+   later phase widens capability without a rewrite.
+2. Every stage is production-real, not a toy. Each phase is deployable,
+   observable, and tested before the next begins.
+3. Stateful domains (Chat, Memory) are owned by dedicated services; the engine
+   is stateless throughout. Never move durable state into the engine to "save
+   a phase."
+4. Security is not a phase you bolt on: mTLS, tenant isolation, and least
+   privilege are implemented within each phase as its services appear. Phase-14
+   only hardens and drills what earlier phases already built.
+5. Cost and quality are observable by construction: token/cost fields are on
+   spans from Phase-03; eval gating arrives in Phase-12 but the trace substrate
+   it needs is emitted from the start.
+
+--------------------------------------------------------------------------------
+FINAL PRODUCTION LAUNCH ROADMAP (Phase-14 close-out)
+--------------------------------------------------------------------------------
+LAUNCH-1  Second cell in primary region; cell router validated.
+LAUNCH-2  Second region; active-active traffic; anycast + geo-routing.
+LAUNCH-3  Cross-region replication verified for Cockroach, ScyllaDB, Memory
+          Postgres, object store; data-residency pinning confirmed.
+LAUNCH-4  DR drill: kill a provider, kill a cell, kill a region — degradation
+          ladder and failover verified against runbooks.
+LAUNCH-5  Chaos game-day passed; RTO/RPO targets met per DR table.
+LAUNCH-6  Learned router + semantic response cache enabled behind flags,
+          validated by eval gate.
+LAUNCH-7  On-prem/enterprise packaging (MinIO, self-host parity) built and
+          smoke-tested.
+LAUNCH-8  Public SDKs, API docs, and playground shipped.
+LAUNCH-9  Production readiness review: SLOs, on-call, runbooks, security sign-off.
+LAUNCH-10 GA.
+
+================================================================================
+END OF ROADMAP.TXT
+================================================================================

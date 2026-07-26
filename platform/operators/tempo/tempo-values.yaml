@@ -1,0 +1,35 @@
+# Tempo — Helm values for local Phase-00 development.
+# Chart: grafana/tempo, version 1.24.4 (Tempo v2.9.0) — this chart IS
+# already single-binary mode by design (not grafana/tempo-distributed,
+# which is the microservices-split chart), matching the same
+# minimal-footprint pattern used for Loki and Prometheus in this plan.
+#
+# Storage points at our existing MinIO (Step 19) rather than deploying a
+# separate object store — same reasoning as Loki (Step 22): one object
+# store per cell is enough, and this is the same config shape production
+# uses when this becomes real S3.
+#
+# multitenancyEnabled defaults to false in this chart already — unlike
+# Loki, no override needed to avoid an auth surprise here.
+
+replicas: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+tempo:
+  storage:
+    trace:
+      backend: s3
+      s3:
+        bucket: onezox-tempo-traces
+        endpoint: minio.default.svc.cluster.local:9000
+        access_key: onezox-admin
+        secret_key: onezox-local-dev-only
+        insecure: true
+        forcepathstyle: true

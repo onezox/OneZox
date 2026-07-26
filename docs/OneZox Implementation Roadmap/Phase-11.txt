@@ -1,0 +1,164 @@
+================================================================================
+PHASE-11 — EXECUTION PLANE HARDENING: FIRECRACKER SANDBOX + SELF-HOSTED GPU
+================================================================================
+Implements Architecture Part H (execution plane detail), Part O (Firecracker
+microVM isolation, seccomp, default-deny egress), Part C (Rust sandbox
+supervisor), Part F.4 (self-hosted embeddings), Part S (continuous batching).
+MILESTONE M6 (secure execution). Build stage 6.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Harden the execution plane: run all tool execution inside Firecracker microVMs
+with VM-level isolation, seccomp-BPF, and default-deny egress via an allow-list
+proxy; and stand up self-hosted GPU inference (vLLM/SGLang) plus the GPU
+embed/rerank service for support models — enabling real KV/prefix reuse and
+cost/privacy control. This completes the tool-calling path started in Phase-07.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Firecracker microVM tool sandbox (Part O): VM-level isolation per tool run,
+  seccomp-BPF syscall filtering, default-deny egress through an allow-list proxy.
+- Sandbox supervisor (Rust) managing microVM lifecycle + pre-warmed pool.
+- Self-hosted GPU inference (vLLM/SGLang) for support models, with continuous
+  batching (Part S) and real KV/prefix reuse (RadixAttention).
+- GPU embed/rerank service hardened (serves Phase-10 rerank + Phase-09/10
+  self-hosted embeddings).
+- Prefix-cache-aware routing becomes real KV reuse for self-hosted models
+  (scheduler prefers the instance holding the prefix).
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- sandbox-supervisor service (Rust) — Firecracker microVM management.
+- gpu-inference service (vLLM/SGLang deploy + serving configs).
+- embed-rerank GPU service (embedding + cross-encoder) hardened.
+- Allow-list egress proxy for sandboxed tool runs.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- sandbox-supervisor (Rust).
+- gpu-inference (vLLM/SGLang).
+- embed-rerank (GPU) — promoted from Phase-10 provisioning to a hardened service.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal:
+- RunTool(tool_ref, args, access_list) -> result           (Firecracker-isolated)
+- InferSelfHosted(model_ref, messages, params) -> stream    (vLLM/SGLang)
+- EmbedSelfHosted(model_ref, input) -> vector               (GPU embed)
+- RerankGPU(query, candidates) -> ranked                    (cross-encoder)
+Provider Gateway self-host adapter (vllm) now routes to gpu-inference.
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+- No new relational tables owned by this phase.
+Redis (ephemeral):
+- sandbox:pool                 -> pre-warmed microVM availability
+- kvcache:{model_ref}:{prefix} -> prefix/KV locality hints for routing
+Object store:
+- sandbox tool artifacts/outputs (scoped, short-lived) if persisted for tracing.
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- sandbox node pool (Part N): bare-metal-ish for Firecracker microVMs.
+- gpu-inference node pool: A100/H100 with MIG (Part N) for self-hosted models.
+- gpu-embed-rerank node pool (from Phase-10) hardened.
+- Allow-list egress proxy; default-deny network policy for sandbox pods (Part O).
+- KEDA scaling on tokens-in-flight/batch queue for GPU pools (Part N.2).
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/
+|-- sandbox-supervisor/           # RUST — Firecracker microVM mgmt
+|-- gpu-inference/                # vLLM/SGLang deploy + serving configs
+|-- embed-rerank/                 # GPU embedding + cross-encoder (hardened)
+services/provider-gateway/adapters/vllm/   # self-host adapter -> gpu-inference
+platform/                         # Firecracker runtime + egress allow-list proxy
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Multi-agent tool call (Phase-07) -> RunTool via sandbox-supervisor:
+  allocate pre-warmed Firecracker microVM (scoped to access_list) -> run tool
+  with seccomp-BPF + default-deny egress (allow-list proxy) -> return result to
+  the emitting agent -> microVM destroyed.
+Scheduler -> InferSelfHosted/EmbedSelfHosted/RerankGPU via Provider Gateway
+  vllm adapter -> gpu-inference / embed-rerank (continuous batching, KV reuse) ->
+  stream back. Prefix-cache-aware routing prefers the instance holding the prefix.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-07 (multi-agent tool calls to isolate), Phase-10 (GPU rerank
+  provisioning + retrieval that self-hosted embeddings serve), Phase-02/04
+  (Provider Gateway + manifests for self-host worker refs).
+- Skeleton may start after Phase-03; integration test requires Phase-07.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Firecracker microVM per tool run: VM-level isolation (stronger than containers).
+- seccomp-BPF restricts syscalls; default-deny egress with allow-list proxy only
+  (Part O).
+- Sandbox bound to the agent's access_list (ties to Phase-07 physical isolation).
+- Self-hosted model access authenticated via mTLS; tenant identity propagated.
+- No provider credentials in the sandbox; tool outputs scoped + short-lived.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Provision sandbox (Firecracker) + GPU (MIG) node pools.
+2. Deploy sandbox-supervisor + allow-list egress proxy + default-deny policy.
+3. Deploy gpu-inference (vLLM/SGLang) + embed-rerank; register self-host
+   manifests (Phase-04) and wire the Provider Gateway vllm adapter.
+4. Enable pre-warmed microVM pool + KEDA GPU scaling.
+5. Run a multi-agent workflow whose tool call executes inside Firecracker.
+6. Validate self-hosted inference + KV/prefix reuse routing.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: microVM lifecycle; seccomp policy; egress allow-list enforcement; vLLM
+  serving config; batch scheduling.
+- Integration: a tool-calling agent runs its tool in an isolated microVM and
+  returns a result; self-hosted model serves a streamed completion.
+- Security: sandbox escape attempts fail; egress to a non-allow-listed host is
+  blocked; syscalls outside policy are denied.
+- Performance: continuous batching improves GPU throughput; prefix-cache-aware
+  routing yields real KV reuse (cold prefill -> cache hit).
+- Isolation: sandbox honors the agent access_list (no out-of-list reach).
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+Tool execution is VM-isolated via Firecracker with default-deny egress, and
+self-hosted GPU inference + embed/rerank serve support models with continuous
+batching and KV reuse. M6, secure execution.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Firecracker microVM sandbox with seccomp-BPF + default-deny egress.
+[ ] Sandbox supervisor + pre-warmed pool.
+[ ] Self-hosted GPU inference (vLLM/SGLang) with continuous batching.
+[ ] GPU embed/rerank service hardened.
+[ ] Real KV/prefix reuse + prefix-cache-aware routing for self-hosted models.
+[ ] Sandbox bound to agent access lists.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-12)   [GATES MILESTONE M6]
+--------------------------------------------------------------------------------
+1. A multi-agent tool call executes inside an isolated Firecracker microVM.
+2. Egress allow-list + seccomp + isolation verified against escape attempts.
+3. Self-hosted inference serves streamed completions with KV reuse.
+4. GPU pools scale on tokens-in-flight/batch queue.
+================================================================================
+END OF PHASE-11.TXT
+================================================================================

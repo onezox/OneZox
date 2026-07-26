@@ -1,0 +1,44 @@
+# Karpenter — cloud-cell configuration (NOT used locally).
+#
+# Referenced (commented out) from platform/terraform/cells/local/karpenter.tf.
+# This file documents what a real cloud deployment needs; it is not applied
+# by anything in Phase-00's local setup.
+#
+# Two separate concerns, both required, neither meaningful on kind:
+#
+# 1) Below: Helm values for the Karpenter *controller* itself (the karpenter
+#    chart installs the controller pod, not node pools).
+# 2) Separately (not in this file): NodePool + EC2NodeClass (or GCP/Azure
+#    equivalent) custom resources, applied once the controller is running,
+#    that actually describe what compute Karpenter is allowed to provision.
+#    Those map to Part N's node pools — general, stateful, gpu (scaled to
+#    zero until needed), sandbox — and get added as real manifests when a
+#    cloud region exists to provision against.
+
+settings:
+  # Must match the real EKS/GKE/AKS cluster name Karpenter is scoped to.
+  clusterName: "REPLACE_WITH_CLOUD_CLUSTER_NAME"
+
+  # AWS example: the SQS queue Karpenter drains for spot-interruption and
+  # instance-health notifications, so it can gracefully drain a node before
+  # the cloud provider reclaims it. Required for spot-aware bin-packing
+  # (Part N: "fast, bin-packing, spot-aware node provisioning").
+  interruptionQueue: "REPLACE_WITH_CLOUD_INTERRUPTION_QUEUE"
+
+serviceAccount:
+  annotations:
+    # AWS example: IRSA role granting the controller ec2:CreateFleet,
+    # ec2:TerminateInstances, pricing:GetProducts, etc. Nothing analogous
+    # exists for a Docker-backed kind node, which is the core reason this
+    # cannot run locally: there is no cloud IAM boundary to scope against.
+    eks.amazonaws.com/role-arn: "REPLACE_WITH_CLOUD_IAM_ROLE_ARN"
+
+replicas: 2 # controller HA — pointless with 1 static local node, real for a region
+
+resources:
+  requests:
+    cpu: 1
+    memory: 1Gi
+  limits:
+    cpu: 1
+    memory: 1Gi

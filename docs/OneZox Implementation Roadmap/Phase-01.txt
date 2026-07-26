@@ -1,0 +1,172 @@
+================================================================================
+PHASE-01 — EDGE GATEWAY (RUST)
+================================================================================
+Implements Architecture Part C (Rust for the hot path), Part D (request
+topology entry), Part K (ingress API), Part O (edge security), Part P
+(lifecycle: authN, key, ratelimit, admit, normalize, meter start, SSE relay).
+Part of build stage 2 (vertical slice, part 1).
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Build the single hottest path component: the Rust edge gateway that terminates
+every client request, authenticates it, rate-limits it, admits it, normalizes
+it to the internal contract, starts metering, and relays streamed tokens back
+over SSE with predictable tail latency and no GC pauses. It does not yet call a
+model — it forwards to a stub and streams the stub's response.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- OpenAI-compatible ingress surface (Part K): /v1/chat/completions,
+  /v1/responses, /v1/embeddings, /v1/models (routes exist; bodies validated).
+- Authentication: API-key auth for developer traffic; JWT verification hook for
+  website traffic (identity attached to request context).
+- Rate limiting using Redis (ephemeral) with tenant-scoped keys.
+- Admission control (accept/queue/shed) at the edge.
+- Request normalization to the internal proto contract.
+- Metering start: emit request-scoped span with token/cost fields (Part L).
+- Server-Sent Events streaming relay with backpressure.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- edge-gateway service (Rust, Tokio async) with modules from Part Q:
+  src/{auth, ratelimit, admission, normalize, stream, meter}.
+- Identity extractor: resolves org_id/user_id/project_id/conversation_id from
+  API key or JWT and attaches to the request context.
+- SSE relay engine with client-disconnect handling and flow control.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- edge-gateway (Rust). Replaces the Phase-00 edge-stub.
+- Temporary downstream: forwards normalized requests to the Phase-00
+  dataplane-stub until Phase-03 replaces it with the real data plane fast path.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Public (ingress):
+- POST /v1/chat/completions   (streamed + non-streamed)
+- POST /v1/responses
+- POST /v1/embeddings         (routes accepted; wired to real embed in Phase-10)
+- GET  /v1/models             (served from a static list until Phase-04 registry)
+Internal (gRPC to data plane):
+- Submit(normalized_request) -> stream(delta)   [proto: dataplane]
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+CockroachDB:
+- api_keys        (key_id PK, org_id, hash, scopes, created_at, revoked_at)
+- rate_limit_policy (policy_id PK, org_id, rpm, tpm, concurrency)
+Redis (ephemeral only):
+- ratelimit:{org_id}:{window}        -> counter (TTL = window)
+- admission:{cell}:inflight          -> gauge
+Note: api_keys stores a HASH of the key, never the raw key.
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- Edge node pool (Part N): burstable, HPA on active connections; Karpenter-backed.
+- Redis Cluster (from Phase-00) for rate-limit + admission counters.
+- Cilium mTLS between edge and data plane.
+- Ingress/load balancer with anycast-ready configuration (single region for now).
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/
+|-- edge-gateway/                 # RUST (replaces edge-stub)
+|   |-- src/
+|   |   |-- auth/                  # api-key + JWT verify, identity extract
+|   |   |-- ratelimit/             # Redis token buckets
+|   |   |-- admission/             # accept/queue/shed
+|   |   |-- normalize/             # -> internal proto
+|   |   |-- stream/                # SSE relay + backpressure
+|   |   |-- meter/                 # span start, token/cost fields
+proto/gateway/                     # ingress request/response contracts finalized
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Client --HTTPS--> edge-gateway:
+  auth (key/JWT) -> ratelimit (Redis) -> admission -> normalize
+  -> meter start (OTel span) -> gRPC Submit to data plane
+  <- stream deltas <- data plane
+Client <--SSE-- edge-gateway (relayed deltas, backpressured)
+On completion: edge emits final meter span (tokens in/out placeholders until
+real model in Phase-03).
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream phases: Phase-00 (foundation, Redis, Cockroach, mesh, telemetry).
+- Contracts: proto/gateway, proto/dataplane.
+- Downstream stub: Phase-00 dataplane-stub (temporary).
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- API keys validated by hash comparison; raw keys never stored or logged.
+- JWT signature + expiry verification for website traffic.
+- Tenant identity attached to every request; no request proceeds without a
+  resolved org_id (Part O tenant isolation begins at the edge).
+- TLS termination at the edge; mTLS onward to the data plane.
+- Rate limiting and admission as DoS protection.
+- Input validation/normalization rejects malformed payloads before they enter
+  the mesh.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Apply api_keys + rate_limit_policy migrations.
+2. Deploy edge-gateway to the edge node pool via Argo CD.
+3. Configure ingress/load balancer to edge-gateway.
+4. Seed one test tenant + one hashed API key.
+5. Point edge-gateway downstream at dataplane-stub.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: auth (valid/invalid/expired key + JWT), rate-limit windows, admission
+  decisions, normalization of good/bad payloads.
+- Integration: end-to-end streamed response relayed from stub over SSE.
+- Load: sustained streaming shows stable p99 (no GC-style latency spikes).
+- Security: raw key never appears in logs/traces; unauthenticated request is
+  rejected; cross-tenant key cannot access another tenant.
+- Disconnect: client drop mid-stream frees resources cleanly.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+A production-grade Rust edge that authenticates, rate-limits, admits,
+normalizes, meters, and streams. A developer can call /v1/chat/completions with
+a valid key and receive a streamed (stubbed) response with a full trace and
+metering span.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Ingress routes implemented + payload validation.
+[ ] API-key (hashed) + JWT auth working.
+[ ] Redis rate limiting + admission control working.
+[ ] Normalization to internal proto.
+[ ] SSE streaming relay with backpressure + disconnect handling.
+[ ] Metering span emitted with token/cost fields.
+[ ] mTLS to data plane; TLS at edge.
+[ ] p99 stable under sustained streaming load.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-02)
+--------------------------------------------------------------------------------
+1. Authenticated, rate-limited, metered streamed request flows edge -> stub ->
+   client over SSE.
+2. Security tests pass (no raw key leakage, tenant isolation at edge,
+   unauth rejected).
+3. Tail-latency test shows no GC-style spikes under sustained streaming.
+4. All edge telemetry visible in the tracing/metrics backend.
+================================================================================
+END OF PHASE-01.TXT
+================================================================================

@@ -1,0 +1,152 @@
+================================================================================
+PHASE-05 — ADMIN PANEL, MODEL STUDIO, CANARY ROLLOUTS   [MILESTONE M2]
+================================================================================
+Implements Architecture Part R (admin panel architecture), Part G.2 (manifest
+lifecycle + canary), Part A (canary rollout with auto-rollback), Part N.5
+(CI/CD, Argo Rollouts), Part C (TypeScript/Next.js RSC). Completes build
+stage 3.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Give operators a real control surface: an admin panel with a Model Studio to
+author virtual-model manifests, and a rollout system (Argo Rollouts) that
+promotes new manifest versions by canary (1% -> 10% -> 50% -> 100%) with
+metric-based automatic rollback on SLO regression.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Admin panel (Next.js RSC) with sections (Part R): dashboard, model-studio,
+  traces, cost, keys, providers, playground, audit (trace/cost/eval panels are
+  populated as their phases land; scaffolded here).
+- Model Studio: author + version a manifest, view diff vs previous version,
+  submit for rollout.
+- Canary rollout via Argo Rollouts with staged traffic + metric gates.
+- Automatic rollback when SLO metrics regress during a canary.
+- admin-api (gRPC + GraphQL gateway) backing the panel.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- admin-panel (TypeScript, Next.js RSC): app/{dashboard,model-studio,traces,
+  cost,keys,providers,playground,audit} + components/ + lib/.
+- admin-api service (gRPC + GraphQL) bridging panel <-> control-plane.
+- Argo Rollouts configuration with analysis templates bound to SLO metrics.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- admin-panel (web).
+- admin-api (gRPC + GraphQL gateway).
+- Argo Rollouts controller configured for manifest promotion.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+admin-api (GraphQL + gRPC):
+- createModelDraft / publishModelVersion  -> control-plane RegisterModelManifest
+- startRollout(model_ref, version_id, strategy) -> rollout controller
+- getRolloutStatus(model_ref) -> {stage, metrics, decision}
+- listApiKeys / createApiKey / revokeApiKey  (writes hashed keys)
+- getDashboardMetrics()  (reads telemetry/analytics; expands with later phases)
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+CockroachDB (admin/control owned):
+- rollout            (rollout_id PK, model_ref, version_id, strategy_json,
+                      stage, status, started_at, ended_at)
+- audit_log          (audit_id PK, actor, action, target, before_json,
+                      after_json, ts)
+- admin_user         (user_id PK, org_id, role, created_at)
+(api_keys table from Phase-01 is reused for key management UI.)
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- Web hosting for Next.js RSC (in-cluster or edge).
+- Argo Rollouts installed alongside Argo CD (Part N.5).
+- Analysis metric source (Prometheus) wired to rollout analysis templates.
+- admin-api on a control/general pool; mTLS to control-plane.
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+admin-panel/                      # TYPESCRIPT, Next.js RSC
+|-- app/{dashboard,model-studio,traces,cost,keys,providers,playground,audit}
+|-- components/
+|-- lib/
+services/
+|-- admin-api/                    # gRPC + GraphQL gateway
+platform/argocd/rollouts/         # Argo Rollouts + analysis templates
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Operator --> admin-panel --> admin-api:
+  createModelDraft/publishModelVersion -> control-plane (new signed manifest
+  version, Phase-04) -> startRollout -> Argo Rollouts stages traffic
+  (1/10/50/100%) -> analysis template reads SLO metrics -> promote or auto-
+  rollback -> status surfaced back to the panel. All admin actions -> audit_log.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-04 (registry/manifests/etcd/Vault), Phase-03 (serving slice
+  to canary against), Phase-00 (Argo, Prometheus).
+- Contracts: admin proto + GraphQL schema.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Admin authNZ with roles (admin_user.role); least-privilege actions.
+- Every mutating admin action is written to audit_log (immutable append).
+- API-key management stores hashes only; raw key shown once at creation.
+- mTLS admin-api <-> control-plane; panel served over TLS.
+- Rollout changes go only through signed manifests (no direct prod mutation).
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Install Argo Rollouts + analysis templates bound to SLO metrics.
+2. Apply rollout/audit_log/admin_user migrations.
+3. Deploy admin-api; deploy admin-panel.
+4. Wire Model Studio publish -> control-plane; wire startRollout -> Rollouts.
+5. Perform a test canary of a trivial manifest change and force a rollback.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: manifest draft/publish, rollout state machine, audit writes, key mgmt.
+- Integration: publish a new model version and promote via canary end-to-end.
+- Rollback: inject an SLO regression during canary; verify automatic rollback.
+- Security: non-admin cannot publish/rollout; audit_log captures all actions.
+- UX: Model Studio diff view matches the actual manifest delta.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+Operators can author virtual models in Model Studio and roll them out safely by
+canary with automatic rollback on regression — M2, safe model operations.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Admin panel + Model Studio operational.
+[ ] admin-api (gRPC + GraphQL) bridging panel <-> control-plane.
+[ ] Canary rollout with staged traffic + metric gates.
+[ ] Automatic rollback on SLO regression.
+[ ] audit_log captures every admin action.
+[ ] API-key management (hashed) in the panel.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-06)   [GATES MILESTONE M2]
+--------------------------------------------------------------------------------
+1. A new virtual-model version is authored, published, and canaried to 100%.
+2. An induced regression triggers automatic rollback.
+3. All admin actions are audited; RBAC enforced.
+4. No path exists to mutate a live model outside signed manifests + rollout.
+================================================================================
+END OF PHASE-05.TXT
+================================================================================

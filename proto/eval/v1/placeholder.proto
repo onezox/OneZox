@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package eval.v1;
+
+// Proves the eval proto package compiles end-to-end across Rust, Python,
+// and Go. Replaced by real request/response contracts starting Phase-01+;
+// no RPCs are defined yet per the Phase-00 scope.
+message Placeholder {
+  string id = 1;
+}

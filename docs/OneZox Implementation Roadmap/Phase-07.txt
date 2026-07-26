@@ -1,0 +1,156 @@
+================================================================================
+PHASE-07 — MULTI-AGENT ORCHESTRATION, AGGREGATOR, ADVERSARIAL VERIFIER
+================================================================================
+Implements Architecture Part E (multi-agent isolation, blackboard, aggregator,
+adversarial verifier, synthesizer, access-list physical enforcement). Completes
+build stage 4 (deliberate path). MILESTONE M3.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Turn the deliberate path into a real multi-agent system: parallel agents with
+scheduler-enforced access lists (physical isolation, not policy), a blackboard
+for shared findings, an aggregator that keeps only claims with provenance, an
+adversarial verifier that tries to DISPROVE claims, and a synthesizer that
+produces the final answer.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Multi-agent execution: independent agents (roles) run concurrently within a
+  workflow IR (Phase-06).
+- Access-list enforcement: the scheduler physically restricts each agent to its
+  permitted workers/tools/data (Part E) — enforcement, not advisory policy.
+- Blackboard pattern: agents publish/read shared findings through a controlled
+  store.
+- Aggregator: collects agent outputs; drops any claim lacking provenance.
+- Adversarial verifier: actively attempts to disprove claims (not confirm);
+  unsupported claims are removed.
+- Synthesizer: composes the verified, provenance-backed result and streams it.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- data-plane modules (Part Q): aggregator/{claims,verify,synthesize}.
+- Access-list enforcement in scheduler/place + scheduler/dispatch.
+- Blackboard store (shared findings) with tenant + workflow scoping.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- No new top-level service; multi-agent logic lives in the data-plane +
+  Temporal workers (Phase-06) plus the blackboard store.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal:
+- SpawnAgents(WorkflowIR) -> [agent_run]        (scheduler, access-list bound)
+- BlackboardPut(workflow_id, finding) / BlackboardGet(workflow_id, query)
+- Aggregate(agent_outputs) -> claims_with_provenance
+- Verify(claims) -> verified_claims              (adversarial)
+- Synthesize(verified_claims) -> stream(delta)
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+FoundationDB / durable workflow store:
+- blackboard        (workflow_id, finding_id -> finding_json + provenance)
+- claim_ledger      (workflow_id, claim_id -> claim, provenance, verify_status)
+Redis (ephemeral):
+- agentstate:{workflow_id}:{agent_id}   -> in-flight agent scratch (TTL)
+(All scoped by tenant + workflow; no cross-workflow or cross-tenant reads.)
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- Uses existing dataplane pool + Temporal workers (Phase-06).
+- No GPU required (verification/synthesis via Provider Gateway workers).
+- Tool execution is stubbed/allow-listed here; the Firecracker sandbox that
+  actually runs tools arrives in Phase-11 (integration test for tool-calling
+  agents completes there).
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/data-plane/
+|-- aggregator/{claims,verify,synthesize}    # provenance, adversarial verify, synth
+|-- scheduler/{place,dispatch}               # access-list PHYSICAL enforcement
+|-- workflows/                               # multi-agent workflow defs (extends P06)
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Deliberate path (Phase-06) -> SpawnAgents:
+  scheduler binds each agent to ONLY its access_list workers/tools/data ->
+  agents run in parallel (Temporal activities), sharing via blackboard ->
+  Aggregate collects outputs, drops claims without provenance ->
+  Verify adversarially attempts to disprove; unsupported claims removed ->
+  Synthesize composes final answer -> stream to edge -> client.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-06 (IR, scheduler, Temporal), Phase-04 (manifests define
+  worker roles + access lists).
+- Downstream note: real tool execution (sandbox) completes in Phase-11.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Access lists are PHYSICALLY enforced by the scheduler: an agent cannot reach a
+  worker/tool/data source outside its list (Part E) — a hard boundary.
+- Blackboard + claim ledger scoped by tenant + workflow; no cross-scope reads.
+- Provenance required: claims without a traceable source are dropped (prevents
+  fabrication leaking into output).
+- Adversarial verification reduces hallucinated/unsupported content.
+- mTLS + tenant identity on every agent activity.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Create blackboard + claim_ledger in the durable store.
+2. Deploy aggregator/verifier/synthesizer + access-list enforcement.
+3. Define a multi-agent manifest (roles + access lists) via Model Studio (P05).
+4. Run a multi-agent workflow end-to-end with a tool call stubbed/allow-listed.
+5. Verify access-list denial and provenance-drop behavior.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: provenance tagging/drop; adversarial verifier logic; synthesis
+  composition; blackboard put/get scoping.
+- Integration: parallel agents produce findings; aggregator + verifier yield a
+  provenance-backed synthesized answer.
+- Isolation: an agent attempting to access an out-of-list worker/tool/data is
+  physically blocked (not merely warned).
+- Quality: a deliberately unsupported claim is removed by the verifier.
+- Cross-scope: no agent can read another workflow's or tenant's blackboard.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+A working multi-agent engine: isolated parallel agents, blackboard sharing,
+provenance-gated aggregation, adversarial verification, and synthesis — M3.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Parallel multi-agent execution within an IR.
+[ ] Access lists physically enforced by the scheduler.
+[ ] Blackboard sharing scoped by tenant + workflow.
+[ ] Aggregator drops claims without provenance.
+[ ] Adversarial verifier removes unsupported claims.
+[ ] Synthesizer produces the final streamed answer.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-08)   [GATES MILESTONE M3]
+--------------------------------------------------------------------------------
+1. A multi-agent workflow runs end-to-end with a provenance-backed, verified,
+   synthesized result.
+2. Access-list physical isolation is proven (out-of-list access blocked).
+3. Provenance-drop and adversarial-verification behaviors are demonstrated.
+4. No cross-workflow/cross-tenant blackboard access is possible.
+================================================================================
+END OF PHASE-07.TXT
+================================================================================

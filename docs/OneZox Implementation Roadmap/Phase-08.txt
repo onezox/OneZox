@@ -1,0 +1,190 @@
+================================================================================
+PHASE-08 — CHAT SERVICE (GO): SCYLLADB + REDIS + S3
+================================================================================
+Implements Architecture Part F.7 (dedicated Chat Service), Part I (ScyllaDB
+chat store, Redis hot cache, S3 cold archive), Part B (execution-plane service),
+Part N (independent scaling), Part N.4 (chat DR). Build stage 5, part 1.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Stand up the dedicated Chat Service that becomes the single owner of chat
+history. The Website Backend no longer stores chat directly — it routes all chat
+operations here. The service owns conversations, messages, attachments,
+pagination, archiving, retention, and conversation deletion, on ScyllaDB
+(partitioned by conversation_id) with Redis as the hot cache and S3 as the cold
+archive. The AI engine receives only the required conversation slice.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Conversation lifecycle: create, append message, paginate, delete.
+- Attachments stored as references to object storage (message holds a pointer;
+  S3 holds the bytes) per Part F.7.
+- Bounded recent-slice reads for the AI engine (never the whole conversation,
+  never a cross-conversation scan).
+- Hot-conversation caching in Redis (recent window).
+- Retention + archiving: background job rolls cold conversations to compressed
+  object storage; restore-on-demand.
+- Conversation deletion as a single authoritative, GDPR-aligned path.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- chat-service (Go) with modules (Part Q):
+  conversations/, messages/, attachments/, pagination/, retention/, archiving/,
+  deletion/, stores/{scylladb_primary, redis_hot_cache, s3_cold_archive}.
+- Tiering job (hot -> warm -> cold) driven by age/activity.
+- Attachment reference manager (S3 pointers).
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- chat-service (Go). New execution-plane service, sibling to the Memory Service.
+- ScyllaDB cluster (deployed via operator).
+- (Redis + S3 already exist from Phase-00; used here for hot cache + cold tier.)
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Chat Service (gRPC; consumed by website + AI engine):
+- CreateConversation(org_id,user_id,project_id) -> conversation_id
+- AppendMessage(conversation_id, role, content, attachments[]) -> message_id
+- GetRecentSlice(conversation_id, limit) -> [message]      (engine uses this)
+- ListMessages(conversation_id, cursor, page_size) -> {messages, next_cursor}
+- AddAttachment(message_id, blob_ref, meta) -> attachment_id
+- ArchiveConversation(conversation_id) -> status
+- DeleteConversation(conversation_id) -> status            (authoritative delete)
+Website routes ALL chat operations through these APIs (no direct chat storage).
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+ScyllaDB (primary; partitioned by conversation_id, messages time-ordered):
+- conversations   (PARTITION KEY conversation_id; org_id, user_id, project_id,
+                   created_at, status, last_activity_at)
+- messages        (PARTITION KEY conversation_id, CLUSTERING KEY (ts, message_id);
+                   role, content, attachment_refs)          -- single-partition slice reads
+- attachments     (PARTITION KEY message_id; blob_ref -> S3, mime, size, meta)
+Redis (hot cache, ephemeral):
+- chat:hot:{conversation_id}   -> recent N messages (0-30 day window)
+S3 (cold archive):
+- cold/{org_id}/{conversation_id}.parquet   -> compressed archived conversations
+Design notes (from Part F.7 / Part I):
+- Partition by conversation_id so "last N messages of conv X" is one fast
+  partition read.
+- Attachments store an S3 reference, not inline blobs.
+- Cold tier is compressed columnar (Parquet), restore-on-demand.
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- chat-service node pool (Part N): Go service, HPA on read/write RPS.
+- ScyllaDB cluster (RF >= 3 across AZs; Part N.4) via operator.
+- Redis (hot cache) + S3 (cold archive) from Phase-00.
+- Cilium mTLS to website + AI engine.
+- This store is SEPARATE from the website's OLTP DB (Cockroach) — a chat write
+  storm must never contend with account/billing queries (Part F.7 / Part N.2).
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/
+|-- chat-service/                 # GO — single owner of chat history
+|   |-- conversations/
+|   |-- messages/
+|   |-- attachments/
+|   |-- pagination/
+|   |-- retention/
+|   |-- archiving/
+|   |-- deletion/
+|   |-- stores/{scylladb_primary, redis_hot_cache, s3_cold_archive}
+platform/operators/scylladb/      # ScyllaDB operator manifests
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Website Backend --gRPC (all chat ops)--> chat-service:
+  Create/Append/List/Archive/Delete -> Redis hot cache + ScyllaDB partition.
+AI Engine --GetRecentSlice(conversation_id, limit)--> chat-service:
+  Redis hot hit -> return; miss -> ScyllaDB single-partition read (time-ordered,
+  limited) -> populate hot cache -> return bounded slice.
+Tiering job (scheduled): age/activity -> roll cold conversations ScyllaDB -> S3
+  (compressed Parquet); restore-on-demand when an archived conversation is read.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-03 (a running engine that requests slices), Phase-00 (Redis,
+  S3, mesh, telemetry).
+- Website integration: the Website Backend must switch chat reads/writes to the
+  Chat Service APIs (remove any direct chat storage).
+- May start after Phase-03 in parallel (see Roadmap dependency notes); sequenced
+  here after Phase-07 in the single-track build.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Tenant isolation: every query filtered by org_id/user_id/project_id; a
+  conversation is only accessible within its owning tenant (Part O).
+- Deletion is authoritative + GDPR-aligned (removes primary + cache + cold copy).
+- Attachments referenced via signed, scoped object-store access; no public blobs.
+- mTLS for website + engine callers.
+- Independent failure domain: chat degradation cannot block logins/payments
+  (separate store from the website DB).
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Deploy ScyllaDB (RF>=3 across AZs) via operator.
+2. Create conversations/messages/attachments schemas (partition by conv_id).
+3. Deploy chat-service; wire Redis hot cache + S3 cold archive.
+4. Switch Website Backend chat operations to the Chat Service APIs.
+5. Point the AI engine's history fetch at GetRecentSlice.
+6. Enable the tiering job (hot->warm->cold) with age/activity policy.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: create/append/paginate/delete; attachment reference handling; cache
+  population/invalidation; tiering decisions.
+- Integration: website writes a conversation via the service; engine reads a
+  bounded recent slice; pagination walks older messages via cursor.
+- Performance: "last N messages of conv X" is a single-partition read; hot cache
+  serves active threads sub-ms.
+- Scale: chat write storm scales ScyllaDB (add nodes) WITHOUT touching the
+  website DB; website latency unaffected.
+- Retention: a conversation ages to cold (Parquet in S3) and restores on read.
+- Deletion: DeleteConversation removes primary + cache + cold copy.
+- Isolation: cross-tenant conversation access is rejected.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+Chat history is owned end-to-end by the Chat Service on its own ScyllaDB store
+(Redis hot, S3 cold). The website routes all chat ops to it; the engine reads
+only bounded slices; chat scales independently of the website.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Website no longer stores chat history directly.
+[ ] Conversations/messages/attachments on ScyllaDB, partitioned by conv_id.
+[ ] Redis hot cache for recent window.
+[ ] S3 cold archive (compressed Parquet) + restore-on-demand.
+[ ] Pagination, retention, archiving, deletion owned by the service.
+[ ] Engine receives only a bounded recent slice.
+[ ] Chat store is separate from the website OLTP DB.
+[ ] Tenant isolation + GDPR-aligned deletion enforced.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-09)
+--------------------------------------------------------------------------------
+1. All website chat operations flow through the Chat Service (no direct storage).
+2. Engine reads bounded recent slices via GetRecentSlice.
+3. Hot->warm->cold tiering and restore-on-demand proven.
+4. A chat write storm scales ScyllaDB without degrading website latency.
+5. Cross-tenant isolation and authoritative deletion verified.
+================================================================================
+END OF PHASE-08.TXT
+================================================================================

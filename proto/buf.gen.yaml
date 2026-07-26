@@ -1,0 +1,17 @@
+version: v2
+
+inputs:
+  - directory: .
+
+# Message codegen only, for all three OneZox languages (Part C). No gRPC
+# service-stub plugins yet — Phase-00 has "no RPCs implemented yet" (roadmap),
+# so there is nothing for a service-codegen plugin to generate against. Those
+# get added (buf.build/grpc/go, and Rust's neoeinstein-tonic) once the first
+# real RPC is defined.
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: gen/go
+  - remote: buf.build/protocolbuffers/python
+    out: gen/python
+  - remote: buf.build/community/neoeinstein-prost
+    out: gen/rust

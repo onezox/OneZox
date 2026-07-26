@@ -1,0 +1,184 @@
+================================================================================
+PHASE-00 — FOUNDATION
+================================================================================
+Implements Architecture Part Q (project structure), Part I (Cockroach, Redis,
+object store), Part L (OpenTelemetry), Part N (one region, one cell, Terraform,
+GitOps), Part B (three-plane skeleton). Build stage 1.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Stand up the repository, contracts, infrastructure-as-code, one running cell,
+the foundational data stores, and end-to-end telemetry — so that every later
+phase plugs into a reproducible, observable, typed foundation with no rework.
+Nothing serves user traffic yet; this is the ground every plane stands on.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Monorepo with cross-language build (Bazel or Nx) and protobuf governance (buf).
+- Single-source-of-truth proto contracts with breaking-change CI.
+- Terraform for one region, one cell (Kubernetes cluster/vcluster).
+- CockroachDB, Redis (Cluster), and object store (S3/GCS + MinIO for on-prem)
+  provisioned.
+- OpenTelemetry tracing/metrics/logs wired from the very first service stub.
+- GitOps delivery (Argo CD) and node autoscaling (Karpenter) baseline.
+- Service mesh baseline: Cilium (eBPF) CNI with mTLS enabled cluster-wide.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- Monorepo skeleton (top-level layout per Part Q).
+- proto/ package tree with buf.yaml + buf.gen.yaml codegen pipeline.
+- platform/ IaC tree: terraform/, helm/, argocd/, karpenter/, cilium/.
+- libs/ shared: otel initializers (per language), ir-schema placeholder,
+  tokenizer stub (Rust/PyO3) scaffold.
+- One "hello" health service per language (Rust, Python, Go) to prove build +
+  telemetry + mesh, each exposing /healthz and emitting an OTel span.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- No user-facing services. Only three throwaway health stubs (edge-stub in Rust,
+  dataplane-stub in Python, provider-stub in Go) to validate the toolchain,
+  mesh, and telemetry. These are replaced by real services in Phases 01-03.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+- Internal only:
+  - GET /healthz  (liveness) on each stub.
+  - GET /readyz   (readiness) on each stub.
+- Proto contract scaffolding (no RPCs implemented yet) for: gateway, dataplane,
+  provider, admin, eval. Definitions compile and generate code in all three
+  languages.
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+CockroachDB (schema bootstrap only; ownership assigned in later phases):
+- schema_migrations        (migration_id PK, applied_at)             -- migration ledger
+- tenants                  (org_id PK, name, created_at, status)     -- created here, populated later
+- health_probe             (probe_id PK, service, ts)                -- proves DB connectivity from each language
+Redis:
+- No persistent schema. Verify connectivity + keyspace namespacing convention:
+  {tenant}:{domain}:{key}. Strictly ephemeral use only.
+Object store:
+- Buckets: onezox-artifacts, onezox-traces, onezox-backups (versioning ON).
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- One Kubernetes cluster in one region, one cell (namespace or vcluster).
+- Node pools (baseline, from Part N): a general pool + a stateful pool for
+  operators. GPU/sandbox pools are declared but scaled to zero until needed.
+- Operators installed: CockroachDB operator, Redis. (Qdrant, ScyllaDB, Redpanda,
+  Temporal operators are declared in Terraform but not yet deployed.)
+- Cilium eBPF CNI + mTLS. Karpenter for node autoscale. Argo CD for GitOps.
+- OTel Collector + a metrics/trace backend (Prometheus + Thanos/Mimir, tracing
+  backend) reachable cluster-wide.
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (created this phase)
+--------------------------------------------------------------------------------
+onezox/
+|-- proto/
+|   |-- gateway/ dataplane/ provider/ admin/ eval/
+|   |-- buf.yaml  buf.gen.yaml
+|-- services/
+|   |-- edge-stub/            # RUST (throwaway)
+|   |-- dataplane-stub/       # PYTHON (throwaway)
+|   |-- provider-stub/        # GO (throwaway)
+|-- platform/
+|   |-- terraform/{regions,cells,networking,gpu,dr}
+|   |-- helm/ argocd/ karpenter/ cilium/
+|   |-- operators/            # Cockroach, Redis now; others declared
+|-- libs/                     # tokenizer(Rust/PyO3) scaffold, otel, ir-schema stub
+|-- data/                     # migrations/ (schema_migrations, tenants, health_probe)
+|-- ci/                       # pipelines, buf breaking-change check, build-all
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+- CI: commit -> buf lint + breaking-change check -> codegen -> build all three
+  languages -> unit tests -> container images -> push.
+- Argo CD watches the platform/ manifests and reconciles the cell.
+- Each stub: on boot connects to CockroachDB (writes a health_probe row) and
+  Redis (set/get a namespaced key), emits an OTel span to the Collector.
+- Mesh: all pod-to-pod traffic over Cilium mTLS.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: none (this is the root phase).
+- External tooling: Bazel/Nx, buf, Terraform, Helm, Argo CD, Karpenter, Cilium,
+  CockroachDB operator, Redis, OTel Collector, Prometheus/Thanos.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- mTLS on by default via Cilium for all service-to-service traffic (zero-trust
+  baseline from Part O).
+- Least-privilege Kubernetes RBAC and per-service ServiceAccounts.
+- Secrets via Kubernetes secrets now; HashiCorp Vault is provisioned in Phase-04
+  (do not put provider keys anywhere yet — none exist this phase).
+- Signed images (Sigstore) and SBOM generation wired into CI as required by
+  Part O (admission controller enforcement can be report-only this phase).
+- Object store buckets private, encryption at rest ON, versioning ON.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. terraform apply for one region + one cell + networking.
+2. Install Cilium (eBPF, mTLS), Karpenter, Argo CD.
+3. Install CockroachDB + Redis operators; provision clusters.
+4. Create object-store buckets with versioning + encryption.
+5. Deploy OTel Collector + metrics/trace backend.
+6. Point Argo CD at platform/; let it reconcile.
+7. Build + push the three stubs; deploy via Argo CD.
+8. Run migrations to create schema_migrations, tenants, health_probe.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- CI proves: buf breaking-change gate blocks a deliberate breaking edit.
+- Build-all passes for Rust, Python, Go.
+- Each stub /healthz and /readyz return 200 in-cluster.
+- Each stub writes a health_probe row (DB reachable) and a Redis key (cache
+  reachable) from its own language runtime.
+- A trace from each stub is visible end-to-end in the tracing backend.
+- Terraform is reproducible: destroy + re-apply yields an identical cell.
+- mTLS verified: plaintext pod-to-pod traffic is rejected.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+A reproducible single-cell environment where all three language runtimes build
+in CI, deploy via GitOps, connect to Cockroach + Redis + object store, and emit
+end-to-end telemetry over an mTLS mesh. No user traffic yet.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Monorepo builds all three languages in CI.
+[ ] buf lint + breaking-change gate enforced.
+[ ] Terraform provisions one region + one cell reproducibly.
+[ ] CockroachDB, Redis, object store reachable from all languages.
+[ ] Cilium mTLS enforced; plaintext rejected.
+[ ] Karpenter + Argo CD reconciling the cell.
+[ ] OTel traces/metrics/logs flowing to backend from every stub.
+[ ] Sigstore signing + SBOM steps present in CI.
+[ ] schema_migrations, tenants, health_probe created.
+[ ] Object buckets created with versioning + encryption.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-01)
+--------------------------------------------------------------------------------
+1. A fresh engineer can clone, build, and deploy the cell from docs alone.
+2. All three stubs healthy, telemetry visible, DB + cache + object store proven
+   from each language.
+3. GitOps reconciliation and Terraform reproducibility demonstrated.
+4. mTLS, image signing, and SBOM steps confirmed in the pipeline.
+================================================================================
+END OF PHASE-00.TXT
+================================================================================

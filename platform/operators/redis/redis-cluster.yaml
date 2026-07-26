@@ -1,0 +1,108 @@
+# Hand-written Redis Cluster manifests for local Phase-00 development.
+#
+# Why hand-written, not a Helm chart: the long-standing default (Bitnami's
+# redis-cluster chart) now references container images Bitnami moved behind
+# their paid "Secure Images" catalog (docker.io/bitnami/redis-cluster has
+# zero public tags as of this writing). Redis Inc.'s own official chart is
+# for Redis Enterprise (commercial/license-gated). Rather than depend on an
+# unmaintained third-party chart, this uses the plain official `redis` image
+# directly with the same StatefulSet + headless-Service pattern Redis's own
+# Kubernetes documentation recommends.
+#
+# No PersistentVolumeClaims: Part I is explicit that Redis here is "strictly
+# ephemeral use only, no persistent schema" — emptyDir is the correct choice,
+# not an oversight. A rescheduled pod gets a clean slate, which is fine for
+# a cache/rate-limit store.
+#
+# 6 replicas = 3 masters + 3 replicas, the minimum viable Redis Cluster
+# topology (fewer than 3 masters can't actually shard across 16384 hash
+# slots in a meaningful way). See the chat explanation for local vs.
+# production sizing differences.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-cluster-config
+  namespace: default
+data:
+  redis.conf: |
+    cluster-enabled yes
+    cluster-config-file /data/nodes.conf
+    cluster-node-timeout 5000
+    appendonly no
+    protected-mode no
+    dir /data
+    port 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster-headless
+  namespace: default
+  labels:
+    app: redis-cluster
+spec:
+  clusterIP: None
+  selector:
+    app: redis-cluster
+  ports:
+    - name: client
+      port: 6379
+      targetPort: 6379
+    - name: cluster-bus
+      port: 16379
+      targetPort: 16379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-cluster
+  namespace: default
+spec:
+  serviceName: redis-cluster-headless
+  replicas: 6
+  selector:
+    matchLabels:
+      app: redis-cluster
+  template:
+    metadata:
+      labels:
+        app: redis-cluster
+    spec:
+      containers:
+        - name: redis
+          image: redis:8.2.3-alpine
+          command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+          ports:
+            - containerPort: 6379
+              name: client
+            - containerPort: 16379
+              name: cluster-bus
+          volumeMounts:
+            - name: conf
+              mountPath: /usr/local/etc/redis
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: redis-cluster-config
+        - name: data
+          emptyDir: {}

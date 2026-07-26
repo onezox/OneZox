@@ -1,0 +1,9 @@
+go 1.26.5
+
+// No `use` directives yet — this workspace is intentionally empty.
+// Application code is out of scope until the phase step that builds the
+// stub/real services. Go modules that will join this workspace (Part C,
+// Part Q):
+//   - services/provider-stub    (Phase-00 throwaway health stub)
+//   - services/provider-gateway (later: real provider abstraction layer)
+//   - services/chat-service     (later: single owner of chat history)

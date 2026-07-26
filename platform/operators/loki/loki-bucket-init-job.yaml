@@ -1,0 +1,34 @@
+# Creates the MinIO bucket Loki uses for chunk + ruler storage.
+#
+# Not one of Phase-00's three named application buckets (onezox-artifacts,
+# onezox-traces, onezox-backups — see platform/operators/minio/) — this is
+# an infrastructure-internal dependency of Loki itself, so it's created here
+# alongside Loki's own manifests rather than folded into the MinIO step.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loki-bucket-init
+  namespace: default
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: docker.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              until mc alias set onezox http://minio.default.svc.cluster.local:9000 \
+                    "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do
+                echo "waiting for minio..."
+                sleep 2
+              done
+              mc mb "onezox/onezox-loki-chunks" || echo "bucket already exists"
+              mc encrypt set sse-s3 "onezox/onezox-loki-chunks"

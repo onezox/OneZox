@@ -1,0 +1,43 @@
+# One-time bucket bootstrap, matching Phase-00's exact object-store spec:
+# "Buckets: onezox-artifacts, onezox-traces, onezox-backups (versioning ON)."
+# Buckets are private by default in MinIO (no public policy applied) —
+# satisfies "Object store buckets private" from the Security Implementation
+# section alongside the SSE-S3 encryption already enabled server-wide.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-bucket-init
+  namespace: default
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: docker.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              until mc alias set onezox http://minio.default.svc.cluster.local:9000 \
+                    "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do
+                echo "waiting for minio..."
+                sleep 2
+              done
+
+              for bucket in onezox-artifacts onezox-traces onezox-backups; do
+                mc mb --with-versioning "onezox/${bucket}" || echo "bucket ${bucket} already exists"
+                mc version info "onezox/${bucket}"
+                # Default SSE-S3 encryption per bucket — MINIO_KMS_SECRET_KEY
+                # alone only makes encryption *available*, it does not make
+                # it the default for objects written without an explicit
+                # encryption header. This is what makes "encryption at rest
+                # ON" (Phase-00 Security Implementation) actually true.
+                mc encrypt set sse-s3 "onezox/${bucket}"
+                mc encrypt info "onezox/${bucket}"
+              done

@@ -1,0 +1,108 @@
+# OpenTelemetry Collector — Helm values for local Phase-00 development.
+# Chart: open-telemetry/opentelemetry-collector, version 0.165.0
+# (collector image v0.156.0, contrib distribution — needed for the
+# otlphttp/prometheus exporter set used below).
+#
+# mode: deployment (not daemonset) — one collector per cell, matching Part L:
+# "Every service -> OTel SDK -> OTel Collector (per cell)". A daemonset
+# (one collector per node) is a production scaling concern, not a Phase-00
+# local-dev one.
+#
+# Exporters to Tempo and Loki are configured now even though those backends
+# don't exist until Steps 21/22 — they will show connection-refused retries
+# in the collector's logs until then. This is expected, not a fault: OTel
+# Collector exporters operate independently per-pipeline, so the debug
+# exporter (used for this step's own verification) and the working
+# Prometheus exporter are unaffected by Tempo/Loki being unreachable.
+
+mode: deployment
+replicaCount: 1
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+  tag: "0.156.0"
+
+command:
+  name: otelcol-contrib
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+ports:
+  otlp:
+    enabled: true
+  otlp-http:
+    enabled: true
+  # Custom port for the `prometheus` exporter below (pull-based metrics
+  # exposition) — distinct from the chart's own built-in `metrics` port
+  # (8888), which is the collector's *internal self-telemetry*, not the
+  # OTLP metrics it receives and re-exposes.
+  prom-exporter:
+    enabled: true
+    containerPort: 8889
+    servicePort: 8889
+    protocol: TCP
+
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: ${env:MY_POD_IP}:4317
+        http:
+          endpoint: ${env:MY_POD_IP}:4318
+
+  processors:
+    batch: {}
+    memory_limiter:
+      check_interval: 5s
+      limit_percentage: 80
+      spike_limit_percentage: 25
+
+  exporters:
+    debug:
+      verbosity: detailed
+    # Traces -> Tempo (Step 23). Tempo natively accepts OTLP, so no
+    # translation is needed, just a direct OTLP-to-OTLP forward.
+    otlp/tempo:
+      endpoint: tempo.default.svc.cluster.local:4317
+      tls:
+        insecure: true
+    # Logs -> Loki (Step 22). Loki's native OTLP ingestion endpoint
+    # (Loki 3.x+) — the modern approach, replacing the older dedicated
+    # `loki` exporter.
+    otlphttp/loki:
+      endpoint: http://loki.default.svc.cluster.local:3100/otlp
+      tls:
+        insecure: true
+    # Metrics -> Prometheus (Step 21), pull-based: this exporter just
+    # exposes a /metrics endpoint; Prometheus will be configured to scrape
+    # this collector as a target, rather than the collector pushing to
+    # Prometheus's remote-write endpoint.
+    prometheus:
+      endpoint: ${env:MY_POD_IP}:8889
+
+  extensions:
+    health_check:
+      endpoint: ${env:MY_POD_IP}:13133
+
+  service:
+    extensions: [health_check]
+    pipelines:
+      traces:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlp/tempo, debug]
+      metrics:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [prometheus, debug]
+      logs:
+        receivers: [otlp]
+        processors: [memory_limiter, batch]
+        exporters: [otlphttp/loki, debug]

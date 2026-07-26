@@ -1,0 +1,105 @@
+# Loki — Helm values for local Phase-00 development.
+# Chart: grafana/loki, version 7.1.0 (Loki v3.6.8), OSS (enterprise.enabled
+# stays false — no license needed).
+#
+# Adapted from the chart's own official single-binary-values.yaml example
+# (production/helm/loki/single-binary-values.yaml in the grafana/loki repo),
+# with one deliberate change: minio.enabled is false here, and storage
+# points at OUR existing MinIO from Step 19 instead of the chart deploying
+# its own bundled MinIO. Running two separate object stores in one cell for
+# no reason would be genuinely redundant, and this is also the exact
+# pattern production uses when swapping in real S3 (see the local vs.
+# production explanation in chat).
+#
+# deploymentMode: SingleBinary — all Loki components in one process, not
+# the SimpleScalable (read/write/backend split) default. Matches this
+# whole plan's pattern of scoping every backend to what Phase-00 actually
+# needs, not production-scale topology.
+
+deploymentMode: SingleBinary
+
+loki:
+  # Multi-tenancy auth is on by default in this chart (every API call would
+  # need an X-Scope-OrgID header). OneZox's real architecture IS
+  # multi-tenant (Part I: {tenant}:{domain}:{key}), but no real tenants
+  # exist yet this phase — matches the same "no auth hardening yet, that's
+  # Phase-04 Vault territory" pattern already used for CockroachDB
+  # (--insecure) and Redis (protected-mode no).
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  schemaConfig:
+    configs:
+      - from: "2024-01-01"
+        store: tsdb
+        object_store: s3
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+  ingester:
+    chunk_encoding: snappy
+  tracing:
+    enabled: true
+  querier:
+    max_concurrent: 2
+  storage:
+    type: s3
+    bucketNames:
+      chunks: onezox-loki-chunks
+      ruler: onezox-loki-chunks
+    s3:
+      endpoint: minio.default.svc.cluster.local:9000
+      region: us-east-1
+      accessKeyId: onezox-admin
+      secretAccessKey: onezox-local-dev-only
+      s3ForcePathStyle: true
+      insecure: true
+
+singleBinary:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  extraEnv:
+    - name: GOMEMLIMIT
+      value: 480MiB
+
+chunksCache:
+  writebackSizeLimit: 10MB
+
+# Using our own MinIO (Step 19) instead — see header comment.
+minio:
+  enabled: false
+
+# Zero out replica counts for the SimpleScalable/distributed deployment
+# modes' components — SingleBinary mode doesn't use them, but the chart
+# still expects these values to be defined.
+backend:
+  replicas: 0
+read:
+  replicas: 0
+write:
+  replicas: 0
+ingester:
+  replicas: 0
+querier:
+  replicas: 0
+queryFrontend:
+  replicas: 0
+queryScheduler:
+  replicas: 0
+distributor:
+  replicas: 0
+compactor:
+  replicas: 0
+indexGateway:
+  replicas: 0
+bloomCompactor:
+  replicas: 0
+bloomGateway:
+  replicas: 0

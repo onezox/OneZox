@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+
+# No members yet — this workspace is intentionally empty. Application code
+# is out of scope until the phase step that builds the stub/real services.
+# Rust crates that will join this workspace (Part C, Part Q):
+#   - services/edge-stub        (Phase-00 throwaway health stub)
+#   - services/edge-gateway     (later: real public ingress / streaming relay)
+#   - services/sandbox-supervisor (later: Firecracker microVM supervisor)
+#   - libs/tokenizer            (later: Rust/PyO3 extension for the Python data-plane)
+members = []
+
+[workspace.package]
+edition = "2024"

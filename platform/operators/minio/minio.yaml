@@ -1,0 +1,112 @@
+# MinIO — S3-compatible object store for local Phase-00 development.
+# Standalone single-node/single-drive mode: sufficient to prove the S3 API
+# contract locally. Production would run MinIO in distributed mode across
+# multiple drives/nodes for erasure-coded durability (see chat explanation
+# for the full local-vs-production breakdown).
+#
+# Root credentials and the SSE-S3 encryption key are stored as a Kubernetes
+# Secret per Phase-00's explicit allowance: "Secrets via Kubernetes secrets
+# now" (Vault arrives Phase-04). These are placeholder dev-only values.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: default
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: onezox-admin
+  MINIO_ROOT_PASSWORD: onezox-local-dev-only
+  # Single-key SSE-S3 auto-encryption (MinIO's built-in KMS-free option) —
+  # gives real "encryption at rest ON" locally without needing Vault, which
+  # doesn't exist until Phase-04. Production replaces this with a
+  # Vault-backed KMS integration instead of a static key.
+  MINIO_KMS_SECRET_KEY: "onezox-sse-key:JLfPOQreMNl10Q7hEUaN9e2L0u09c/0ChCZWUkPne1w="
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 4Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: docker.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: default
+  labels:
+    app: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001

@@ -1,0 +1,24 @@
+# Local Phase-00 CockroachDB cluster — insecure mode, single cell, no
+# topology.zones (kind nodes have no real cloud AZ labels). A production
+# CrdbCluster differs in: secure mode (operator-managed TLS), topology.zones
+# set to real cloud AZs/regions (drives geo-partitioning), durable
+# cloud-backed storage with snapshot backups, and storage sized to real
+# tenant/usage volume rather than this 4Gi placeholder.
+apiVersion: crdb.cockroachlabs.com/v1alpha1
+kind: CrdbCluster
+metadata:
+  name: onezox-crdb
+  namespace: default
+spec:
+  dataStore:
+    pvc:
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 4Gi
+        volumeMode: Filesystem
+  image:
+    name: cockroachdb/cockroach:v26.2.4
+  nodes: 3

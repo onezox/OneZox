@@ -1,0 +1,193 @@
+================================================================================
+PHASE-14 — MULTI-REGION, DR, CHAOS, LEARNED ROUTER, LAUNCH   [MILESTONE M9]
+================================================================================
+Implements Architecture Part N.1-N.4 (multi-cell -> multi-region active-active,
+HA, DR), Part N.3 (graceful degradation ladder), Part G.3 (learned router),
+Part F.6 (semantic response cache), Part K (SDKs/playground), Part O (final
+security hardening). Build stage 9 + 10. FINAL PRODUCTION LAUNCH.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Take OneZox to production scale and launch: expand from one cell to many, then to
+multi-region active-active with anycast routing and cross-region replication;
+drill DR and chaos against the degradation ladder; enable the learned router and
+semantic response cache behind the eval gate; package for on-prem/enterprise; and
+ship SDKs, docs, and a playground. This is the enterprise-scale endgame.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Multi-cell scale-out within a region (scale OUT by cells, not up by fleets).
+- Multi-region active-active: anycast routes to nearest healthy region; full
+  region loss sheds to others.
+- Cross-region replication + data-residency pinning for all stateful stores.
+- Graceful degradation ladder (Part N.3): provider down -> fallback provider ->
+  cheaper model -> cached/semantic response -> clear error (never a hard 500 if a
+  lower rung can serve).
+- DR drills + chaos game-days: kill a provider, kill a cell, kill a region;
+  verify failover + degradation + RTO/RPO.
+- Learned router (Part G.3): the optimizer's policy (Phase-12) routes for
+  quality-per-dollar, enabled behind the eval gate.
+- Semantic response cache (Part F.6): near-duplicate requests skip execution
+  (with freshness policy), enabled behind the eval gate.
+- On-prem/enterprise packaging (MinIO + self-host parity).
+- Public SDKs, API docs, and playground.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- Cell router / global traffic manager (anycast + geo-routing).
+- Cross-region replication config for CockroachDB, ScyllaDB (Chat), Memory
+  Postgres, FoundationDB, object store, Redpanda, ClickHouse.
+- Degradation-ladder controller wiring across scheduler + Provider Gateway.
+- Learned-router integration consuming optimizer_policy (Phase-12).
+- Semantic-response-cache tier activation (Part F.6).
+- SDK packages + docs site + playground (admin panel playground from Part R).
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- Global traffic manager / cell router (multi-region).
+- SDKs (client libraries) + docs/playground.
+- No new core engine service; this phase composes + hardens existing services
+  across regions.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+- Public SDK surface over the existing OpenAI-compatible + OZ-native APIs
+  (Part K); no new server APIs required.
+- Internal: RouteDecision(request_class) -> model (learned router, behind flag).
+- Internal: SemanticCacheLookup(request_embedding) -> cached_response|miss.
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+- No new logical tables; existing stores gain cross-region replication +
+  residency pinning:
+  * CockroachDB: multi-region synchronous replication (billing/usage/manifests).
+  * ScyllaDB (Chat): RF>=3 across AZs/regions, quorum writes.
+  * Memory Postgres: replicated; Qdrant embeddings rebuildable from text.
+  * FoundationDB: replication + Temporal multi-cluster.
+  * Object store: cross-region replication, versioned.
+  * Redpanda + ClickHouse: replication + backups.
+Semantic response cache (Part F.6):
+- semantic_response_cache  (request_embedding -> response, freshness_policy, ts)
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- Multiple regions, each with multiple cells (vclusters) (Part N.1).
+- Anycast / global load balancing with health-based region shedding.
+- Cross-region networking + replication for all stateful stores.
+- Karpenter + KEDA per region; token-aware scaling everywhere (Part N.2).
+- DR + chaos tooling (game-day automation).
+- Docs hosting + SDK package registries.
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+platform/terraform/{regions,cells,networking,dr}/   # multi-region + DR
+platform/                                            # global traffic manager
+services/data-plane/scheduler/                       # learned-router + degradation ladder
+services/data-plane/retrieval/                       # semantic-response-cache wiring
+sdks/                                                # client SDK packages
+docs/                                                # API docs + playground assets
+admin-panel/app/playground/                          # playground (Part R)
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+Client -> anycast -> nearest healthy REGION -> cell router -> edge -> engine.
+Region loss -> anycast sheds to another region (active-active).
+Degradation ladder: provider down -> Provider Gateway signals -> scheduler
+  falls back provider -> cheaper model -> semantic/cached response -> clear error.
+Learned router: scheduler consults optimizer_policy (behind flag, eval-gated) to
+  pick quality-per-dollar routing.
+Semantic cache: near-duplicate request -> SemanticCacheLookup hit -> skip
+  execution (respecting freshness) -> respond.
+DR/chaos: game-day kills provider/cell/region -> verify failover + RTO/RPO.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: ALL prior phases (00-13). Multi-region composes every service;
+  learned router needs Phase-12 optimizer; semantic cache needs Phase-10 cache
+  tiers + Phase-12 eval gate; DR needs Phase-13 observability.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Data-residency pinning: a tenant's data stays in its home region where required
+  (Part I geo-partitioning; Chat/Memory honor residency).
+- Cross-region replication encrypted in transit + at rest (per-tenant keys).
+- Final zero-trust review: mTLS everywhere, least-privilege, signed images +
+  admission control enforced (Part O) — report-only modes flipped to enforcing.
+- DR runbooks + automated failover; security sign-off in the readiness review.
+- Learned router + semantic cache gated by eval (no quality/safety regression
+  ships).
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS (mirrors Roadmap FINAL PRODUCTION LAUNCH ROADMAP)
+--------------------------------------------------------------------------------
+1. Add a second cell in the primary region; validate the cell router.
+2. Add a second region; enable active-active traffic + anycast/geo-routing.
+3. Verify cross-region replication (Cockroach, ScyllaDB, Memory Postgres, FDB,
+   object store, Redpanda, ClickHouse) + residency pinning.
+4. DR drill: kill a provider, kill a cell, kill a region; verify the degradation
+   ladder + failover against runbooks.
+5. Chaos game-day; confirm RTO/RPO per the DR table.
+6. Enable learned router + semantic response cache behind flags, eval-validated.
+7. Build + smoke-test on-prem/enterprise packaging (MinIO, self-host parity).
+8. Ship SDKs, API docs, and playground.
+9. Production readiness review: SLOs, on-call, runbooks, security sign-off.
+10. GA.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Multi-region: active-active traffic served from nearest region; region loss
+  sheds without user-visible outage.
+- Replication: cross-region RTO/RPO meet the DR table targets; residency honored.
+- DR drills: provider/cell/region kills recover per runbooks; degradation ladder
+  never returns a hard 500 when a lower rung can serve.
+- Chaos: game-day passes; idempotency/Temporal durability prevent double charges.
+- Learned router: routing improves quality-per-dollar without eval regression.
+- Semantic cache: near-duplicate requests served from cache within freshness
+  policy; no stale/incorrect reuse.
+- Enterprise: on-prem package deploys with self-host parity.
+- SDKs/docs/playground: a new developer integrates via SDK from docs alone.
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+OneZox running multi-region active-active, DR-drilled and chaos-tested, with a
+learned router and semantic cache live behind the eval gate, enterprise packaging,
+and shipped SDKs/docs/playground. Production launch — M9.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Multi-cell -> multi-region active-active with anycast/geo-routing.
+[ ] Cross-region replication + data-residency pinning for all stores.
+[ ] Graceful degradation ladder verified (no hard 500 when a rung can serve).
+[ ] DR drills + chaos game-days pass; RTO/RPO met.
+[ ] Learned router live behind the eval gate.
+[ ] Semantic response cache live (with freshness policy).
+[ ] On-prem/enterprise packaging built + smoke-tested.
+[ ] SDKs + API docs + playground shipped.
+[ ] Final zero-trust security review + admission control enforcing.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (PRODUCTION LAUNCH — MILESTONE M9)
+--------------------------------------------------------------------------------
+1. Active-active multi-region serves traffic and survives a region loss.
+2. DR + chaos drills pass against runbooks; RTO/RPO targets met.
+3. Learned router + semantic cache are eval-gated and live.
+4. Enterprise packaging + SDKs + docs shipped; readiness review + security
+   sign-off complete.
+5. GA declared.
+================================================================================
+END OF PHASE-14.TXT
+================================================================================

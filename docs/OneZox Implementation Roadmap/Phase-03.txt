@@ -1,0 +1,164 @@
+================================================================================
+PHASE-03 — DATA PLANE FAST PATH (PYTHON)   [SHIPPABLE MILESTONE M1]
+================================================================================
+Implements Architecture Part E (orchestration core: two-tier planner fast path,
+scheduler binding), Part C (Python for orchestration), Part D (request topology),
+Part P (lifecycle brain), Part L (token/cost metering). Completes build stage 2
+(vertical slice). END OF THIS PHASE = SHIPPABLE PRODUCT.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Complete the vertical slice: a real Python data plane that takes the normalized
+request from the edge, runs the complexity classifier, executes the FAST PATH
+(a template DAG with no LLM planning cost), binds the role to a model, calls the
+Provider Gateway, streams tokens back through the edge, and meters final
+token/cost. After this phase a user gets a real, streamed answer from one
+frontier model — authenticated, rate-limited, and billed.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Complexity classifier that routes simple requests to the fast path.
+- Fast path: template DAG execution (no LLM used to plan — zero planning cost).
+- Scheduler (minimal): admission + role->model binding using live provider
+  health/headroom from the Provider Gateway.
+- Streaming fan-in: relay provider deltas up through the edge to the client.
+- Final metering: tokens_in, tokens_out, orchestration_tokens, usd_cost on the
+  span (Part L), emitted to telemetry.
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- data-plane service (Python) with modules (Part Q, fast-path subset):
+  planner/{classifier,templates}, scheduler/{admit,place,dispatch,backpressure},
+  working_memory/ (in-request only), aggregator/ (passthrough synth for single
+  worker). Retrieval, deliberate planner, and multi-agent are later phases.
+- Template DAG library for common single-worker request shapes.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- data-plane (Python). Replaces the Phase-00 dataplane-stub.
+- Integrates edge-gateway (Phase-01) upstream and provider-gateway (Phase-02)
+  downstream to form the complete slice.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal (gRPC):
+- Submit(normalized_request) -> stream(delta)     [proto: dataplane] (now real)
+Consumes:
+- provider Invoke() -> stream(delta), ProviderHealth()  (from Phase-02)
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+CockroachDB:
+- usage_event   (event_id PK, org_id, request_id, tokens_in, tokens_out,
+                 orch_tokens, usd_cost, model_ref, ts)   -- billing substrate
+- request_log   (request_id PK, org_id, path, status, latency_ms, ts)
+Redis (ephemeral):
+- workingmem:{request_id}   -> in-request transcript/DAG state (TTL = request life)
+Note: working memory is request-scoped only; it evaporates at request end. The
+engine stays stateless (no durable state here).
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- dataplane node pool (Part N), Python service, HPA baseline (token-aware KEDA
+  arrives in Phase-13; basic scaling now).
+- Redis for working memory + admission signals.
+- mTLS to edge (up) and provider-gateway (down).
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/
+|-- data-plane/                   # PYTHON (replaces dataplane-stub)
+|   |-- planner/
+|   |   |-- classifier/           # complexity classifier
+|   |   |-- templates/            # template DAGs (fast path)
+|   |-- scheduler/
+|   |   |-- admit/ place/ dispatch/ backpressure/
+|   |-- working_memory/           # in-request only (Redis/in-proc)
+|   |-- aggregator/               # single-worker passthrough synth
+proto/dataplane/                  # Submit contract finalized
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+edge-gateway --gRPC Submit--> data-plane:
+  classifier -> FAST PATH template DAG -> scheduler admit
+  -> bind role->model (uses ProviderHealth) -> dispatch
+  -> provider-gateway Invoke() [stream] -> fan-in deltas
+  -> stream up to edge -> client (SSE)
+On completion: write usage_event + request_log; emit final metering span.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-00 (foundation), Phase-01 (edge), Phase-02 (provider gateway).
+- Contracts: proto/dataplane, proto/provider.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- Tenant identity (org_id/user_id/project_id) propagated from the edge on every
+  internal call; no call proceeds without it (Part O).
+- mTLS on all gRPC.
+- Working memory keyed and TTL'd per request; never shared across tenants.
+- No provider credentials in the data plane — it calls the Provider Gateway,
+  which holds them.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Apply usage_event + request_log migrations.
+2. Deploy data-plane to the dataplane pool via Argo CD.
+3. Wire edge-gateway downstream to data-plane (remove stub route).
+4. Register one frontier model reference as a static config (registry arrives
+   in Phase-04; a static ref is acceptable here).
+5. Run the full slice: client -> edge -> data plane -> provider -> client.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: classifier decisions (simple->fast path); template DAG execution;
+  scheduler role->model binding; metering math.
+- Integration (the slice): authenticated streamed answer from one real frontier
+  model end-to-end, with correct usage_event written.
+- Billing: token/cost fields on the span match usage_event.
+- Backpressure: slow client does not stall the pool.
+- Resilience: provider breaker (Phase-02) causes a clean typed error to client
+  (fallback routing is added in Phase-06).
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+A SHIPPABLE product: a real, authenticated, rate-limited, metered, streamed
+completion from one frontier model via an OpenAI-compatible API. This is M1 —
+the first thing a customer could actually use.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Complexity classifier routes to fast path.
+[ ] Template DAG executes with no LLM planning cost.
+[ ] Scheduler binds role->model using live provider health.
+[ ] Streaming fan-in edge<->data plane<->provider works.
+[ ] usage_event + request_log written; metering span correct.
+[ ] Engine remains stateless (working memory request-scoped only).
+[ ] Full slice passes end-to-end with a real frontier model.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-04)   [GATES MILESTONE M1]
+--------------------------------------------------------------------------------
+1. A user with a valid API key receives a streamed frontier-model answer
+   end-to-end.
+2. Metering is correct and reconciles to usage_event (billing substrate real).
+3. Tenant isolation holds across the whole slice.
+4. The slice is deployed via GitOps, observable, and load-tested for stable p99.
+================================================================================
+END OF PHASE-03.TXT
+================================================================================

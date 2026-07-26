@@ -1,0 +1,164 @@
+================================================================================
+PHASE-06 — DELIBERATE PATH: WORKFLOW IR, PLANNER, SCHEDULER, TEMPORAL
+================================================================================
+Implements Architecture Part E (two-tier planner deliberate path, Workflow IR,
+scheduler advanced binding), Part A (Workflow IR + Temporal redesigns), Part J
+(Temporal for durable execution), Part I (FoundationDB for durable workflow
+state). Build stage 4, part 1.
+
+--------------------------------------------------------------------------------
+GOAL
+--------------------------------------------------------------------------------
+Add the deliberate (slow, high-quality) path: an LLM planner that emits a typed,
+serializable Workflow IR (a DAG), a cost gate that approves the plan before
+execution, an advanced scheduler that binds roles to models on live signals, and
+Temporal for durable, exactly-once workflow execution that survives pod crashes.
+The fast path from Phase-03 remains for simple requests.
+
+--------------------------------------------------------------------------------
+FEATURES IMPLEMENTED
+--------------------------------------------------------------------------------
+- Deliberate planner: LLM-generated Workflow IR (typed DAG) for complex requests.
+- Workflow IR schema: nodes carry {node_id, kind, worker_ref, access_list,
+  budget, retry, cache_key, on_fail}.
+- Cost gate: estimate plan cost from pricing (Phase-04) and approve/deny/limit
+  before any execution.
+- Advanced scheduler: admission control, role->model binding using live
+  health/price/latency/cache-locality, deadline propagation, backpressure.
+- Temporal durable execution: activities are idempotent; workflows resume on
+  another pod after a crash; exactly-once effects.
+- Fast path bypasses Temporal; deliberate path uses it (Part J).
+
+--------------------------------------------------------------------------------
+COMPONENTS IMPLEMENTED
+--------------------------------------------------------------------------------
+- data-plane modules (Part Q): planner/{deliberate,critic,ir},
+  scheduler/{admit,place,dispatch,backpressure} (advanced binding),
+  workflows/ (Temporal workflow + activity definitions).
+- IR schema in libs/ir-schema (typed, serializable, versioned).
+- Cost-gate component reading pricing/policy from the control plane.
+
+--------------------------------------------------------------------------------
+SERVICES CREATED
+--------------------------------------------------------------------------------
+- Temporal (deployed, FoundationDB-backed).
+- No new top-level service; the deliberate path lives in the existing data-plane
+  service plus Temporal workers.
+
+--------------------------------------------------------------------------------
+APIS CREATED
+--------------------------------------------------------------------------------
+Internal:
+- PlanRequest(normalized_request) -> WorkflowIR            (planner)
+- CostGate(WorkflowIR) -> {approved, adjusted_budget}      (cost gate)
+- ExecuteWorkflow(WorkflowIR) -> stream(delta)             (Temporal-driven)
+- (fast path Submit from Phase-03 unchanged for simple requests)
+
+--------------------------------------------------------------------------------
+DATABASE TABLES REQUIRED
+--------------------------------------------------------------------------------
+FoundationDB (durable workflow state, Part I):
+- workflow_state       (workflow_id -> serialized Temporal state)   -- via Temporal
+- ir_store             (workflow_id -> WorkflowIR json)             -- for replay (Phase-12)
+CockroachDB:
+- plan_audit           (plan_id PK, request_id, ir_hash, est_cost, approved,
+                        ts)   -- cost-gate decisions
+Redis (ephemeral):
+- workingmem:{workflow_id}   -> in-flight DAG state (TTL = workflow life)
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE REQUIRED
+--------------------------------------------------------------------------------
+- FoundationDB cluster (Part I) via operator, backing Temporal + workflow state.
+- Temporal server + worker pools (dataplane pool).
+- No GPU required this phase (LLM planning uses the Provider Gateway).
+
+--------------------------------------------------------------------------------
+FOLDER / PROJECT STRUCTURE (added/changed this phase)
+--------------------------------------------------------------------------------
+services/data-plane/
+|-- planner/{deliberate,critic,ir}     # LLM planning + plan critic + IR emit
+|-- scheduler/{admit,place,dispatch,backpressure}  # advanced binding
+|-- workflows/                          # Temporal workflow + activity defs
+libs/ir-schema/                         # typed serializable IR (finalized)
+platform/operators/foundationdb/        # FDB operator
+platform/                               # Temporal deploy
+
+--------------------------------------------------------------------------------
+INTERNAL COMMUNICATION FLOW
+--------------------------------------------------------------------------------
+edge -> data-plane Submit:
+  classifier -> if simple: FAST PATH (Phase-03, no Temporal)
+             -> if complex: DELIBERATE PATH:
+                planner -> WorkflowIR -> cost gate (pricing/policy) ->
+                if approved: ExecuteWorkflow via Temporal:
+                  scheduler binds roles->models (health/price/latency/cache) ->
+                  activities call Provider Gateway [stream] ->
+                  deadline propagation + backpressure -> fan-in -> stream to edge.
+On crash: Temporal resumes the workflow on another pod from the last activity.
+
+--------------------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------------------
+- Upstream: Phase-03 (fast path + scheduler base), Phase-04 (pricing/policy for
+  cost gate; manifests for worker_ref), Phase-05 (manifests authored/rolled out).
+- Contracts: proto/dataplane extensions; libs/ir-schema.
+
+--------------------------------------------------------------------------------
+SECURITY IMPLEMENTATION
+--------------------------------------------------------------------------------
+- access_list on each IR node is recorded now and PHYSICALLY enforced by the
+  scheduler in Phase-07 (multi-agent isolation).
+- Cost gate prevents runaway spend (budget enforcement per plan).
+- Temporal activities idempotent; exactly-once effects prevent double charges.
+- mTLS across all internal calls; tenant identity on every activity.
+
+--------------------------------------------------------------------------------
+DEPLOYMENT STEPS
+--------------------------------------------------------------------------------
+1. Deploy FoundationDB; deploy Temporal (FDB-backed).
+2. Apply plan_audit migration; create ir_store/workflow_state via Temporal + FDB.
+3. Deploy deliberate planner + advanced scheduler + Temporal workers.
+4. Enable classifier routing to the deliberate path for complex requests.
+5. Validate crash-resume and cost-gate denial paths.
+
+--------------------------------------------------------------------------------
+TESTING REQUIREMENTS
+--------------------------------------------------------------------------------
+- Unit: IR schema validation; planner output typing; cost estimate math;
+  scheduler binding decisions; deadline propagation.
+- Integration: a complex request produces an IR, passes the cost gate, executes
+  via Temporal, and streams a result.
+- Durability: kill a worker pod mid-workflow; Temporal resumes; result is
+  correct and effects are exactly-once (no double provider charge).
+- Cost gate: an over-budget plan is denied or trimmed before execution.
+- Regression: simple requests still take the fast path (no Temporal overhead).
+
+--------------------------------------------------------------------------------
+EXPECTED OUTPUT
+--------------------------------------------------------------------------------
+Complex requests are planned into a typed IR, cost-gated, and executed durably
+via Temporal with exactly-once semantics and crash resumption; simple requests
+still use the zero-planning-cost fast path.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST
+--------------------------------------------------------------------------------
+[ ] Deliberate planner emits typed Workflow IR.
+[ ] IR nodes carry worker_ref, access_list, budget, retry, cache_key, on_fail.
+[ ] Cost gate approves/denies/limits plans pre-execution.
+[ ] Advanced scheduler binding on live signals + deadline propagation.
+[ ] Temporal durable execution; idempotent activities; exactly-once.
+[ ] Fast path bypasses Temporal; deliberate path uses it.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA (must all pass before Phase-07)
+--------------------------------------------------------------------------------
+1. A complex request runs the full plan -> cost-gate -> Temporal execution path
+   and streams a correct result.
+2. Crash-resume proven; exactly-once effects verified (no double charges).
+3. Cost gate blocks an over-budget plan.
+4. IR is serialized/stored (ir_store) ready for replay in Phase-12.
+================================================================================
+END OF PHASE-06.TXT
+================================================================================
