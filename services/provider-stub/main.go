@@ -56,11 +56,7 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 		return nil, err
 	}
 
-	res, err := resource.Merge(resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(serviceName)))
-	if err != nil {
-		return nil, err
-	}
+	res := resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(serviceName))
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
@@ -79,7 +75,7 @@ func writeHealthProbe(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger)
 	return nil
 }
 
-func setAndGetRedisKey(ctx context.Context, rdb *redis.Client, log *slog.Logger) error {
+func setAndGetRedisKey(ctx context.Context, rdb *redis.ClusterClient, log *slog.Logger) error {
 	key := tenant + ":" + serviceName + ":boot"
 	value := time.Now().UTC().Format(time.RFC3339)
 	if err := rdb.Set(ctx, key, value, 0).Err(); err != nil {
@@ -145,7 +141,7 @@ func main() {
 	}
 
 	redisHost := envOr("REDIS_HOST", "redis-cluster-headless.default.svc.cluster.local")
-	rdb := redis.NewClient(&redis.Options{Addr: redisHost + ":6379"})
+	rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{redisHost + ":6379"}})
 	if err := setAndGetRedisKey(ctx, rdb, log); err != nil {
 		log.Error("failed redis set/get", "error", err)
 		os.Exit(1)

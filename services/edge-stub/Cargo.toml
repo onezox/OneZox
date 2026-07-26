@@ -7,7 +7,7 @@ edition = "2024"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = "0.7"
-redis = { version = "1.4", features = ["tokio-comp"] }
+redis = { version = "1.4", features = ["tokio-comp", "cluster-async"] }
 s3 = { package = "rust-s3", version = "0.37" }
 opentelemetry = "0.32"
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }

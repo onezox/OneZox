@@ -1,0 +1,24 @@
+# Promtail — Helm values for local Phase-00 development.
+# Chart: grafana/promtail, version 6.17.1 (Promtail v3.5.1).
+#
+# Loki (Step 22) only had its OTLP ingestion path proven (via telemetrygen);
+# nothing was actually tailing container stdout logs into it. Promtail is
+# that missing piece: a DaemonSet (one pod per node) that tails every
+# container's log file and pushes it to Loki's push API, which is what
+# makes the structured JSON logs the three stub services (Deployment
+# Step 7) print to stdout actually queryable in Loki/Grafana.
+#
+# Default config.clients already points at loki-gateway's push endpoint;
+# made explicit here (FQDN) rather than relying on same-namespace DNS
+# shorthand.
+config:
+  clients:
+    - url: http://loki-gateway.default.svc.cluster.local/loki/api/v1/push
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi

@@ -20,7 +20,7 @@ const TENANT: &str = "onezox-dev";
 
 struct AppState {
     pg: Arc<Mutex<tokio_postgres::Client>>,
-    redis: redis::Client,
+    redis: redis::cluster::ClusterClient,
     boot_ok: IntCounter,
     registry: Registry,
 }
@@ -54,7 +54,18 @@ fn init_telemetry() -> opentelemetry_sdk::trace::SdkTracerProvider {
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let fmt_layer = tracing_subscriber::fmt::layer().json();
 
+    // Without this, tracing_opentelemetry bridges EVERY tracing span in the
+    // process into an OTel span — including h2/tonic's own internal
+    // per-frame instrumentation used by the OTLP exporter itself, which
+    // floods Tempo with transport-noise instead of our actual application
+    // spans (confirmed: without this filter, searching Tempo by
+    // service.name=edge-stub returned h2 internals like "reserve_capacity"
+    // instead of "edge_stub.boot"). INFO excludes that (it's TRACE/DEBUG).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
     tracing_subscriber::registry()
+        .with(filter)
         .with(otel_layer)
         .with(fmt_layer)
         .init();
@@ -72,8 +83,8 @@ async fn write_health_probe(pg_client: &tokio_postgres::Client) -> Result<(), to
 }
 
 #[instrument(skip(client))]
-async fn set_and_get_redis_key(client: &redis::Client) -> redis::RedisResult<()> {
-    let mut conn = client.get_multiplexed_async_connection().await?;
+async fn set_and_get_redis_key(client: &redis::cluster::ClusterClient) -> redis::RedisResult<()> {
+    let mut conn = client.get_async_connection().await?;
     let key = format!("{TENANT}:{SERVICE_NAME}:boot");
     let value = chrono::Utc::now().to_rfc3339();
     redis::cmd("SET").arg(&key).arg(&value).query_async::<()>(&mut conn).await?;
@@ -109,7 +120,7 @@ async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pg_ok = pg.simple_query("SELECT 1").await.is_ok();
     drop(pg);
 
-    let redis_ok = match state.redis.get_multiplexed_async_connection().await {
+    let redis_ok = match state.redis.get_async_connection().await {
         Ok(mut conn) => redis::cmd("PING").query_async::<String>(&mut conn).await.is_ok(),
         Err(_) => false,
     };
@@ -130,12 +141,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], buffer)
 }
 
-#[tokio::main]
-async fn main() {
-    let provider = init_telemetry();
-
-    let boot_span = tracing::info_span!("edge_stub.boot");
-    let _enter = boot_span.enter();
+async fn boot(registry: &Registry) -> (tokio_postgres::Client, redis::cluster::ClusterClient, IntCounter) {
     info!(service = SERVICE_NAME, "starting boot sequence");
 
     let pg_host = env("COCKROACH_HOST", "onezox-crdb-public.default.svc.cluster.local");
@@ -151,20 +157,36 @@ async fn main() {
     write_health_probe(&pg_client).await.expect("failed to write health_probe row");
 
     let redis_host = env("REDIS_HOST", "redis-cluster-headless.default.svc.cluster.local");
-    let redis_client = redis::Client::open(format!("redis://{redis_host}:6379")).expect("invalid redis url");
+    let redis_client = redis::cluster::ClusterClient::new(vec![format!("redis://{redis_host}:6379")])
+        .expect("invalid redis cluster config");
     set_and_get_redis_key(&redis_client).await.expect("failed redis set/get");
 
     if let Err(e) = upload_test_object().await {
         error!(error = ?e, "failed to upload test object to MinIO");
     }
 
-    let registry = Registry::new();
     let boot_ok = IntCounter::new("edge_stub_boot_total", "Number of successful boot sequences").unwrap();
     registry.register(Box::new(boot_ok.clone())).unwrap();
     boot_ok.inc();
 
     info!("boot sequence complete");
-    drop(_enter);
+    (pg_client, redis_client, boot_ok)
+}
+
+#[tokio::main]
+async fn main() {
+    let provider = init_telemetry();
+    let registry = Registry::new();
+
+    // .instrument() (not span.enter()) is required here: this span wraps an
+    // async fn with multiple .await points, and holding a sync enter-guard
+    // across an await breaks span-context propagation for the OTel export
+    // (confirmed by the exported trace showing unrelated tonic/tower
+    // internal spans instead of this one, before this fix).
+    use tracing::Instrument;
+    let (pg_client, redis_client, boot_ok) = boot(&registry)
+        .instrument(tracing::info_span!("edge_stub.boot"))
+        .await;
 
     let state = Arc::new(AppState { pg: Arc::new(Mutex::new(pg_client)), redis: redis_client, boot_ok, registry });
 

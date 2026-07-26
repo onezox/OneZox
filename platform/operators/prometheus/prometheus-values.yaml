@@ -34,8 +34,19 @@ server:
 # Scrapes the OTel Collector's `prometheus` exporter (Step 20,
 # platform/operators/otel/values.yaml) — the pull side of the push/pull
 # handoff: Collector exposes /metrics, Prometheus scrapes it here.
+#
+# Also scrapes the three Phase-00 stub services directly (Deployment
+# Step 7) — each exposes its own /metrics with a *_boot_total counter,
+# independent of whatever it emits via OTel.
 extraScrapeConfigs: |
   - job_name: 'otel-collector'
     scrape_interval: 15s
     static_configs:
       - targets: ['otel-collector-opentelemetry-collector.default.svc.cluster.local:8889']
+  - job_name: 'onezox-stubs'
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - 'edge-stub.default.svc.cluster.local:8080'
+          - 'dataplane-stub.default.svc.cluster.local:8080'
+          - 'provider-stub.default.svc.cluster.local:8080'

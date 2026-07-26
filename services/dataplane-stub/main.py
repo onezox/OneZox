@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import asyncpg
-import redis.asyncio as aioredis
+from redis.asyncio.cluster import RedisCluster
 from fastapi import FastAPI, Response
 from fastapi.responses import PlainTextResponse
 from minio import Minio
@@ -66,7 +66,7 @@ tracer = trace.get_tracer(SERVICE)
 boot_counter = Counter("dataplane_stub_boot_total", "Number of successful boot sequences")
 
 pg_pool: asyncpg.Pool | None = None
-redis_client: aioredis.Redis | None = None
+redis_client: RedisCluster | None = None
 
 
 async def write_health_probe(pool: asyncpg.Pool) -> None:
@@ -75,7 +75,7 @@ async def write_health_probe(pool: asyncpg.Pool) -> None:
     log.info("wrote health_probe row")
 
 
-async def set_and_get_redis_key(client: aioredis.Redis) -> None:
+async def set_and_get_redis_key(client: RedisCluster) -> None:
     key = f"{TENANT}:{SERVICE}:boot"
     value = datetime.now(timezone.utc).isoformat()
     await client.set(key, value)
@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI):
         await write_health_probe(pg_pool)
 
         redis_host = os.environ.get("REDIS_HOST", "redis-cluster-headless.default.svc.cluster.local")
-        redis_client = aioredis.Redis(host=redis_host, port=6379, decode_responses=True)
+        redis_client = RedisCluster(host=redis_host, port=6379, decode_responses=True)
         await set_and_get_redis_key(redis_client)
 
         try:
