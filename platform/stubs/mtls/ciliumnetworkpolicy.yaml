@@ -1,0 +1,126 @@
+# Cilium mTLS enforcement between the three Phase-00 stub services.
+#
+# Completes the last Phase-00 acceptance item: SPIRE (Step 9) installed the
+# mTLS *capability* only, deliberately not enforced at the time, pending
+# real services to enforce it between. That's now these three stubs.
+#
+# Design constraint that shaped every rule below: adding ANY ingress rule
+# to a CiliumNetworkPolicy switches that endpoint's ingress to default-deny
+# for everything NOT explicitly matched — but only for ingress; egress is
+# untouched since no egress rules are defined here. Port 8080 on each stub
+# already serves two things besides sibling-stub traffic:
+#   1. kubelet's own liveness/readiness probes (Cilium identity: `host`)
+#   2. Prometheus's /metrics scrape (Deployment Step 7 verification)
+# Both get an explicit no-auth allow rule below so this doesn't regress
+# either already-verified behavior. Nothing else is allowed in on 8080.
+
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: edge-stub-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: edge-stub
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - dataplane-stub
+                - provider-stub
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+      authentication:
+        mode: "required"
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: dataplane-stub-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: dataplane-stub
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - edge-stub
+                - provider-stub
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+      authentication:
+        mode: "required"
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: provider-stub-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: provider-stub
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - edge-stub
+                - dataplane-stub
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+      authentication:
+        mode: "required"
