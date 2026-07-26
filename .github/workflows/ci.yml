@@ -1,0 +1,159 @@
+name: CI
+
+# Runs on every push and every pull request, against any branch — no path
+# or branch filters, per the Phase-00 CI requirement to always run.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  BUF_VERSION: "1.72.0"
+  SYFT_VERSION: "1.49.0"
+  COSIGN_VERSION: "3.1.2"
+
+jobs:
+  # Gate 1: proto contract checks (Part C). Must pass before anything is
+  # built — a broken or breaking contract should never reach a build step.
+  proto:
+    name: buf lint & breaking-change check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install buf ${{ env.BUF_VERSION }}
+        run: |
+          curl -sSL "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64" -o /usr/local/bin/buf
+          chmod +x /usr/local/bin/buf
+          buf --version
+
+      - name: buf lint (proto/)
+        working-directory: proto
+        run: buf lint
+
+      - name: Determine breaking-change base ref
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            echo "ref=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            # First push to a new branch/repo: nothing to compare against yet.
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: buf breaking (proto/, against ${{ steps.base.outputs.ref }})
+        if: steps.base.outputs.skip != 'true'
+        working-directory: proto
+        run: |
+          buf breaking --against "https://github.com/${{ github.repository }}.git#ref=${{ steps.base.outputs.ref }},subdir=proto"
+
+  # Gate 2: build every stub service image, generate its SBOM, and sign it.
+  # Each service builds and is verified independently (fail-fast disabled)
+  # so one language's failure doesn't hide the other two's results.
+  build-sign:
+    name: Build, SBOM & sign — ${{ matrix.service }}
+    needs: proto
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [edge-stub, dataplane-stub, provider-stub]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # --provenance=false --sbom=false: BuildKit attaches its own OCI
+      # attestation manifests by default, turning the output into a
+      # manifest list instead of a plain single image manifest. That
+      # exact manifest-list shape is what broke `kind load docker-image`
+      # for these same images during local deployment (Phase-00
+      # Deployment Step 7, worked around there with a manual `ctr images
+      # import`). Disabling it here keeps every image a plain manifest,
+      # consistent with how these images were built for the cluster.
+      - name: Build ${{ matrix.service }} image
+        run: |
+          docker build --provenance=false --sbom=false \
+            -t "onezox/${{ matrix.service }}:${{ github.sha }}" \
+            -f "services/${{ matrix.service }}/Dockerfile" \
+            "services/${{ matrix.service }}"
+
+      - name: Install Syft ${{ env.SYFT_VERSION }}
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin "v${SYFT_VERSION}"
+          syft version
+
+      - name: Generate SPDX SBOM
+        run: |
+          mkdir -p sbom-out
+          syft "onezox/${{ matrix.service }}:${{ github.sha }}" \
+            -o "spdx-json=sbom-out/${{ matrix.service }}.spdx.json"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-out/${{ matrix.service }}.spdx.json
+          retention-days: 30
+
+      # Cosign signs registry-addressable images (the signature is pushed
+      # as a separate OCI artifact next to the image) — the same reason a
+      # temporary local registry was used to prove signing worked in
+      # Phase-00 Step 24. Using one here too keeps this pipeline
+      # self-contained: no image is published anywhere outside this job.
+      - name: Start ephemeral local registry
+        run: docker run -d --name registry -p 5000:5000 registry:2
+
+      - name: Push image to ephemeral registry
+        id: push
+        run: |
+          docker tag "onezox/${{ matrix.service }}:${{ github.sha }}" \
+            "localhost:5000/onezox/${{ matrix.service }}:${{ github.sha }}"
+          digest=$(docker push "localhost:5000/onezox/${{ matrix.service }}:${{ github.sha }}" \
+            | tee /dev/stderr | grep -oE 'sha256:[a-f0-9]{64}' | tail -1)
+          echo "image_ref=localhost:5000/onezox/${{ matrix.service }}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign ${{ env.COSIGN_VERSION }}
+        run: |
+          curl -sSL "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64" -o /usr/local/bin/cosign
+          chmod +x /usr/local/bin/cosign
+          cosign version
+
+      # Uses the existing dev key pair (COSIGN_KEY / COSIGN_PASSWORD repo
+      # secrets, sourced from the already-generated .tooling/cosign/
+      # key pair — never committed) and the existing no-Rekor signing
+      # config already tracked at .tooling/cosign/signing_config_no_tlog.json,
+      # preserving the Step 24 decision not to upload dev signatures to the
+      # public Rekor transparency log.
+      - name: Sign image with cosign
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          umask 077
+          printf '%s' "${{ secrets.COSIGN_KEY }}" > cosign.key
+          cosign sign --key cosign.key \
+            --allow-insecure-registry \
+            --signing-config .tooling/cosign/signing_config_no_tlog.json \
+            --yes \
+            "${{ steps.push.outputs.image_ref }}"
+          rm -f cosign.key
+
+      - name: Verify signature against tracked public key
+        run: |
+          cosign verify --key platform/security/cosign/cosign.pub \
+            --allow-insecure-registry \
+            --insecure-ignore-tlog=true \
+            "${{ steps.push.outputs.image_ref }}"
+
+      - name: Stop ephemeral registry
+        if: always()
+        run: docker rm -f registry
