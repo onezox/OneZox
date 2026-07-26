@@ -1,0 +1,24 @@
+# Argo CD Application for the three Phase-00 throwaway stub services.
+# Source: the actual GitHub remote (onezox/OneZox) — Argo CD's whole job is
+# to watch a real git repo and reconcile the cluster against it (Part B,
+# Part N), so this points at platform/stubs/ there, not a local path.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: onezox-stubs
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/onezox/OneZox.git
+    targetRevision: main
+    path: platform/stubs
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

@@ -1,0 +1,62 @@
+# Phase-00 throwaway health stub (Rust). Replaced by the real edge-gateway
+# in Phase-01. Deployed via Argo CD, watching platform/ per the roadmap's
+# internal communication flow ("Argo CD watches the platform/ manifests
+# and reconciles the cell").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-stub
+  namespace: default
+  labels:
+    app: edge-stub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-stub
+  template:
+    metadata:
+      labels:
+        app: edge-stub
+    spec:
+      containers:
+        - name: edge-stub
+          image: onezox/edge-stub:phase00
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-stub
+  namespace: default
+  labels:
+    app: edge-stub
+spec:
+  selector:
+    app: edge-stub
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

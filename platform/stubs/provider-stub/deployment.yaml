@@ -1,0 +1,60 @@
+# Phase-00 throwaway health stub (Go). Replaced by the real provider-gateway
+# in a later phase.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-stub
+  namespace: default
+  labels:
+    app: provider-stub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: provider-stub
+  template:
+    metadata:
+      labels:
+        app: provider-stub
+    spec:
+      containers:
+        - name: provider-stub
+          image: onezox/provider-stub:phase00
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-stub
+  namespace: default
+  labels:
+    app: provider-stub
+spec:
+  selector:
+    app: provider-stub
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
