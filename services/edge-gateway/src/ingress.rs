@@ -23,6 +23,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{ApiKeyStore, Identity};
+use crate::state::AppState;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -90,19 +93,43 @@ fn not_wired(stage: String) -> impl IntoResponse {
     )
 }
 
-async fn chat_completions(Json(req): Json<ChatCompletionRequest>) -> impl IntoResponse {
-    not_wired(format!("chat.completions model={}", req.model))
+// Every handler takes `identity: Identity` (even where the value isn't used
+// yet, e.g. models): this is the enforcement point for "no request proceeds
+// without a resolved org_id" (Phase-01.txt, Security Implementation).
+// Identity must be extracted before any body-consuming extractor (axum
+// requires the last argument to be the one that consumes the request body).
+
+async fn chat_completions<S: ApiKeyStore + 'static>(
+    identity: Identity,
+    Json(req): Json<ChatCompletionRequest>,
+) -> impl IntoResponse {
+    not_wired(format!(
+        "chat.completions org_id={} model={}",
+        identity.org_id, req.model
+    ))
 }
 
-async fn responses(Json(req): Json<ResponsesRequest>) -> impl IntoResponse {
-    not_wired(format!("responses model={}", req.model))
+async fn responses<S: ApiKeyStore + 'static>(
+    identity: Identity,
+    Json(req): Json<ResponsesRequest>,
+) -> impl IntoResponse {
+    not_wired(format!(
+        "responses org_id={} model={}",
+        identity.org_id, req.model
+    ))
 }
 
-async fn embeddings(Json(req): Json<EmbeddingsRequest>) -> impl IntoResponse {
-    not_wired(format!("embeddings model={}", req.model))
+async fn embeddings<S: ApiKeyStore + 'static>(
+    identity: Identity,
+    Json(req): Json<EmbeddingsRequest>,
+) -> impl IntoResponse {
+    not_wired(format!(
+        "embeddings org_id={} model={}",
+        identity.org_id, req.model
+    ))
 }
 
-async fn models() -> impl IntoResponse {
+async fn models<S: ApiKeyStore + 'static>(_identity: Identity) -> impl IntoResponse {
     // Phase-01.txt: "served from a static list until Phase-04 registry".
     Json(ModelsListResponse {
         data: vec![Model {
@@ -112,21 +139,42 @@ async fn models() -> impl IntoResponse {
     })
 }
 
-pub fn router() -> Router {
+pub fn router<S: ApiKeyStore + 'static>() -> Router<AppState<S>> {
     Router::new()
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(responses))
-        .route("/v1/embeddings", post(embeddings))
-        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat_completions::<S>))
+        .route("/v1/responses", post(responses::<S>))
+        .route("/v1/embeddings", post(embeddings::<S>))
+        .route("/v1/models", get(models::<S>))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt;
+    use crate::auth::FakeApiKeyStore;
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
     use tower::ServiceExt;
+    use uuid::Uuid;
+
+    const TEST_KEY: &str = "oz_test_ingress_key";
+
+    /// A router wired to a fake, in-memory store with one pre-seeded valid
+    /// key — hermetic, no live CockroachDB needed for these route-level
+    /// tests (only auth::store.rs's thin CockroachDB wrapper needs that,
+    /// verified separately).
+    fn test_app() -> (Router, Uuid) {
+        let org_id = Uuid::new_v4();
+        let store = FakeApiKeyStore::new();
+        store.insert(TEST_KEY, org_id, None);
+        let state = AppState { api_key_store: Arc::new(store) };
+        (router::<FakeApiKeyStore>().with_state(state), org_id)
+    }
+
+    fn authed(req: axum::http::request::Builder) -> axum::http::request::Builder {
+        req.header("authorization", format!("Bearer {TEST_KEY}"))
+    }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -134,35 +182,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completions_accepts_a_well_formed_body() {
-        let app = router();
+    async fn chat_completions_accepts_a_well_formed_authenticated_body() {
+        let (app, _org_id) = test_app();
         let body = serde_json::json!({
             "model": "onezox-ultra",
             "messages": [{"role": "user", "content": "hi"}],
         });
         let response = app
             .oneshot(
-                Request::post("/v1/chat/completions")
+                authed(Request::post("/v1/chat/completions"))
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        // 501: structurally valid, downstream not wired yet (Step E).
+        // 501: authenticated + structurally valid, downstream not wired yet
+        // (Step E).
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
     async fn chat_completions_rejects_a_missing_required_field() {
-        let app = router();
+        let (app, _org_id) = test_app();
         // Missing "model".
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
         });
         let response = app
             .oneshot(
-                Request::post("/v1/chat/completions")
+                authed(Request::post("/v1/chat/completions"))
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -174,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completions_rejects_wrong_field_types() {
-        let app = router();
+        let (app, _org_id) = test_app();
         // "messages" should be an array, not a string.
         let body = serde_json::json!({
             "model": "onezox-ultra",
@@ -182,7 +231,7 @@ mod tests {
         });
         let response = app
             .oneshot(
-                Request::post("/v1/chat/completions")
+                authed(Request::post("/v1/chat/completions"))
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -193,12 +242,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_accepts_a_well_formed_body() {
-        let app = router();
+    async fn chat_completions_rejects_no_credential_before_even_checking_the_body() {
+        let (app, _org_id) = test_app();
+        // Well-formed body, but no Authorization header at all.
+        let body = serde_json::json!({
+            "model": "onezox-ultra",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_rejects_an_unknown_credential() {
+        let (app, _org_id) = test_app();
+        let body = serde_json::json!({
+            "model": "onezox-ultra",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("authorization", "Bearer oz_test_totally_wrong")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn responses_accepts_a_well_formed_authenticated_body() {
+        let (app, _org_id) = test_app();
         let body = serde_json::json!({"model": "onezox-ultra", "input": "hi"});
         let response = app
             .oneshot(
-                Request::post("/v1/responses")
+                authed(Request::post("/v1/responses"))
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -210,12 +299,12 @@ mod tests {
 
     #[tokio::test]
     async fn embeddings_rejects_wrong_field_types() {
-        let app = router();
+        let (app, _org_id) = test_app();
         // "input" should be an array of strings, not a bare string.
         let body = serde_json::json!({"model": "onezox-ultra", "input": "not-an-array"});
         let response = app
             .oneshot(
-                Request::post("/v1/embeddings")
+                authed(Request::post("/v1/embeddings"))
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -226,14 +315,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn models_returns_the_static_list() {
-        let app = router();
+    async fn models_requires_authentication_too() {
+        let (app, _org_id) = test_app();
         let response = app
             .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn models_returns_the_static_list_when_authenticated() {
+        let (app, _org_id) = test_app();
+        let response = app
+            .oneshot(
+                authed(Request::get("/v1/models"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
-        assert!(json["data"].as_array().unwrap().len() >= 1);
+        assert!(!json["data"].as_array().unwrap().is_empty());
     }
 }

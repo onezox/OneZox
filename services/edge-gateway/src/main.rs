@@ -1,15 +1,23 @@
 //! edge-gateway — Phase-01: replaces the Phase-00 edge-stub with the real
 //! public ingress. Built incrementally per CLAUDE.md: this step wires the
-//! four OpenAI-compatible ingress routes only (Part K, src/ingress.rs).
-//! auth, ratelimit, admission, normalize, meter, and the SSE relay to the
-//! data plane (src/{auth,ratelimit,admission,normalize,stream,meter}, per
-//! Phase-01.txt's folder structure) land in later Phase-01 steps.
+//! four OpenAI-compatible ingress routes (Part K, src/ingress.rs) behind
+//! API-key authentication (Part O, src/auth). ratelimit, admission,
+//! normalize, meter, and the SSE relay to the data plane (per Phase-01.txt's
+//! src/{ratelimit,admission,normalize,stream,meter} folder structure) land
+//! in later Phase-01 steps.
 
+mod auth;
 mod ingress;
+mod state;
 
-use axum::{http::StatusCode, routing::get};
+use std::sync::Arc;
+
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+use auth::store::{CockroachApiKeyStore, build_pool};
+use state::AppState;
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -24,14 +32,26 @@ fn init_logging() {
         .init();
 }
 
+async fn readyz(State(state): State<AppState<CockroachApiKeyStore>>) -> impl IntoResponse {
+    if state.api_key_store.ping().await.is_ok() {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    }
+}
+
 #[tokio::main]
 async fn main() {
     init_logging();
 
-    // Liveness only for now — "is the process up." /readyz is added once
-    // there's a real dependency to check (CockroachDB in Step C, Redis in
-    // Step D); a readyz that checks nothing would be misleading.
-    let app = ingress::router().route("/healthz", get(|| async { StatusCode::OK }));
+    let pg_host = env("COCKROACH_HOST", "onezox-crdb-public.default.svc.cluster.local");
+    let pool = build_pool(&pg_host);
+    let state = AppState { api_key_store: Arc::new(CockroachApiKeyStore::new(pool)) };
+
+    let app = ingress::router::<CockroachApiKeyStore>()
+        .route("/healthz", get(|| async { StatusCode::OK }))
+        .route("/readyz", get(readyz))
+        .with_state(state);
 
     let port = env("PORT", "8080");
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
