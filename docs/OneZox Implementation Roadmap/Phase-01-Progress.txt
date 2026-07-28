@@ -1,0 +1,109 @@
+================================================================================
+PHASE-01 — EDGE GATEWAY — PROGRESS / FINDINGS RECORD
+================================================================================
+This file is NOT a step-by-step changelog of Phase-01 code changes — git log
+and each commit message are the record for that (every Phase-01 commit is a
+verified, independently-testable checkpoint per CLAUDE.md). This file exists
+for things git history doesn't capture on its own: deviations from expected
+environment state, process gaps, and findings that future sessions (or a
+fresh engineer) need to know about before they re-discover them the hard way.
+Entries are dated and point-in-time; nothing here is retroactively folded
+into Phase-00-Complete.txt, which stands as-is as a record of what was true
+when Phase-00 was verified.
+
+--------------------------------------------------------------------------------
+2026-07-28 — Redis Cluster / stub drift discovered during Phase-01 Step A
+--------------------------------------------------------------------------------
+FINDING: Phase-00's "verified" state had drifted by the time Phase-01 work
+began. Redis Cluster reported cluster_state:fail (`cluster info` on
+redis-cluster-0), and all three Phase-00 stubs (edge-stub, dataplane-stub,
+provider-stub) were in CrashLoopBackOff with restart counts in the 140-175
+range, ages ~44-45h. This was NOT caused by any Phase-01 change — it was
+discovered while verifying dataplane-stub's new Submit gRPC shim (Step A6),
+before that step's own code had even been redeployed.
+
+ROOT CAUSE: the onezox-dev kind cluster's Docker containers had been through
+a WSL2/host restart. Per the existing restart guide
+(Phase-01-Local-Restart-Guide.txt), the 3 kind node containers came back up
+fine and all pods reached Running — but Redis Cluster's 6 pods run on
+emptyDir (intentionally ephemeral, no PVC). Their on-disk cluster gossip
+state (nodes.conf) survived the container restart, but each pod's IP address
+did not — freshly assigned by the CNI on every pod (re)start. The result:
+every node's gossiped view of the cluster referenced IPs no other node was
+actually listening on anymore. `cluster nodes` confirmed this directly:
+gossiped IPs (e.g. 10.244.1.190) did not match any current `kubectl get pods
+-o wide` IP (e.g. 10.244.1.42) for the same node ID. The three stubs then
+failed their own boot sequences at the Redis set/get step (edge-stub panicked
+outright; provider-stub and dataplane-stub errored/hung), which is why they
+were crash-looping — a symptom of the same root cause, not a separate bug.
+
+FIX APPLIED: `kubectl delete pod -l app=redis-cluster` (StatefulSet
+recreated all 6 with clean emptyDir state), waited for all 6 Running, then
+re-ran the cluster bootstrap by deleting and reapplying the existing
+`redis-cluster-init` Job (platform/operators/redis/redis-cluster-init-job.yaml,
+unchanged) — `cluster_state:ok` confirmed afterward, 16384/16384 slots
+covered. edge-stub and provider-stub were then pod-deleted (Deployment
+recreated them) to force them off their stale in-memory cluster topology;
+both came up Running immediately once Redis was healthy. No manifest files
+changed for this fix — see finding #2 below for how it was applied.
+
+PROCESS LESSON: a completion record (Phase-00-Complete.txt) documents
+verification AT THAT POINT IN TIME, not an ongoing guarantee. Emptydir-backed,
+intentionally-ephemeral components (Redis here; see Dependencies.txt section
+6, "rebuild-on-demand, no DR needed") are exactly the ones most likely to
+silently drift across a host restart, because kubelet/the Deployment
+controller will happily report every pod "Running" while the cluster-level
+protocol above it is broken. The restart guide already has the right checks
+for this (Phase-01-Local-Restart-Guide.txt section 3.2 `kubectl get pods -A`
+and 3.5 `redis-cli cluster info`) — the gap was that they were not actually
+re-run at the start of this work session before starting Phase-01 changes,
+so the drift wasn't caught until it blocked Step A6 mid-build.
+
+ACTION ITEM (standing practice going forward): at the start of every Phase-01
+work session, before writing or deploying any code, run a minimal liveness
+check first: `kubectl get pods -A` (look for anything not Running/Completed)
+and `kubectl exec -n default redis-cluster-0 -- redis-cli cluster info | grep
+cluster_state` (expect cluster_state:ok). This is cheap, catches this exact
+failure mode immediately, and avoids re-discovering environment drift in the
+middle of an unrelated step.
+
+--------------------------------------------------------------------------------
+2026-07-28 — redis-cluster-init Job recovery applied outside Argo CD
+--------------------------------------------------------------------------------
+FINDING: the fix above (`kubectl delete pod` on the 6 redis-cluster pods,
+then `kubectl delete job` + `kubectl apply -f
+platform/operators/redis/redis-cluster-init-job.yaml`) was applied directly
+against the cluster, not through the "onezox-stubs" Argo CD Application.
+This does NOT violate the project's GitOps hard rule as currently scoped:
+that rule (CLAUDE.md, and Phase-00-Complete.txt's own account of how Redis
+was originally provisioned) only covers stub/service and CiliumNetworkPolicy
+manifests under platform/stubs/, which is the only path the "onezox-stubs"
+Application watches (platform/argocd/applications/onezox-stubs.yaml). Redis
+lives under platform/operators/redis/ and was hand-applied directly in
+Phase-00 too — this fix used the same, already-established mechanism.
+
+FLAG: this is a known, currently-accepted gap, not a mistake to silently
+paper over. Two distinct things are worth keeping separate:
+  1. By design, infra operators (Redis, CockroachDB Operator, MinIO, the
+     observability stack) are declared-in-Terraform / hand-applied, not
+     GitOps-owned — that's an existing, intentional Phase-00 decision, not
+     new.
+  2. What IS new here: there is no written recovery procedure anywhere in
+     the docs for "Redis Cluster gossip state references stale IPs after a
+     node restart." A fresh engineer following Phase-00.txt,
+     Phase-00-Complete.txt, and Phase-01-Local-Restart-Guide.txt alone would
+     hit the exact same cluster_state:fail wall this session did, and have
+     no documented next step — only the restart guide's "expect
+     cluster_state:ok" with no remediation if it isn't. That is a partial
+     gap against Phase-00 exit criterion #1 ("A fresh engineer can clone,
+     build, and deploy the cell from docs alone.") specifically for the
+     failure-recovery path, not the initial-provisioning path (which is
+     documented and was not itself in question here).
+
+This entry is that missing documentation for now. Whether to promote it into
+a proper remediation step in Phase-01-Local-Restart-Guide.txt (or a new
+troubleshooting doc) is a decision for whoever next revisits that guide —
+not made here.
+================================================================================
+END OF PHASE-01-PROGRESS.TXT (living document — append, do not rewrite)
+================================================================================
