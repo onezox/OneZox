@@ -71,6 +71,7 @@ pub struct AdmissionGuard {
 
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
+        metrics::gauge!(crate::metrics::INFLIGHT_REQUESTS).decrement(1.0);
         let gauge = Arc::clone(&self.gauge);
         let key = self.key.clone();
         tokio::spawn(async move {
@@ -103,6 +104,11 @@ pub async fn admit(
         Ok(n) => n,
         Err(e) => {
             tracing::warn!(error = ?e, key = %key, "admission gauge increment failed; failing open");
+            // Matches the Redis-gauge's own fail-open shape: Drop always
+            // decrements unconditionally on this path too, so the
+            // Prometheus gauge's increment/decrement calls stay
+            // symmetric with it (see AdmissionGuard's Drop impl).
+            metrics::gauge!(crate::metrics::INFLIGHT_REQUESTS).increment(1.0);
             return Ok(AdmissionGuard { gauge, key });
         }
     };
@@ -114,7 +120,10 @@ pub async fn admit(
             }
             Err(AdmissionError::Shed)
         }
-        AdmissionDecision::Accept | AdmissionDecision::Queue => Ok(AdmissionGuard { gauge, key }),
+        AdmissionDecision::Accept | AdmissionDecision::Queue => {
+            metrics::gauge!(crate::metrics::INFLIGHT_REQUESTS).increment(1.0);
+            Ok(AdmissionGuard { gauge, key })
+        }
     }
 }
 

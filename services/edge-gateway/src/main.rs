@@ -12,6 +12,7 @@ mod auth;
 mod dataplane_client;
 mod ingress;
 mod meter;
+mod metrics;
 mod normalize;
 mod pb;
 mod pipeline;
@@ -105,6 +106,10 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 #[tokio::main]
 async fn main() {
     let provider = init_telemetry();
+    // Must install before any metrics::counter!/histogram!/gauge! call
+    // anywhere else in the process — admission::admit/AdmissionGuard::drop
+    // record to INFLIGHT_REQUESTS unconditionally on every request.
+    let prometheus_handle = metrics::install();
 
     let pg_host = env("COCKROACH_HOST", "onezox-crdb-public.default.svc.cluster.local");
     let pool = build_pool(&pg_host);
@@ -143,8 +148,10 @@ async fn main() {
     };
 
     let app = ingress::router()
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), metrics::track))
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(move || async move { prometheus_handle.render() }))
         .with_state(state);
 
     let port = env("PORT", "8080");

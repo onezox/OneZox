@@ -28,6 +28,8 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.33"
 async-stream = "0.3"
 futures-util = "0.3"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
