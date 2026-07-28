@@ -1,8 +1,12 @@
-# Cilium mTLS enforcement between the three Phase-00 stub services.
+# Cilium mTLS enforcement between edge-gateway (Phase-01) and the two
+# remaining Phase-00 stubs (dataplane-stub, provider-stub).
 #
 # Completes the last Phase-00 acceptance item: SPIRE (Step 9) installed the
 # mTLS *capability* only, deliberately not enforced at the time, pending
-# real services to enforce it between. That's now these three stubs.
+# real services to enforce it between. edge-stub-mtls (the third original
+# Phase-00 policy) was removed in Phase-01 Step F3 once edge-gateway-mtls
+# below was confirmed healthy — edge-stub itself was removed in the same
+# cutover, replaced by edge-gateway.
 #
 # Design constraint that shaped every rule below: adding ANY ingress rule
 # to a CiliumNetworkPolicy switches that endpoint's ingress to default-deny
@@ -14,43 +18,6 @@
 # Both get an explicit no-auth allow rule below so this doesn't regress
 # either already-verified behavior. Nothing else is allowed in on 8080.
 
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: edge-stub-mtls
-  namespace: default
-spec:
-  endpointSelector:
-    matchLabels:
-      app: edge-stub
-  ingress:
-    - fromEntities:
-        - host
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-    - fromEndpoints:
-        - matchLabels:
-            app.kubernetes.io/name: prometheus
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-    - fromEndpoints:
-        - matchExpressions:
-            - key: app
-              operator: In
-              values:
-                - dataplane-stub
-                - provider-stub
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-      authentication:
-        mode: "required"
----
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -81,12 +48,8 @@ spec:
             - port: "8080"
               protocol: TCP
     - fromEndpoints:
-        - matchExpressions:
-            - key: app
-              operator: In
-              values:
-                - edge-stub
-                - provider-stub
+        - matchLabels:
+            app: provider-stub
       toPorts:
         - ports:
             - port: "8080"
@@ -168,12 +131,8 @@ spec:
             - port: "8080"
               protocol: TCP
     - fromEndpoints:
-        - matchExpressions:
-            - key: app
-              operator: In
-              values:
-                - edge-stub
-                - dataplane-stub
+        - matchLabels:
+            app: dataplane-stub
       toPorts:
         - ports:
             - port: "8080"
