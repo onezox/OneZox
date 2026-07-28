@@ -1,13 +1,21 @@
-//! Metering start (Part L, Phase-01 Step E2): emits a request-scoped OTel
-//! span carrying token/cost fields. Phase-01 doesn't call a model yet
-//! (Phase-03 does) — token/cost values are fixed placeholders (0), not
-//! real usage; Part L's full field set (orchestration_tokens, cache_hit,
-//! node_id, eval_score, ...) is out of scope until later phases actually
-//! produce those signals.
+//! Metering (Part L, Phase-01 Steps E2/J): token/cost fields on the
+//! request-scoped span. Phase-01 doesn't call a model yet (Phase-03
+//! does) — token/cost values are fixed placeholders (0), not real usage;
+//! Part L's full field set (orchestration_tokens, cache_hit, node_id,
+//! eval_score, ...) is out of scope until later phases actually produce
+//! those signals.
 //!
-//! Part P's sequence diagram places "meter start" right before the gRPC
-//! Submit call and "meter final" after the stream completes — so the span
-//! must wrap the request's FULL Submit+relay lifecycle, not just admission.
+//! Step J correction: the request span itself is now created early, in
+//! pipeline.rs's `Admitted` extractor (before auth even runs), not here —
+//! EC4's "all edge telemetry visible" requires every pipeline stage
+//! (auth, ratelimit, admission, normalize, meter, submit, relay) to
+//! produce a span correctly parented under ONE request-scoped root; that's
+//! only possible if the root exists before the earliest stage runs. Part
+//! P's "meter start" (right before the gRPC Submit call) now means
+//! "the token/cost fields are attached to the already-open root span
+//! here", not "the span itself is created here". `RequestMeter` wraps
+//! that already-created span.
+//!
 //! `RequestMeter` is deliberately NOT closed on Drop (unlike
 //! admission::AdmissionGuard): closing needs the real final token/cost
 //! values in hand, which only Step E4's relay loop has once the stream
@@ -27,24 +35,17 @@ pub struct RequestMeter {
     span: Span,
 }
 
-/// Starts the request-scoped meter span. Call as close as possible to the
-/// gRPC Submit call (Part P) so the span's duration reflects the actual
-/// Submit+relay work, not upstream auth/ratelimit/admission overhead.
-pub fn start(request_id: &str, org_id: &str, model: &str) -> RequestMeter {
-    let span = tracing::info_span!(
-        "edge_gateway.request",
-        request_id = %request_id,
-        org_id = %org_id,
-        model = %model,
-        tokens_in = PLACEHOLDER_TOKENS_IN,
-        tokens_out = PLACEHOLDER_TOKENS_OUT,
-        usd_cost = PLACEHOLDER_USD_COST,
-        finish_reason = tracing::field::Empty,
-    );
-    RequestMeter { span }
-}
-
 impl RequestMeter {
+    /// Wraps an already-created request span as the meter. The span is
+    /// expected to have already declared `tokens_in`/`tokens_out`/
+    /// `usd_cost`/`finish_reason` fields (pipeline.rs's root span does,
+    /// at creation, via `tracing::field::Empty`/the placeholder
+    /// constants above) — `finish` below only records final values into
+    /// fields that already exist.
+    pub fn new(span: Span) -> Self {
+        Self { span }
+    }
+
     /// A handle to enter/instrument the Submit+relay work with this span
     /// (Step E3/E4) — `RequestMeter` itself isn't a `Future`, so callers
     /// use `tracing::Instrument` against this directly:
@@ -72,14 +73,26 @@ mod tests {
     use super::*;
     use tracing_subscriber::layer::SubscriberExt;
 
+    fn test_span() -> Span {
+        tracing::info_span!(
+            "edge_gateway.request",
+            request_id = "req-1",
+            org_id = "org-1",
+            model = "onezox-ultra",
+            tokens_in = PLACEHOLDER_TOKENS_IN,
+            tokens_out = PLACEHOLDER_TOKENS_OUT,
+            usd_cost = PLACEHOLDER_USD_COST,
+            finish_reason = tracing::field::Empty,
+        )
+    }
+
     /// Not a "does Tempo receive this" test (that's a live check, since it
-    /// needs a real OTel Collector) — this only proves start()/finish()
-    /// don't panic and that a span is genuinely created and closed,
-    /// running against a no-op subscriber so it has no external
-    /// dependency.
+    /// needs a real OTel Collector) — this only proves finish() doesn't
+    /// panic and that a span is genuinely closed, running against a no-op
+    /// subscriber so it has no external dependency.
     #[test]
-    fn start_and_finish_do_not_panic_with_no_subscriber_installed() {
-        let meter = start("req-1", "org-1", "onezox-ultra");
+    fn finish_does_not_panic_with_no_subscriber_installed() {
+        let meter = RequestMeter::new(test_span());
         meter.finish("stop");
     }
 
@@ -87,7 +100,7 @@ mod tests {
     fn span_is_observable_while_open() {
         let subscriber = tracing_subscriber::registry().with(tracing_subscriber::fmt::layer());
         tracing::subscriber::with_default(subscriber, || {
-            let meter = start("req-2", "org-2", "onezox-ultra");
+            let meter = RequestMeter::new(test_span());
             assert!(!meter.span().is_disabled());
             meter.finish("stop");
         });

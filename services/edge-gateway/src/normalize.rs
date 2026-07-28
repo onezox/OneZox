@@ -6,8 +6,13 @@
 //! No "bad payload" branch here: by the time a request reaches normalize,
 //! it has already passed serde/axum's structural validation (ingress.rs)
 //! and identity resolution (auth). This is a pure, infallible mapping.
-
-use uuid::Uuid;
+//!
+//! `request_id` is a parameter here, not generated internally (Step J
+//! correction to Step E1's original design): it now has to exist before
+//! auth even runs, since it's a field on the request-scoped root span
+//! created at the very start of pipeline.rs's `Admitted` extractor —
+//! normalize just reuses that same, already-established ID rather than
+//! minting a second, disconnected one.
 
 use crate::auth::Identity;
 use crate::ingress::{ChatCompletionRequest, EmbeddingsRequest, ResponsesRequest};
@@ -26,16 +31,13 @@ fn pb_identity(identity: &Identity) -> PbIdentity {
     }
 }
 
-fn new_request_id() -> String {
-    Uuid::new_v4().to_string()
-}
-
 pub fn normalize_chat_completions(
+    request_id: &str,
     identity: &Identity,
     req: &ChatCompletionRequest,
 ) -> SubmitRequest {
     SubmitRequest {
-        request_id: new_request_id(),
+        request_id: request_id.to_string(),
         identity: Some(pb_identity(identity)),
         kind: RequestKind::ChatCompletion as i32,
         model: req.model.clone(),
@@ -50,9 +52,13 @@ pub fn normalize_chat_completions(
     }
 }
 
-pub fn normalize_responses(identity: &Identity, req: &ResponsesRequest) -> SubmitRequest {
+pub fn normalize_responses(
+    request_id: &str,
+    identity: &Identity,
+    req: &ResponsesRequest,
+) -> SubmitRequest {
     SubmitRequest {
-        request_id: new_request_id(),
+        request_id: request_id.to_string(),
         identity: Some(pb_identity(identity)),
         kind: RequestKind::Responses as i32,
         model: req.model.clone(),
@@ -63,9 +69,13 @@ pub fn normalize_responses(identity: &Identity, req: &ResponsesRequest) -> Submi
     }
 }
 
-pub fn normalize_embeddings(identity: &Identity, req: &EmbeddingsRequest) -> SubmitRequest {
+pub fn normalize_embeddings(
+    request_id: &str,
+    identity: &Identity,
+    req: &EmbeddingsRequest,
+) -> SubmitRequest {
     SubmitRequest {
-        request_id: new_request_id(),
+        request_id: request_id.to_string(),
         identity: Some(pb_identity(identity)),
         kind: RequestKind::Embeddings as i32,
         model: req.model.clone(),
@@ -84,6 +94,7 @@ pub fn normalize_embeddings(identity: &Identity, req: &EmbeddingsRequest) -> Sub
 mod tests {
     use super::*;
     use crate::ingress::ChatMessage;
+    use uuid::Uuid;
 
     fn test_identity() -> Identity {
         Identity {
@@ -108,7 +119,7 @@ mod tests {
             temperature: Some(0.7),
         };
 
-        let normalized = normalize_chat_completions(&identity, &req);
+        let normalized = normalize_chat_completions("req-42", &identity, &req);
 
         assert_eq!(normalized.kind, RequestKind::ChatCompletion as i32);
         assert_eq!(normalized.model, "onezox-ultra");
@@ -119,11 +130,11 @@ mod tests {
         assert_eq!(normalized.messages[0].role, "system");
         assert_eq!(normalized.messages[1].content, "hi");
         assert_eq!(normalized.identity.unwrap().org_id, identity.org_id.to_string());
-        assert!(!normalized.request_id.is_empty());
+        assert_eq!(normalized.request_id, "req-42");
     }
 
     #[test]
-    fn two_normalizations_get_different_request_ids() {
+    fn the_passed_request_id_is_used_verbatim_not_regenerated() {
         let identity = test_identity();
         let req = ChatCompletionRequest {
             model: "onezox-ultra".to_string(),
@@ -132,9 +143,10 @@ mod tests {
             max_tokens: None,
             temperature: None,
         };
-        let a = normalize_chat_completions(&identity, &req);
-        let b = normalize_chat_completions(&identity, &req);
-        assert_ne!(a.request_id, b.request_id);
+        let a = normalize_chat_completions("req-a", &identity, &req);
+        let b = normalize_chat_completions("req-b", &identity, &req);
+        assert_eq!(a.request_id, "req-a");
+        assert_eq!(b.request_id, "req-b");
     }
 
     #[test]
@@ -151,7 +163,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
         };
-        let pb = normalize_chat_completions(&identity, &req).identity.unwrap();
+        let pb = normalize_chat_completions("req-1", &identity, &req).identity.unwrap();
         assert_eq!(pb.user_id, "");
         assert_eq!(pb.project_id, "");
         assert_eq!(pb.conversation_id, "");
@@ -172,7 +184,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
         };
-        let pb = normalize_chat_completions(&identity, &req).identity.unwrap();
+        let pb = normalize_chat_completions("req-1", &identity, &req).identity.unwrap();
         assert_eq!(pb.org_id, identity.org_id.to_string());
         assert_eq!(pb.user_id, identity.user_id.unwrap().to_string());
         assert_eq!(pb.project_id, identity.project_id.unwrap().to_string());
@@ -188,7 +200,7 @@ mod tests {
             stream: true,
         };
 
-        let normalized = normalize_responses(&identity, &req);
+        let normalized = normalize_responses("req-1", &identity, &req);
 
         assert_eq!(normalized.kind, RequestKind::Responses as i32);
         assert_eq!(normalized.messages.len(), 1);
@@ -205,7 +217,7 @@ mod tests {
             input: vec!["a".to_string(), "b".to_string(), "c".to_string()],
         };
 
-        let normalized = normalize_embeddings(&identity, &req);
+        let normalized = normalize_embeddings("req-1", &identity, &req);
 
         assert_eq!(normalized.kind, RequestKind::Embeddings as i32);
         assert_eq!(normalized.messages.len(), 3);

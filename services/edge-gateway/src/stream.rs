@@ -108,17 +108,19 @@ where
 /// stays accurate for the request's entire streamed duration, not just its
 /// initial admission (see admission::AdmissionGuard's doc comment).
 ///
-/// Each `.next()` call is individually `.instrument()`-ed with the
-/// meter's span rather than entered with a manual guard once: `tracing`'s
-/// `Instrument` trait only covers `Future`, not `Stream` (there's no
-/// blanket "instrument every poll" wrapper for a whole stream), and a
-/// manual `span.enter()` guard held across the loop's `.await` points
-/// would be exactly the async-span pitfall documented in main.rs's
-/// `init_telemetry` and this module's own doc comment. Instrumenting the
-/// `Future` returned by each individual `.next()` call gets the same
-/// result — the span is entered/exited around each poll, never held
-/// across an await — at the granularity `tracing::Instrument` actually
-/// supports.
+/// Each `.next()` call is individually `.instrument()`-ed with a dedicated
+/// `edge_gateway.relay` span (Step J — parented under the meter's root
+/// span, not the root span itself, so relay shows up as its own stage in
+/// the trace tree rather than folding into the request span) rather than
+/// entered with a manual guard once: `tracing`'s `Instrument` trait only
+/// covers `Future`, not `Stream` (there's no blanket "instrument every
+/// poll" wrapper for a whole stream), and a manual `span.enter()` guard
+/// held across the loop's `.await` points would be exactly the async-span
+/// pitfall documented in main.rs's `init_telemetry` and this module's own
+/// doc comment. Instrumenting the `Future` returned by each individual
+/// `.next()` call gets the same result — the span is entered/exited around
+/// each poll, never held across an await — at the granularity
+/// `tracing::Instrument` actually supports.
 pub fn relay<S>(
     request_id: String,
     model: String,
@@ -129,7 +131,7 @@ pub fn relay<S>(
 where
     S: Stream<Item = Result<SubmitResponse, Status>> + Send + 'static,
 {
-    let span = meter.span().clone();
+    let span = tracing::info_span!(parent: meter.span(), "edge_gateway.relay");
     let chunks = to_chunks(upstream, request_id, model);
 
     let sse_stream = async_stream::stream! {
@@ -153,6 +155,24 @@ where
 mod tests {
     use super::*;
     use futures_util::stream;
+
+    /// Builds a `RequestMeter` wrapping a standalone root span, matching
+    /// the shape pipeline.rs's `Admitted` extractor produces in the real
+    /// request path (see meter.rs's own `test_span` helper) — these tests
+    /// exercise `relay()` directly, without going through the extractor.
+    fn test_meter() -> RequestMeter {
+        let span = tracing::info_span!(
+            "edge_gateway.request",
+            request_id = "req-1",
+            org_id = "org-1",
+            model = "onezox-ultra",
+            tokens_in = crate::meter::PLACEHOLDER_TOKENS_IN,
+            tokens_out = crate::meter::PLACEHOLDER_TOKENS_OUT,
+            usd_cost = crate::meter::PLACEHOLDER_USD_COST,
+            finish_reason = tracing::field::Empty,
+        );
+        RequestMeter::new(span)
+    }
 
     fn delta(content: &str, is_final: bool, finish_reason: Option<&str>) -> SubmitResponse {
         SubmitResponse {
@@ -245,7 +265,6 @@ mod tests {
         // drains the actual HTTP response body rather than inspecting
         // typed Event values.
         use crate::admission::{self, FakeAdmissionGauge};
-        use crate::meter;
         use axum::response::IntoResponse;
         use http_body_util::BodyExt;
         use std::sync::Arc;
@@ -254,7 +273,7 @@ mod tests {
         let admission_guard = admission::admit(gauge.clone(), 10, 20).await.unwrap();
         assert_eq!(gauge.current(), 1);
 
-        let meter = meter::start("req-1", "org-1", "onezox-ultra");
+        let meter = test_meter();
 
         let upstream = stream::iter(vec![
             Ok(delta("hi ", false, None)),
@@ -295,7 +314,6 @@ mod tests {
         // explicit cleanup function; Drop is the entire mechanism under
         // test (see this module's doc comment).
         use crate::admission::{self, FakeAdmissionGauge};
-        use crate::meter;
         use axum::response::IntoResponse;
         use http_body_util::BodyExt;
         use std::sync::Arc;
@@ -304,7 +322,7 @@ mod tests {
         let admission_guard = admission::admit(gauge.clone(), 10, 20).await.unwrap();
         assert_eq!(gauge.current(), 1);
 
-        let meter = meter::start("req-1", "org-1", "onezox-ultra");
+        let meter = test_meter();
 
         let upstream = stream::iter(vec![Ok(delta("first", false, None))])
             .chain(stream::pending::<Result<SubmitResponse, Status>>());

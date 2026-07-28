@@ -28,8 +28,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
-use crate::auth::Identity;
-use crate::pipeline::Admitted;
+use crate::pipeline::{Admitted, RequestContext};
 use crate::state::AppState;
 use crate::{dataplane_client, meter, normalize, stream};
 
@@ -148,21 +147,28 @@ fn bad_gateway(request_id: &str) -> Response {
 /// called), then returns 502.
 async fn submit_and_relay(
     state: &AppState,
-    identity: &Identity,
     admission_guard: crate::admission::AdmissionGuard,
     submit_req: crate::pb::dataplane::v1::SubmitRequest,
+    request_context: RequestContext,
 ) -> Response {
     let request_id = submit_req.request_id.clone();
     let model = submit_req.model.clone();
-    let meter = meter::start(&request_id, &identity.org_id.to_string(), &model);
-    let span = meter.span().clone();
+    request_context.root_span.record("model", model.as_str());
+
+    // A distinct child span for the Submit RPC itself (Step J), parented
+    // under the same root as auth/ratelimit/admission/normalize — not the
+    // root span directly, so the span tree shows "submit" as its own named
+    // stage rather than folding the RPC's duration into the root.
+    let submit_span = tracing::info_span!(parent: &request_context.root_span, "edge_gateway.submit");
 
     // .instrument(), not a manual enter() guard: this await crosses the
     // whole RPC round-trip — see stream::relay's doc comment for why that
     // distinction matters for async spans.
     let submit_result = dataplane_client::submit(state.dataplane_channel.clone(), submit_req)
-        .instrument(span)
+        .instrument(submit_span)
         .await;
+
+    let meter = meter::RequestMeter::new(request_context.root_span);
 
     match submit_result {
         Ok(upstream) => stream::relay(request_id, model, upstream, meter, admission_guard).into_response(),
@@ -188,24 +194,33 @@ async fn submit_and_relay(
 
 async fn chat_completions(
     State(state): State<AppState>,
-    Admitted(identity, admission_guard): Admitted,
+    Admitted(identity, admission_guard, request_context): Admitted,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    let submit_req = normalize::normalize_chat_completions(&identity, &req);
-    submit_and_relay(&state, &identity, admission_guard, submit_req).await
+    // normalize is synchronous, so `.in_scope()` (enter/exit around a plain
+    // closure call) is the right tool here — no cross-await pitfall to
+    // worry about, unlike the async stages that use `.instrument()`.
+    let normalize_span = tracing::info_span!(parent: &request_context.root_span, "edge_gateway.normalize");
+    let submit_req = normalize_span.in_scope(|| {
+        normalize::normalize_chat_completions(&request_context.request_id, &identity, &req)
+    });
+    submit_and_relay(&state, admission_guard, submit_req, request_context).await
 }
 
 async fn responses(
     State(state): State<AppState>,
-    Admitted(identity, admission_guard): Admitted,
+    Admitted(identity, admission_guard, request_context): Admitted,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
-    let submit_req = normalize::normalize_responses(&identity, &req);
-    submit_and_relay(&state, &identity, admission_guard, submit_req).await
+    let normalize_span = tracing::info_span!(parent: &request_context.root_span, "edge_gateway.normalize");
+    let submit_req = normalize_span.in_scope(|| {
+        normalize::normalize_responses(&request_context.request_id, &identity, &req)
+    });
+    submit_and_relay(&state, admission_guard, submit_req, request_context).await
 }
 
 async fn embeddings(
-    Admitted(identity, _guard): Admitted,
+    Admitted(identity, _guard, _request_context): Admitted,
     Json(req): Json<EmbeddingsRequest>,
 ) -> impl IntoResponse {
     not_wired(format!(
@@ -214,7 +229,7 @@ async fn embeddings(
     ))
 }
 
-async fn models(Admitted(_identity, _guard): Admitted) -> impl IntoResponse {
+async fn models(Admitted(_identity, _guard, _request_context): Admitted) -> impl IntoResponse {
     // Phase-01.txt: "served from a static list until Phase-04 registry".
     Json(ModelsListResponse {
         data: vec![Model {
