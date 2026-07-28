@@ -5,6 +5,7 @@
 //! how — not an automated `cargo test`, since that would make the unit test
 //! suite depend on cluster availability).
 
+use async_trait::async_trait;
 use deadpool_postgres::{Config, Pool, Runtime};
 use tokio_postgres::NoTls;
 
@@ -29,20 +30,9 @@ impl CockroachApiKeyStore {
     pub fn new(pool: Pool) -> Self {
         Self { pool }
     }
-
-    pub async fn ping(&self) -> Result<(), AuthError> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| AuthError::Store(format!("pool checkout failed: {e}")))?;
-        conn.simple_query("SELECT 1")
-            .await
-            .map_err(|e| AuthError::Store(format!("ping failed: {e}")))?;
-        Ok(())
-    }
 }
 
+#[async_trait]
 impl ApiKeyStore for CockroachApiKeyStore {
     async fn lookup_by_hash(&self, hash: &str) -> Result<Option<ApiKeyRow>, AuthError> {
         let conn = self
@@ -63,5 +53,17 @@ impl ApiKeyStore for CockroachApiKeyStore {
             org_id: r.get("org_id"),
             revoked_at: r.get("revoked_at"),
         }))
+    }
+
+    async fn ping(&self) -> Result<(), AuthError> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| AuthError::Store(format!("pool checkout failed: {e}")))?;
+        conn.simple_query("SELECT 1")
+            .await
+            .map_err(|e| AuthError::Store(format!("ping failed: {e}")))?;
+        Ok(())
     }
 }

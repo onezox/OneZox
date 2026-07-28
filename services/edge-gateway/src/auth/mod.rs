@@ -11,13 +11,22 @@
 //! requirement is explicitly "Unit: auth (valid/invalid/expired key + JWT)".
 //! A thin CockroachDB-backed implementation is verified separately against
 //! the live cluster (store.rs).
+//!
+//! `ApiKeyStore` uses `#[async_trait]` (not a native async fn in a trait)
+//! specifically so it's `dyn`-compatible: `AppState` (state.rs) holds
+//! `Arc<dyn ApiKeyStore>` rather than being generic over the store type.
+//! Phase-01's pipeline (auth -> ratelimit -> admission -> ...) composes
+//! several independently-swappable stores/counters into one shared state;
+//! a generic type parameter per stage doesn't scale — it would have to
+//! thread through every handler signature and grow with each new stage.
 
 pub mod jwt;
 pub mod store;
 
+use async_trait::async_trait;
+use axum::Json;
 use axum::extract::FromRequestParts;
 use axum::http::{StatusCode, header, request::Parts};
-use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -66,11 +75,14 @@ pub struct ApiKeyRow {
 
 /// Looks up a pre-hashed API key. Implemented by a real CockroachDB-backed
 /// store (store.rs) in production and by an in-memory fake in tests.
+#[async_trait]
 pub trait ApiKeyStore: Send + Sync {
-    fn lookup_by_hash(
-        &self,
-        hash: &str,
-    ) -> impl Future<Output = Result<Option<ApiKeyRow>, AuthError>> + Send;
+    async fn lookup_by_hash(&self, hash: &str) -> Result<Option<ApiKeyRow>, AuthError>;
+
+    /// Health check for /readyz. Part of the trait (not a CockroachDB-only
+    /// inherent method) so main.rs's readyz handler can call it through
+    /// `Arc<dyn ApiKeyStore>` without knowing the concrete store type.
+    async fn ping(&self) -> Result<(), AuthError>;
 }
 
 /// SHA-256 hex digest of a raw API key — the same convention used by
@@ -84,7 +96,7 @@ pub fn hash_api_key(raw_key: &str) -> String {
 /// Pure authentication logic: hash the raw key, look it up, check it isn't
 /// revoked, resolve an `Identity`. No I/O beyond what `store` performs.
 pub async fn authenticate_api_key(
-    store: &impl ApiKeyStore,
+    store: &dyn ApiKeyStore,
     raw_key: &str,
 ) -> Result<Identity, AuthError> {
     if raw_key.is_empty() {
@@ -144,12 +156,12 @@ fn unauthorized() -> (StatusCode, Json<AuthErrorBody>) {
 /// or JWT"), and rejects with a generic 401 on any failure. This is the
 /// enforcement point for "no request proceeds without a resolved org_id"
 /// (Phase-01.txt, Security Implementation).
-impl<S: ApiKeyStore + 'static> FromRequestParts<AppState<S>> for Identity {
+impl FromRequestParts<AppState> for Identity {
     type Rejection = (StatusCode, Json<AuthErrorBody>);
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState<S>,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let token = parts
             .headers
@@ -191,9 +203,14 @@ impl FakeApiKeyStore {
 }
 
 #[cfg(test)]
+#[async_trait]
 impl ApiKeyStore for FakeApiKeyStore {
     async fn lookup_by_hash(&self, hash: &str) -> Result<Option<ApiKeyRow>, AuthError> {
         Ok(self.rows.lock().unwrap().get(hash).cloned())
+    }
+
+    async fn ping(&self) -> Result<(), AuthError> {
+        Ok(())
     }
 }
 

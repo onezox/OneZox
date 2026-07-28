@@ -1,13 +1,16 @@
 //! edge-gateway — Phase-01: replaces the Phase-00 edge-stub with the real
 //! public ingress. Built incrementally per CLAUDE.md: this step wires the
 //! four OpenAI-compatible ingress routes (Part K, src/ingress.rs) behind
-//! API-key authentication (Part O, src/auth). ratelimit, admission,
-//! normalize, meter, and the SSE relay to the data plane (per Phase-01.txt's
-//! src/{ratelimit,admission,normalize,stream,meter} folder structure) land
-//! in later Phase-01 steps.
+//! authentication (Part O, src/auth) and rate limiting (src/ratelimit),
+//! composed in src/pipeline.rs. admission, normalize, meter, and the SSE
+//! relay to the data plane (per Phase-01.txt's
+//! src/{admission,normalize,stream,meter} folder structure) land in later
+//! Phase-01 steps.
 
 mod auth;
 mod ingress;
+mod pipeline;
+mod ratelimit;
 mod state;
 
 use std::sync::Arc;
@@ -17,6 +20,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use auth::store::{CockroachApiKeyStore, build_pool};
+use ratelimit::store::{CockroachRateLimitPolicyStore, RedisRateLimitCounter, build_redis_client};
 use state::AppState;
 
 fn env(key: &str, default: &str) -> String {
@@ -32,7 +36,7 @@ fn init_logging() {
         .init();
 }
 
-async fn readyz(State(state): State<AppState<CockroachApiKeyStore>>) -> impl IntoResponse {
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     if state.api_key_store.ping().await.is_ok() {
         (StatusCode::OK, "ready")
     } else {
@@ -46,16 +50,23 @@ async fn main() {
 
     let pg_host = env("COCKROACH_HOST", "onezox-crdb-public.default.svc.cluster.local");
     let pool = build_pool(&pg_host);
+
+    let redis_host = env("REDIS_HOST", "redis-cluster-headless.default.svc.cluster.local");
+    let redis_client = build_redis_client(&redis_host);
+
     // No real JWT issuer exists yet in Phase-01 (see auth/jwt.rs) — this is
     // a placeholder default so the service boots without a K8s Secret
     // during local dev; production deployment sets JWT_HMAC_SECRET.
     let jwt_secret = env("JWT_HMAC_SECRET", "phase01-dev-only-placeholder-secret");
+
     let state = AppState {
-        api_key_store: Arc::new(CockroachApiKeyStore::new(pool)),
+        api_key_store: Arc::new(CockroachApiKeyStore::new(pool.clone())),
         jwt_secret: Arc::from(jwt_secret.into_bytes().into_boxed_slice()),
+        rate_limit_counter: Arc::new(RedisRateLimitCounter::new(redis_client)),
+        rate_limit_policy_store: Arc::new(CockroachRateLimitPolicyStore::new(pool)),
     };
 
-    let app = ingress::router::<CockroachApiKeyStore>()
+    let app = ingress::router()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/readyz", get(readyz))
         .with_state(state);

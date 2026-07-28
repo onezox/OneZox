@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Phase-01, Deployment Step 4 — seed one test tenant + one hashed API key.
+# Phase-01, Deployment Step 4 — seed one test tenant, one hashed API key,
+# and (Step D1) that tenant's rate_limit_policy row.
 #
 # The raw key is generated here, hashed with SHA-256 (hex-encoded, lowercase
 # — the same convention edge-gateway's auth module uses to hash an incoming
@@ -8,13 +9,20 @@
 # afterward (CLAUDE.md: store API-key hashes, never raw keys).
 #
 # Idempotent: reuses the existing "phase01-test-tenant" tenant if present,
-# and does not mint a second key if this tenant already has an active
-# (non-revoked) one.
+# does not mint a second key if this tenant already has an active
+# (non-revoked) one, and does not overwrite an existing rate_limit_policy
+# row. rpm=60/tpm=100000/concurrency=10 are general-purpose test defaults,
+# not tuned to trip on the first few requests — a step that specifically
+# wants to exercise "rate limit exceeded" (Step H) adjusts rpm for its own
+# test scope rather than relying on a low standing default here.
 set -euo pipefail
 
 POD="${1:-onezox-crdb-0}"
 NAMESPACE="default"
 TENANT_NAME="phase01-test-tenant"
+DEFAULT_RPM=60
+DEFAULT_TPM=100000
+DEFAULT_CONCURRENCY=10
 
 sql() {
   kubectl exec -n "$NAMESPACE" "$POD" -- cockroach sql --insecure --format=csv --execute "$1" | tail -n +2
@@ -26,6 +34,14 @@ if [[ -z "$ORG_ID" ]]; then
   echo "Created tenant ${TENANT_NAME} (org_id=${ORG_ID})"
 else
   echo "Reusing existing tenant ${TENANT_NAME} (org_id=${ORG_ID})"
+fi
+
+EXISTING_POLICY_ID="$(sql "SELECT policy_id FROM rate_limit_policy WHERE org_id = '${ORG_ID}';")"
+if [[ -z "$EXISTING_POLICY_ID" ]]; then
+  POLICY_ID="$(sql "INSERT INTO rate_limit_policy (org_id, rpm, tpm, concurrency) VALUES ('${ORG_ID}', ${DEFAULT_RPM}, ${DEFAULT_TPM}, ${DEFAULT_CONCURRENCY}) RETURNING policy_id;")"
+  echo "Created rate_limit_policy (policy_id=${POLICY_ID}, rpm=${DEFAULT_RPM})"
+else
+  echo "Reusing existing rate_limit_policy (policy_id=${EXISTING_POLICY_ID})"
 fi
 
 EXISTING_KEY_ID="$(sql "SELECT key_id FROM api_keys WHERE org_id = '${ORG_ID}' AND revoked_at IS NULL LIMIT 1;")"

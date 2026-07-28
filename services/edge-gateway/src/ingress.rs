@@ -23,7 +23,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{ApiKeyStore, Identity};
+use crate::pipeline::Admitted;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -93,14 +93,15 @@ fn not_wired(stage: String) -> impl IntoResponse {
     )
 }
 
-// Every handler takes `identity: Identity` (even where the value isn't used
-// yet, e.g. models): this is the enforcement point for "no request proceeds
-// without a resolved org_id" (Phase-01.txt, Security Implementation).
-// Identity must be extracted before any body-consuming extractor (axum
-// requires the last argument to be the one that consumes the request body).
+// Every handler takes `Admitted(identity)` (even where identity isn't used
+// yet, e.g. models): this is the enforcement point for both "no request
+// proceeds without a resolved org_id" AND rate limiting (Phase-01.txt,
+// Security Implementation + FEATURES). `Admitted` must be extracted before
+// any body-consuming extractor (axum requires the last argument to be the
+// one that consumes the request body).
 
-async fn chat_completions<S: ApiKeyStore + 'static>(
-    identity: Identity,
+async fn chat_completions(
+    Admitted(identity): Admitted,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     not_wired(format!(
@@ -109,8 +110,8 @@ async fn chat_completions<S: ApiKeyStore + 'static>(
     ))
 }
 
-async fn responses<S: ApiKeyStore + 'static>(
-    identity: Identity,
+async fn responses(
+    Admitted(identity): Admitted,
     Json(req): Json<ResponsesRequest>,
 ) -> impl IntoResponse {
     not_wired(format!(
@@ -119,8 +120,8 @@ async fn responses<S: ApiKeyStore + 'static>(
     ))
 }
 
-async fn embeddings<S: ApiKeyStore + 'static>(
-    identity: Identity,
+async fn embeddings(
+    Admitted(identity): Admitted,
     Json(req): Json<EmbeddingsRequest>,
 ) -> impl IntoResponse {
     not_wired(format!(
@@ -129,7 +130,7 @@ async fn embeddings<S: ApiKeyStore + 'static>(
     ))
 }
 
-async fn models<S: ApiKeyStore + 'static>(_identity: Identity) -> impl IntoResponse {
+async fn models(Admitted(_identity): Admitted) -> impl IntoResponse {
     // Phase-01.txt: "served from a static list until Phase-04 registry".
     Json(ModelsListResponse {
         data: vec![Model {
@@ -139,18 +140,19 @@ async fn models<S: ApiKeyStore + 'static>(_identity: Identity) -> impl IntoRespo
     })
 }
 
-pub fn router<S: ApiKeyStore + 'static>() -> Router<AppState<S>> {
+pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/v1/chat/completions", post(chat_completions::<S>))
-        .route("/v1/responses", post(responses::<S>))
-        .route("/v1/embeddings", post(embeddings::<S>))
-        .route("/v1/models", get(models::<S>))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/v1/models", get(models))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::FakeApiKeyStore;
+    use crate::ratelimit::{FakeRateLimitCounter, FixedRateLimitPolicyStore, RateLimitPolicy};
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -159,11 +161,14 @@ mod tests {
     use uuid::Uuid;
 
     const TEST_KEY: &str = "oz_test_ingress_key";
+    // High enough that no ingress test trips it incidentally; ratelimit's
+    // own denial behavior is unit-tested directly in ratelimit/mod.rs.
+    const GENEROUS_RPM: u32 = 1000;
 
-    /// A router wired to a fake, in-memory store with one pre-seeded valid
-    /// key — hermetic, no live CockroachDB needed for these route-level
-    /// tests (only auth::store.rs's thin CockroachDB wrapper needs that,
-    /// verified separately).
+    /// A router wired to fake, in-memory stores (auth + ratelimit) with one
+    /// pre-seeded valid key — hermetic, no live CockroachDB/Redis needed
+    /// for these route-level tests (the real store/counter implementations
+    /// are verified separately against the live cluster).
     fn test_app() -> (Router, Uuid) {
         let org_id = Uuid::new_v4();
         let store = FakeApiKeyStore::new();
@@ -171,8 +176,12 @@ mod tests {
         let state = AppState {
             api_key_store: Arc::new(store),
             jwt_secret: Arc::from(b"test-secret".as_slice()),
+            rate_limit_counter: Arc::new(FakeRateLimitCounter::new()),
+            rate_limit_policy_store: Arc::new(FixedRateLimitPolicyStore(RateLimitPolicy {
+                rpm: GENEROUS_RPM,
+            })),
         };
-        (router::<FakeApiKeyStore>().with_state(state), org_id)
+        (router().with_state(state), org_id)
     }
 
     fn authed(req: axum::http::request::Builder) -> axum::http::request::Builder {
@@ -371,5 +380,45 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
         assert!(!json["data"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_over_the_rate_limit_is_rejected_through_the_real_route() {
+        // Proves pipeline.rs's `Admitted` extractor actually reaches
+        // ratelimit::enforce through a real route (ratelimit/mod.rs's own
+        // tests cover the threshold logic itself in isolation).
+        let org_id = Uuid::new_v4();
+        let store = FakeApiKeyStore::new();
+        store.insert(TEST_KEY, org_id, None);
+        let state = AppState {
+            api_key_store: Arc::new(store),
+            jwt_secret: Arc::from(b"test-secret".as_slice()),
+            rate_limit_counter: Arc::new(FakeRateLimitCounter::new()),
+            rate_limit_policy_store: Arc::new(FixedRateLimitPolicyStore(RateLimitPolicy {
+                rpm: 1,
+            })),
+        };
+        let app = router().with_state(state);
+
+        let first = app
+            .clone()
+            .oneshot(
+                authed(Request::get("/v1/models"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app
+            .oneshot(
+                authed(Request::get("/v1/models"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }
