@@ -1,0 +1,66 @@
+# Phase-01 edge-gateway (Rust) — real public ingress, replacing the
+# Phase-00 edge-stub. Deployed ALONGSIDE edge-stub during the cutover
+# (Step F2): edge-stub's own Deployment/Service/CiliumNetworkPolicy are
+# removed in a separate, later commit (Step F3), only once this one is
+# confirmed Synced/Healthy with edge-gateway-mtls (platform/stubs/mtls/
+# ciliumnetworkpolicy.yaml) in place — no gap where edge-gateway lacks a
+# mesh identity. Deployed via the onezox-stubs Argo CD Application, not
+# kubectl.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-gateway
+  namespace: default
+  labels:
+    app: edge-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-gateway
+  template:
+    metadata:
+      labels:
+        app: edge-gateway
+    spec:
+      containers:
+        - name: edge-gateway
+          image: onezox/edge-gateway:phase01
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-gateway
+  namespace: default
+  labels:
+    app: edge-gateway
+spec:
+  selector:
+    app: edge-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

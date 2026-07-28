@@ -67,10 +67,10 @@ spec:
         - ports:
             - port: "8080"
               protocol: TCP
-            # Phase-01: host-only for now (kubectl port-forward, used to
-            # verify the Submit gRPC shim before edge-gateway exists). The
-            # authenticated edge-gateway -> dataplane-stub rule is added
-            # once edge-gateway is deployed (Phase-01 Step F/G).
+            # Still needed alongside the authenticated edge-gateway rule
+            # below: kubectl port-forward (used throughout Phase-01 Steps
+            # A6/D/E for host-based live verification) authenticates as
+            # "host", not as edge-gateway's own identity.
             - port: "50051"
               protocol: TCP
     - fromEndpoints:
@@ -86,6 +86,56 @@ spec:
               operator: In
               values:
                 - edge-stub
+                - provider-stub
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+      authentication:
+        mode: "required"
+    # Phase-01 Step F2: edge-gateway's real Submit() gRPC calls (Step E3).
+    # Added in the SAME commit/sync as edge-gateway's own Deployment and
+    # edge-gateway-mtls policy below, so edge-gateway never has a moment
+    # where it's deployed but can't reach its one real downstream.
+    - fromEndpoints:
+        - matchLabels:
+            app: edge-gateway
+      toPorts:
+        - ports:
+            - port: "50051"
+              protocol: TCP
+      authentication:
+        mode: "required"
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: edge-gateway-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: edge-gateway
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - dataplane-stub
                 - provider-stub
       toPorts:
         - ports:
