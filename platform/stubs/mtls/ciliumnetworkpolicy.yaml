@@ -67,6 +67,12 @@ spec:
         - ports:
             - port: "8080"
               protocol: TCP
+            # Phase-01: host-only for now (kubectl port-forward, used to
+            # verify the Submit gRPC shim before edge-gateway exists). The
+            # authenticated edge-gateway -> dataplane-stub rule is added
+            # once edge-gateway is deployed (Phase-01 Step F/G).
+            - port: "50051"
+              protocol: TCP
     - fromEndpoints:
         - matchLabels:
             app.kubernetes.io/name: prometheus

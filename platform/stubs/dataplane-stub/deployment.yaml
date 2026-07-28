@@ -1,5 +1,6 @@
-# Phase-00 throwaway health stub (Python). Replaced by the real data plane
-# in Phase-03.
+# Phase-00 throwaway health stub (Python), extended in Phase-01 with a
+# minimal DataplaneService.Submit gRPC shim (port 50051) so edge-gateway has
+# a real downstream to call. Replaced by the real data plane in Phase-03.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,11 +20,13 @@ spec:
     spec:
       containers:
         - name: dataplane-stub
-          image: onezox/dataplane-stub:phase00
+          image: onezox/dataplane-stub:phase01
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
               name: http
+            - containerPort: 50051
+              name: grpc
           readinessProbe:
             httpGet:
               path: /readyz
@@ -58,3 +61,6 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
+    - name: grpc
+      port: 50051
+      targetPort: 50051

@@ -3,9 +3,18 @@
 Proves the toolchain, mesh, and telemetry work end-to-end: on boot it
 connects to CockroachDB, Redis, and MinIO, emits a trace span covering the
 whole sequence, and exposes /healthz, /readyz, and /metrics.
-Replaced by the real data-plane in Phase-03.
+
+Phase-01 adds a minimal DataplaneService.Submit gRPC shim (see
+proto/dataplane/v1/dataplane.proto): it does not call a model, it streams a
+fixed placeholder response so edge-gateway has a real downstream to forward
+and relay over SSE. This is a contract requirement of Phase-01 (edge needs a
+Submit endpoint to call), not a reopening of Phase-00 — the health-check
+surface and its verification are unchanged.
+
+Replaced by the real data plane in Phase-03.
 """
 
+import asyncio
 import io
 import json
 import logging
@@ -16,6 +25,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import asyncpg
+import grpc
 from redis.asyncio.cluster import RedisCluster
 from fastapi import FastAPI, Response
 from fastapi.responses import PlainTextResponse
@@ -27,8 +37,12 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "generated"))
+from dataplane.v1 import dataplane_pb2, dataplane_pb2_grpc  # noqa: E402
+
 SERVICE = "dataplane-stub"
 TENANT = "onezox-dev"
+GRPC_PORT = int(os.environ.get("GRPC_PORT", "50051"))
 
 
 class JsonFormatter(logging.Formatter):
@@ -64,9 +78,42 @@ trace.set_tracer_provider(provider)
 tracer = trace.get_tracer(SERVICE)
 
 boot_counter = Counter("dataplane_stub_boot_total", "Number of successful boot sequences")
+submit_counter = Counter("dataplane_stub_submit_total", "Number of Submit RPCs served")
 
 pg_pool: asyncpg.Pool | None = None
 redis_client: RedisCluster | None = None
+grpc_server: grpc.aio.Server | None = None
+
+# Fixed placeholder stream: dataplane-stub does not call a model (Phase-03
+# does). This just proves edge-gateway's SSE relay carries real multi-chunk
+# streamed content end to end.
+_PLACEHOLDER_WORDS = ["Hello", "from", "the", "Phase-01", "dataplane-stub", "shim."]
+
+
+class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
+    async def Submit(self, request, context):
+        with tracer.start_as_current_span("dataplane_stub.submit") as span:
+            span.set_attribute("request_id", request.request_id)
+            span.set_attribute("model", request.model)
+            log.info(
+                f"submit request_id={request.request_id} "
+                f"org_id={request.identity.org_id} model={request.model} kind={request.kind}"
+            )
+
+            for word in _PLACEHOLDER_WORDS:
+                yield dataplane_pb2.SubmitResponse(
+                    request_id=request.request_id,
+                    content=f"{word} ",
+                    is_final=False,
+                )
+                await asyncio.sleep(0.05)
+
+            yield dataplane_pb2.SubmitResponse(
+                request_id=request.request_id,
+                finish_reason="stop",
+                is_final=True,
+            )
+            submit_counter.inc()
 
 
 async def write_health_probe(pool: asyncpg.Pool) -> None:
@@ -98,7 +145,7 @@ def upload_test_object() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pg_pool, redis_client
+    global pg_pool, redis_client, grpc_server
 
     with tracer.start_as_current_span("dataplane_stub.boot"):
         log.info("starting boot sequence")
@@ -121,8 +168,15 @@ async def lifespan(app: FastAPI):
         boot_counter.inc()
         log.info("boot sequence complete")
 
+    grpc_server = grpc.aio.server()
+    dataplane_pb2_grpc.add_DataplaneServiceServicer_to_server(DataplaneServicer(), grpc_server)
+    grpc_server.add_insecure_port(f"[::]:{GRPC_PORT}")
+    await grpc_server.start()
+    log.info(f"gRPC DataplaneService listening on :{GRPC_PORT}")
+
     yield
 
+    await grpc_server.stop(grace=5)
     if pg_pool:
         await pg_pool.close()
     if redis_client:
