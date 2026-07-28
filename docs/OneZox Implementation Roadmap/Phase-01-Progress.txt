@@ -104,6 +104,74 @@ This entry is that missing documentation for now. Whether to promote it into
 a proper remediation step in Phase-01-Local-Restart-Guide.txt (or a new
 troubleshooting doc) is a decision for whoever next revisits that guide —
 not made here.
+--------------------------------------------------------------------------------
+2026-07-28 — Step J (EC4) findings: span tree, metrics, and a Loki gap that
+was real but not what it first looked like
+--------------------------------------------------------------------------------
+FINDING 1 (fixed): before Step J, edge-gateway's OTel span tree was a single
+span (edge_gateway.request) with no children — auth, ratelimit, and admission
+all ran and completed before the request span was even created (it used to be
+created at "meter start," well after admission and normalize). Fixed by
+moving root-span creation into pipeline.rs's `Admitted` extractor, as early as
+possible (before auth runs), and giving every stage (auth, ratelimit,
+admission, normalize, submit, relay) its own explicit `parent: &root_span`
+child span. Live-verified in Tempo, twice (before and after Step J's later
+/metrics rebuild, to rule out the second rebuild regressing it): exactly 7
+spans per real request, no orphans. "Meter" is not a distinct child span —
+it's represented by the token/cost/finish_reason fields recorded onto the
+root span itself, since Phase-01 has no real usage yet to justify a span of
+its own for it.
+
+FINDING 2 (fixed): edge-gateway had no /metrics endpoint at all — flagged as
+a known gap back in Step F3b's own comment in
+platform/operators/prometheus/prometheus-values.yaml, deferred to this step
+on purpose. Added real (not placeholder) request-count, latency-histogram,
+and inflight-gauge metrics; the inflight gauge deliberately reuses
+admission::AdmissionGuard's existing Redis-backed lifecycle (already verified
+correct by Steps H3/I) instead of a second, independent counter. First
+attempt rendered as Prometheus *summaries* (client-side quantiles) rather
+than true histograms — a metrics-exporter-prometheus default when no bucket
+boundaries are configured — corrected with explicit `set_buckets()`. Live-
+verified: Prometheus's own TSDB values exactly match real requests made, and
+the inflight gauge visibly rose 0->5->8 under 8 concurrent streamed requests
+and drained back to 0, not a static reading.
+
+FINDING 3 (fixed, and a process note): edge-gateway had no structured log
+line anywhere on the successful-request path — only `tracing::warn!` on
+error branches, plus main.rs's one boot line. A real, successful request
+produced zero Loki log lines. Fixed with one `tracing::info!` at request
+completion in stream.rs's relay() (after the SSE stream fully drains),
+carrying request_id and finish_reason explicitly rather than relying on the
+JSON formatter's span-field embedding.
+
+While verifying the fix, an initial ~45s poll against Loki found nothing,
+which triggered a deeper investigation (per the same "prove the query path
+first" discipline as Step H1's raw-key test) into whether promtail itself was
+broken: `kubectl get pods -n default -l app=promtail` initially returned
+nothing (wrong label — the DaemonSet is separately queryable, pods aren't
+labeled `app=promtail`), and two of the three promtail pods
+(promtail-hrb4z on onezox-dev-control-plane, promtail-pbwkc on
+onezox-dev-worker2) turned out to have genuinely stale logs (nothing since
+~12:06 and ~13:15 respectively, vs. current time ~21:00) — consistent with
+this session's already-documented pattern of WSL2-restart drift silently
+breaking pods that still report Running. This did NOT block edge-gateway's
+own telemetry: edge-gateway runs on onezox-dev-worker, served by
+promtail-hz29h specifically, which was healthy and actively pushing to
+loki-gateway (confirmed via loki-gateway's own access log showing continuous
+204s). The actual reason the first poll came back empty was ordinary Loki
+ingestion lag relative to how short that poll window was, not a broken
+pipeline — a longer wait (60s) and a wide query window found the log line
+immediately after. Left promtail-hrb4z/-pbwkc's staleness unaddressed here:
+they don't affect any Phase-01 service's telemetry today (nothing Phase-01
+cares about runs on the control-plane node; onezox-dev-worker2 hosts no
+edge-gateway replica), so fixing them is out of Step J's scope, but it's the
+same underlying class of drift as the Redis Cluster finding above and belongs
+in the same "known gap" bucket if it starts mattering later.
+
+Net result: EC4 verified complete for one real request across all three
+backends — Tempo (7 correctly-parented spans), Prometheus (real request
+count/histogram/inflight values), and Loki (one structured completion log
+line, request_id and finish_reason present and correct).
 ================================================================================
 END OF PHASE-01-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================

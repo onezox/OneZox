@@ -132,6 +132,7 @@ where
     S: Stream<Item = Result<SubmitResponse, Status>> + Send + 'static,
 {
     let span = tracing::info_span!(parent: meter.span(), "edge_gateway.relay");
+    let log_request_id = request_id.clone();
     let chunks = to_chunks(upstream, request_id, model);
 
     let sse_stream = async_stream::stream! {
@@ -144,6 +145,18 @@ where
             let json = serde_json::to_string(&chunk).unwrap_or_default();
             yield Ok(Event::default().data(json));
         }
+        // EC4/Step J3: a structured log line for the request, not just a
+        // span — Tempo (traces) and Prometheus (metrics) both already
+        // observe every request; Loki previously didn't, since nothing in
+        // the happy path called tracing::info!/warn! at all (only error
+        // branches did). Explicit fields here, not relying on the fmt
+        // JSON formatter's span-field embedding, so this line is
+        // self-contained regardless of formatter config.
+        tracing::info!(
+            request_id = %log_request_id,
+            finish_reason = %last_finish_reason,
+            "edge_gateway request completed"
+        );
         meter.finish(&last_finish_reason);
         drop(admission_guard);
     };
