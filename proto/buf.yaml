@@ -8,7 +8,7 @@ breaking:
   use:
     - FILE
   ignore:
-    # One-time: gateway/v1/placeholder.proto was deleted and replaced by the
-    # real Phase-01 ingress contracts in gateway.proto. Removed in the next
-    # proto-touching commit once this comparison is no longer live.
-    - gateway/v1/placeholder.proto
+    # One-time: dataplane/v1/placeholder.proto was deleted and replaced by
+    # the real Phase-01 internal contract in dataplane.proto. Removed in the
+    # next proto-touching commit once this comparison is no longer live.
+    - dataplane/v1/placeholder.proto

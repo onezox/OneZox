@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package dataplane.v1;
+
+import "gateway/v1/gateway.proto";
+
+// Internal contract (Part K.2: gRPC + protobuf, service-to-service) between
+// edge-gateway and the data plane. Phase-01 defines the minimal shape edge
+// needs to normalize into and stream deltas back from; Phase-03 extends this
+// as the real data plane replaces the dataplane-stub (Dependencies.txt:
+// proto/dataplane owner P01/P03).
+
+enum RequestKind {
+  REQUEST_KIND_UNSPECIFIED = 0;
+  REQUEST_KIND_CHAT_COMPLETION = 1;
+  REQUEST_KIND_RESPONSES = 2;
+  REQUEST_KIND_EMBEDDINGS = 3;
+}
+
+// Resolved at the edge from the API key or JWT (Part P.1); attached to every
+// downstream call so no request proceeds without a resolved org_id.
+message Identity {
+  string org_id = 1;
+  string user_id = 2;
+  string project_id = 3;
+  string conversation_id = 4;
+}
+
+message SubmitRequest {
+  string request_id = 1;
+  Identity identity = 2;
+  RequestKind kind = 3;
+  string model = 4;
+  repeated gateway.v1.ChatMessage messages = 5;
+  bool stream = 6;
+  optional int32 max_tokens = 7;
+  optional float temperature = 8;
+}
+
+message SubmitResponse {
+  string request_id = 1;
+  optional string content = 2;
+  optional string finish_reason = 3;
+  bool is_final = 4;
+}
+
+service DataplaneService {
+  rpc Submit(SubmitRequest) returns (stream SubmitResponse);
+}
