@@ -9,6 +9,7 @@
 
 mod admission;
 mod auth;
+mod dataplane_client;
 mod ingress;
 mod meter;
 mod normalize;
