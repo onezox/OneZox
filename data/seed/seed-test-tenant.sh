@@ -8,18 +8,23 @@
 # stored. The raw key is printed once to stdout and is not recoverable
 # afterward (CLAUDE.md: store API-key hashes, never raw keys).
 #
-# Idempotent: reuses the existing "phase01-test-tenant" tenant if present,
-# does not mint a second key if this tenant already has an active
-# (non-revoked) one, and does not overwrite an existing rate_limit_policy
-# row. rpm=60/tpm=100000/concurrency=10 are general-purpose test defaults,
-# not tuned to trip on the first few requests — a step that specifically
-# wants to exercise "rate limit exceeded" (Step H) adjusts rpm for its own
-# test scope rather than relying on a low standing default here.
+# Idempotent: reuses the tenant if it already exists, does not mint a
+# second key if it already has an active (non-revoked) one, and does not
+# overwrite an existing rate_limit_policy row. rpm=60/tpm=100000/
+# concurrency=10 are general-purpose test defaults, not tuned to trip on
+# the first few requests — a step that specifically wants to exercise
+# "rate limit exceeded" (Step H) adjusts rpm for its own test scope rather
+# than relying on a low standing default here.
+#
+# Usage: seed-test-tenant.sh [pod] [tenant-name]
+# Defaults to the standing "phase01-test-tenant" used throughout Phase-01;
+# pass a second tenant name (Step H2) to seed an independent tenant for
+# cross-tenant isolation testing.
 set -euo pipefail
 
 POD="${1:-onezox-crdb-0}"
 NAMESPACE="default"
-TENANT_NAME="phase01-test-tenant"
+TENANT_NAME="${2:-phase01-test-tenant}"
 DEFAULT_RPM=60
 DEFAULT_TPM=100000
 DEFAULT_CONCURRENCY=10
