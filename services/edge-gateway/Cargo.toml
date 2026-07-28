@@ -29,9 +29,10 @@ tracing-opentelemetry = "0.33"
 async-stream = "0.3"
 futures-util = "0.3"
 
-[build-dependencies]
-tonic-prost-build = "0.14"
-
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Not a build-dependency: proto codegen no longer runs at build time (see
+# src/pb.rs's doc comment) — only used by the #[ignore]-gated regeneration
+# test, a manual dev-time operation.
+tonic-prost-build = "0.14"
