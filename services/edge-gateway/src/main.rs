@@ -1,12 +1,13 @@
 //! edge-gateway — Phase-01: replaces the Phase-00 edge-stub with the real
 //! public ingress. Built incrementally per CLAUDE.md: this step wires the
 //! four OpenAI-compatible ingress routes (Part K, src/ingress.rs) behind
-//! authentication (Part O, src/auth) and rate limiting (src/ratelimit),
-//! composed in src/pipeline.rs. admission, normalize, meter, and the SSE
-//! relay to the data plane (per Phase-01.txt's
-//! src/{admission,normalize,stream,meter} folder structure) land in later
-//! Phase-01 steps.
+//! authentication (Part O, src/auth), rate limiting (src/ratelimit), and
+//! admission control (src/admission), composed in src/pipeline.rs.
+//! normalize, meter, and the SSE relay to the data plane (per
+//! Phase-01.txt's src/{normalize,stream,meter} folder structure) land in
+//! the next Phase-01 step.
 
+mod admission;
 mod auth;
 mod ingress;
 mod pipeline;
@@ -19,12 +20,20 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::ge
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use admission::store::RedisAdmissionGauge;
 use auth::store::{CockroachApiKeyStore, build_pool};
 use ratelimit::store::{CockroachRateLimitPolicyStore, RedisRateLimitCounter, build_redis_client};
 use state::AppState;
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn init_logging() {
@@ -59,11 +68,20 @@ async fn main() {
     // during local dev; production deployment sets JWT_HMAC_SECRET.
     let jwt_secret = env("JWT_HMAC_SECRET", "phase01-dev-only-placeholder-secret");
 
+    // Placeholder concurrency thresholds for Phase-01's single local cell
+    // (Part D). Not tuned against real capacity data — that's a later-phase
+    // concern once there's real load/latency data to size against.
+    let admission_soft_limit = env_u64("ADMISSION_SOFT_LIMIT", 100);
+    let admission_hard_limit = env_u64("ADMISSION_HARD_LIMIT", 200);
+
     let state = AppState {
         api_key_store: Arc::new(CockroachApiKeyStore::new(pool.clone())),
         jwt_secret: Arc::from(jwt_secret.into_bytes().into_boxed_slice()),
-        rate_limit_counter: Arc::new(RedisRateLimitCounter::new(redis_client)),
+        rate_limit_counter: Arc::new(RedisRateLimitCounter::new(redis_client.clone())),
         rate_limit_policy_store: Arc::new(CockroachRateLimitPolicyStore::new(pool)),
+        admission_gauge: Arc::new(RedisAdmissionGauge::new(redis_client)),
+        admission_soft_limit,
+        admission_hard_limit,
     };
 
     let app = ingress::router()

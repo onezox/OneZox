@@ -1,8 +1,8 @@
-//! Composes the auth -> ratelimit (-> admission, Step D2) pipeline
-//! (Phase-01.txt) into a single axum extractor, so each stage's own module
-//! (auth, ratelimit, ...) stays independently cohesive and unit-tested in
-//! isolation, while a real request still flows through all of them, in
-//! order, before reaching a handler.
+//! Composes the auth -> ratelimit -> admission pipeline (Phase-01.txt) into
+//! a single axum extractor, so each stage's own module (auth, ratelimit,
+//! admission) stays independently cohesive and unit-tested in isolation,
+//! while a real request still flows through all of them, in order, before
+//! reaching a handler.
 
 use axum::Json;
 use axum::extract::FromRequestParts;
@@ -10,6 +10,7 @@ use axum::http::{StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
+use crate::admission::{self, AdmissionError, AdmissionGuard};
 use crate::auth::Identity;
 use crate::ratelimit::{self, RateLimitError};
 use crate::state::AppState;
@@ -36,10 +37,23 @@ fn rate_limited() -> Response {
         .into_response()
 }
 
-/// Admits a request: resolves identity (auth), then enforces the org's
-/// rate limit. Use exactly like `Identity` as a handler parameter — this
-/// IS the identity, just also guaranteed to have passed rate limiting.
-pub struct Admitted(pub Identity);
+fn shed() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: ErrorDetail { message: "cell at capacity, request shed", kind: "shed" },
+        }),
+    )
+        .into_response()
+}
+
+/// Admits a request: resolves identity (auth), enforces the org's rate
+/// limit, then applies admission control. Use exactly like `Identity` as a
+/// handler parameter — this IS the identity, just also guaranteed to have
+/// passed rate limiting and admission. Holds the `AdmissionGuard` for as
+/// long as the handler (and, once Step E's SSE relay exists, the whole
+/// streamed response) is alive; it decrements the in-flight gauge on drop.
+pub struct Admitted(pub Identity, pub AdmissionGuard);
 
 impl FromRequestParts<AppState> for Admitted {
     type Rejection = Response;
@@ -55,11 +69,23 @@ impl FromRequestParts<AppState> for Admitted {
         let policy = state.rate_limit_policy_store.policy_for(identity.org_id).await;
         match ratelimit::enforce(state.rate_limit_counter.as_ref(), identity.org_id, &policy).await
         {
-            Ok(()) => Ok(Admitted(identity)),
-            Err(RateLimitError::Exceeded) => Err(rate_limited()),
-            // enforce() already fails open on a store error — this arm is
-            // unreachable in practice, kept only so the match is exhaustive.
-            Err(RateLimitError::Store(_)) => Ok(Admitted(identity)),
+            Ok(()) => {}
+            Err(RateLimitError::Exceeded) => return Err(rate_limited()),
+            // enforce() already fails open on a store error — unreachable
+            // in practice, kept only so the match is exhaustive.
+            Err(RateLimitError::Store(_)) => {}
         }
+
+        // admit() fails open on a gauge-store error (see its doc comment) —
+        // the only Err it actually returns is a genuine Shed decision.
+        let guard = admission::admit(
+            state.admission_gauge.clone(),
+            state.admission_soft_limit,
+            state.admission_hard_limit,
+        )
+        .await
+        .map_err(|_: AdmissionError| shed())?;
+
+        Ok(Admitted(identity, guard))
     }
 }

@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::admission::AdmissionGauge;
 use crate::auth::ApiKeyStore;
 use crate::ratelimit::{RateLimitCounter, RateLimitPolicyStore};
 
@@ -17,4 +18,7 @@ pub struct AppState {
     pub jwt_secret: Arc<[u8]>,
     pub rate_limit_counter: Arc<dyn RateLimitCounter>,
     pub rate_limit_policy_store: Arc<dyn RateLimitPolicyStore>,
+    pub admission_gauge: Arc<dyn AdmissionGauge>,
+    pub admission_soft_limit: u64,
+    pub admission_hard_limit: u64,
 }
