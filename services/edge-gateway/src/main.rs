@@ -17,6 +17,7 @@ mod pb;
 mod pipeline;
 mod ratelimit;
 mod state;
+mod stream;
 
 use std::sync::Arc;
 

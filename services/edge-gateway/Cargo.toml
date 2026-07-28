@@ -26,6 +26,8 @@ opentelemetry = "0.32"
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.33"
+async-stream = "0.3"
+futures-util = "0.3"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

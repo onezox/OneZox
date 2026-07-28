@@ -67,6 +67,31 @@ pub struct ModelsListResponse {
     pub data: Vec<Model>,
 }
 
+/// SSE chunk shape (Step E4): mirrors proto/gateway/v1/gateway.proto's
+/// ChatCompletionChunk field names by the same hand-written-not-generated
+/// convention as the request structs above (see module doc).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ChatCompletionChunkDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ChatCompletionChunkChoice {
+    pub index: i32,
+    pub delta: ChatCompletionChunkDelta,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub model: String,
+    pub choices: Vec<ChatCompletionChunkChoice>,
+}
+
 #[derive(Debug, Serialize)]
 struct NotWiredError {
     error: NotWiredErrorDetail,
