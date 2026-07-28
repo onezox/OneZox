@@ -33,6 +33,7 @@ use std::convert::Infallible;
 use axum::response::sse::{Event, Sse};
 use futures_util::{Stream, StreamExt};
 use tonic::Status;
+use tracing::Instrument;
 
 use crate::admission::AdmissionGuard;
 use crate::ingress::{ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta};
@@ -106,6 +107,18 @@ where
 /// stream itself ends or is dropped, so `AdmissionGuard`'s in-flight gauge
 /// stays accurate for the request's entire streamed duration, not just its
 /// initial admission (see admission::AdmissionGuard's doc comment).
+///
+/// Each `.next()` call is individually `.instrument()`-ed with the
+/// meter's span rather than entered with a manual guard once: `tracing`'s
+/// `Instrument` trait only covers `Future`, not `Stream` (there's no
+/// blanket "instrument every poll" wrapper for a whole stream), and a
+/// manual `span.enter()` guard held across the loop's `.await` points
+/// would be exactly the async-span pitfall documented in main.rs's
+/// `init_telemetry` and this module's own doc comment. Instrumenting the
+/// `Future` returned by each individual `.next()` call gets the same
+/// result — the span is entered/exited around each poll, never held
+/// across an await — at the granularity `tracing::Instrument` actually
+/// supports.
 pub fn relay<S>(
     request_id: String,
     model: String,
@@ -116,12 +129,13 @@ pub fn relay<S>(
 where
     S: Stream<Item = Result<SubmitResponse, Status>> + Send + 'static,
 {
+    let span = meter.span().clone();
     let chunks = to_chunks(upstream, request_id, model);
 
     let sse_stream = async_stream::stream! {
         futures_util::pin_mut!(chunks);
         let mut last_finish_reason = "unknown".to_string();
-        while let Some(chunk) = chunks.next().await {
+        while let Some(chunk) = chunks.next().instrument(span.clone()).await {
             if let Some(reason) = &chunk.choices[0].finish_reason {
                 last_finish_reason = reason.clone();
             }

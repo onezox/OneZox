@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use tonic::transport::Channel;
+
 use crate::admission::AdmissionGauge;
 use crate::auth::ApiKeyStore;
 use crate::ratelimit::{RateLimitCounter, RateLimitPolicyStore};
@@ -21,4 +23,8 @@ pub struct AppState {
     pub admission_gauge: Arc<dyn AdmissionGauge>,
     pub admission_soft_limit: u64,
     pub admission_hard_limit: u64,
+    /// gRPC channel to dataplane-stub (Step E3/E5). `Channel` is itself
+    /// Send+Sync+Clone (see dataplane_client.rs's doc comment), so it
+    /// doesn't need an `Arc` wrapper here.
+    pub dataplane_channel: Channel,
 }

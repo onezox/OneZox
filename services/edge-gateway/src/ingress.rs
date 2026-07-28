@@ -1,9 +1,12 @@
-//! OpenAI-compatible ingress surface (Part K, Phase-01 Step B): routes
-//! exist, bodies are structurally validated via serde's `Deserialize` —
-//! axum's `Json` extractor rejects malformed/missing-field bodies with 422
-//! automatically. Semantic validation and the actual conversion to the
-//! internal proto contract is the normalize module's job (Phase-01 Step E),
-//! not wired here yet; valid requests currently get a 501 placeholder.
+//! OpenAI-compatible ingress surface (Part K): routes exist, bodies are
+//! structurally validated via serde's `Deserialize` — axum's `Json`
+//! extractor rejects malformed/missing-field bodies with 422
+//! automatically. chat.completions and responses (Step E5) are fully
+//! wired: auth -> ratelimit -> admission -> normalize -> meter -> Submit
+//! -> SSE relay. /v1/embeddings stays a 501 placeholder deliberately —
+//! Phase-01.txt's APIS CREATED section is explicit that it's "wired to
+//! real embed in Phase-10", the only one of the four routes with that
+//! caveat.
 //!
 //! Hand-written serde structs here, not the prost-generated proto/gateway
 //! types: protobuf's canonical JSON mapping renders field names in
@@ -12,19 +15,23 @@
 //! proto/gateway/v1/gateway.proto's field names/types by convention; that
 //! proto file remains the cross-language schema of record. The generated
 //! Rust types from it are used downstream instead, in the gRPC call to the
-//! data plane (Phase-01 Step E), where binary wire format applies and this
-//! concern doesn't exist.
+//! data plane, where binary wire format applies and this concern doesn't
+//! exist.
 
 use axum::{
     Json, Router,
+    extract::State,
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
+use crate::auth::Identity;
 use crate::pipeline::Admitted;
 use crate::state::AppState;
+use crate::{dataplane_client, meter, normalize, stream};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
@@ -104,49 +111,97 @@ struct NotWiredErrorDetail {
     kind: String,
 }
 
-fn not_wired(stage: String) -> impl IntoResponse {
+fn not_wired(stage: String) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(NotWiredError {
             error: NotWiredErrorDetail {
                 message: format!(
-                    "{stage} accepted a structurally valid request but downstream is not wired yet (Phase-01, later step)"
+                    "{stage} accepted a structurally valid request but downstream is not wired yet (Phase-10)"
                 ),
                 kind: "not_implemented".to_string(),
             },
         }),
     )
+        .into_response()
 }
 
-// Every handler takes `Admitted(identity, _guard)` (even where identity
-// isn't used yet, e.g. models): this is the enforcement point for "no
-// request proceeds without a resolved org_id", rate limiting, and admission
-// (Phase-01.txt, Security Implementation + FEATURES). `_guard` isn't read
-// directly by any handler yet — it exists to be held for the handler's
-// full lifetime, decrementing the in-flight gauge on drop; once Step E's
-// SSE relay exists, it moves into the stream's task instead of dropping
-// immediately. `Admitted` must be extracted before any body-consuming
-// extractor (axum requires the last argument to be the one that consumes
-// the request body).
+fn bad_gateway(request_id: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(NotWiredError {
+            error: NotWiredErrorDetail {
+                message: format!("request {request_id}: downstream (dataplane-stub) unavailable"),
+                kind: "bad_gateway".to_string(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+/// Shared tail of the auth -> ratelimit -> admission -> normalize pipeline
+/// (Phase-01.txt) for chat.completions and responses: starts metering,
+/// calls dataplane-stub's Submit, and either relays the stream (Step E4)
+/// or — if Submit itself fails, e.g. dataplane-stub unreachable — finishes
+/// the meter span and drops the admission guard explicitly (relay()'s
+/// Drop-based cleanup never starts in this branch, since relay() is never
+/// called), then returns 502.
+async fn submit_and_relay(
+    state: &AppState,
+    identity: &Identity,
+    admission_guard: crate::admission::AdmissionGuard,
+    submit_req: crate::pb::dataplane::v1::SubmitRequest,
+) -> Response {
+    let request_id = submit_req.request_id.clone();
+    let model = submit_req.model.clone();
+    let meter = meter::start(&request_id, &identity.org_id.to_string(), &model);
+    let span = meter.span().clone();
+
+    // .instrument(), not a manual enter() guard: this await crosses the
+    // whole RPC round-trip — see stream::relay's doc comment for why that
+    // distinction matters for async spans.
+    let submit_result = dataplane_client::submit(state.dataplane_channel.clone(), submit_req)
+        .instrument(span)
+        .await;
+
+    match submit_result {
+        Ok(upstream) => stream::relay(request_id, model, upstream, meter, admission_guard).into_response(),
+        Err(status) => {
+            tracing::warn!(
+                error = %status,
+                request_id = %request_id,
+                "dataplane-stub Submit call failed"
+            );
+            meter.finish("error");
+            drop(admission_guard);
+            bad_gateway(&request_id)
+        }
+    }
+}
+
+// Every handler takes `Admitted(identity, guard)` (even where identity
+// isn't used, e.g. models): this is the enforcement point for "no request
+// proceeds without a resolved org_id", rate limiting, and admission
+// (Phase-01.txt, Security Implementation + FEATURES). `Admitted` must be
+// extracted before any body-consuming extractor (axum requires the last
+// argument to be the one that consumes the request body).
 
 async fn chat_completions(
-    Admitted(identity, _guard): Admitted,
+    State(state): State<AppState>,
+    Admitted(identity, admission_guard): Admitted,
     Json(req): Json<ChatCompletionRequest>,
-) -> impl IntoResponse {
-    not_wired(format!(
-        "chat.completions org_id={} model={}",
-        identity.org_id, req.model
-    ))
+) -> Response {
+    let submit_req = normalize::normalize_chat_completions(&identity, &req);
+    submit_and_relay(&state, &identity, admission_guard, submit_req).await
 }
 
 async fn responses(
-    Admitted(identity, _guard): Admitted,
+    State(state): State<AppState>,
+    Admitted(identity, admission_guard): Admitted,
     Json(req): Json<ResponsesRequest>,
-) -> impl IntoResponse {
-    not_wired(format!(
-        "responses org_id={} model={}",
-        identity.org_id, req.model
-    ))
+) -> Response {
+    let submit_req = normalize::normalize_responses(&identity, &req);
+    submit_and_relay(&state, &identity, admission_guard, submit_req).await
 }
 
 async fn embeddings(
@@ -216,8 +271,18 @@ mod tests {
             admission_gauge: Arc::new(FakeAdmissionGauge::new()),
             admission_soft_limit: GENEROUS_ADMISSION_LIMIT,
             admission_hard_limit: GENEROUS_ADMISSION_LIMIT,
+            dataplane_channel: unreachable_dataplane_channel(),
         };
         (router().with_state(state), org_id)
+    }
+
+    /// A channel to a port nothing listens on. `connect_lazy` never fails
+    /// at construction (see dataplane_client.rs) — the actual connection
+    /// attempt only happens on first use, so this is safe and fast to
+    /// build in every test even though most tests never call the routes
+    /// that would use it.
+    fn unreachable_dataplane_channel() -> tonic::transport::Channel {
+        crate::dataplane_client::connect_lazy("http://127.0.0.1:1").unwrap()
     }
 
     fn authed(req: axum::http::request::Builder) -> axum::http::request::Builder {
@@ -230,7 +295,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completions_accepts_a_well_formed_authenticated_body() {
+    async fn chat_completions_reaches_the_real_downstream_call_once_authenticated_and_valid() {
+        // The real Submit() call to dataplane-stub is now wired (Step E5);
+        // this test's fake AppState has no reachable dataplane-stub, so a
+        // structurally valid, authenticated request gets 502 — proving it
+        // got all the way through auth/ratelimit/admission/normalize and
+        // genuinely attempted the downstream call, rather than short-
+        // circuiting on validation (that's a distinct, earlier failure
+        // mode covered by the "rejects" tests below, all still 422/401).
+        // The actual happy-path SSE relay is verified live against a real
+        // dataplane-stub (dataplane_client.rs's #[ignore] test, and this
+        // step's own live end-to-end check).
         let (app, _org_id) = test_app();
         let body = serde_json::json!({
             "model": "onezox-ultra",
@@ -245,9 +320,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // 501: authenticated + structurally valid, downstream not wired yet
-        // (Step E).
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -360,7 +433,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_accepts_a_well_formed_authenticated_body() {
+    async fn responses_reaches_the_real_downstream_call_once_authenticated_and_valid() {
+        // Same reasoning as chat_completions' equivalent test above.
         let (app, _org_id) = test_app();
         let body = serde_json::json!({"model": "onezox-ultra", "input": "hi"});
         let response = app
@@ -372,7 +446,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -436,6 +510,7 @@ mod tests {
             admission_gauge: Arc::new(FakeAdmissionGauge::new()),
             admission_soft_limit: GENEROUS_ADMISSION_LIMIT,
             admission_hard_limit: GENEROUS_ADMISSION_LIMIT,
+            dataplane_channel: unreachable_dataplane_channel(),
         };
         let app = router().with_state(state);
 
@@ -484,6 +559,7 @@ mod tests {
             admission_gauge: gauge,
             admission_soft_limit: 0,
             admission_hard_limit: 1,
+            dataplane_channel: unreachable_dataplane_channel(),
         };
         let app = router().with_state(state);
 

@@ -123,6 +123,14 @@ async fn main() {
     let admission_soft_limit = env_u64("ADMISSION_SOFT_LIMIT", 100);
     let admission_hard_limit = env_u64("ADMISSION_HARD_LIMIT", 200);
 
+    // Temporary downstream (Phase-01.txt) until Phase-03's real data plane.
+    let dataplane_endpoint = env(
+        "DATAPLANE_STUB_ENDPOINT",
+        "http://dataplane-stub.default.svc.cluster.local:50051",
+    );
+    let dataplane_channel = dataplane_client::connect_lazy(&dataplane_endpoint)
+        .expect("invalid DATAPLANE_STUB_ENDPOINT");
+
     let state = AppState {
         api_key_store: Arc::new(CockroachApiKeyStore::new(pool.clone())),
         jwt_secret: Arc::from(jwt_secret.into_bytes().into_boxed_slice()),
@@ -131,6 +139,7 @@ async fn main() {
         admission_gauge: Arc::new(RedisAdmissionGauge::new(redis_client)),
         admission_soft_limit,
         admission_hard_limit,
+        dataplane_channel,
     };
 
     let app = ingress::router()
