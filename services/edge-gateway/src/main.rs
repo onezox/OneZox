@@ -10,6 +10,7 @@
 mod admission;
 mod auth;
 mod ingress;
+mod meter;
 mod normalize;
 mod pb;
 mod pipeline;
@@ -19,6 +20,9 @@ mod state;
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::Resource;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -26,6 +30,8 @@ use admission::store::RedisAdmissionGauge;
 use auth::store::{CockroachApiKeyStore, build_pool};
 use ratelimit::store::{CockroachRateLimitPolicyStore, RedisRateLimitCounter, build_redis_client};
 use state::AppState;
+
+const SERVICE_NAME: &str = "edge-gateway";
 
 fn env(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -38,13 +44,52 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn init_logging() {
+/// Adapted from edge-stub's already-verified Phase-00 pattern (Phase-00's
+/// own Problem #15 in Phase-00-Complete.txt). Two things that pattern
+/// specifically exists to avoid:
+/// - Without the EnvFilter excluding TRACE/DEBUG, tracing_opentelemetry
+///   bridges h2/tonic's own internal per-frame spans (used by the OTLP
+///   exporter itself) into Tempo alongside real application spans —
+///   confirmed there by searching Tempo and getting transport-noise
+///   instead of the intended span.
+/// - Spans wrapping async code with multiple .await points must be entered
+///   via `.instrument()`, never a manual `span.enter()` guard held across
+///   an await — that breaks OTel span-context propagation. meter.rs's
+///   `RequestMeter::span()` is designed to be used with `.instrument()` in
+///   Step E3/E4 for exactly this reason.
+fn init_telemetry() -> opentelemetry_sdk::trace::SdkTracerProvider {
+    let otlp_endpoint = env(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://otel-collector-opentelemetry-collector.default.svc.cluster.local:4317",
+    );
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(otlp_endpoint)
+        .build()
+        .expect("failed to build OTLP exporter");
+
+    let resource = Resource::builder().with_service_name(SERVICE_NAME).build();
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .build();
+
+    let tracer = provider.tracer(SERVICE_NAME);
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let fmt_layer = tracing_subscriber::fmt::layer().json();
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(otel_layer)
+        .with(fmt_layer)
         .init();
+
+    provider
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
@@ -57,7 +102,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() {
-    init_logging();
+    let provider = init_telemetry();
 
     let pg_host = env("COCKROACH_HOST", "onezox-crdb-public.default.svc.cluster.local");
     let pool = build_pool(&pg_host);
@@ -97,4 +142,6 @@ async fn main() {
         .unwrap();
     tracing::info!(port = %port, "edge-gateway listening");
     axum::serve(listener, app).await.unwrap();
+
+    provider.shutdown().ok();
 }

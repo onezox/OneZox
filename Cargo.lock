@@ -487,6 +487,9 @@ dependencies = [
  "hex",
  "http-body-util",
  "jsonwebtoken",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "prost",
  "prost-build",
  "redis",
@@ -497,6 +500,7 @@ dependencies = [
  "tokio-postgres",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
 ]
