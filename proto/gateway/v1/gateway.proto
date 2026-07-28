@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package gateway.v1;
+
+// Ingress request/response contracts for the OpenAI-compatible surface
+// (Part K, Phase-01): /v1/chat/completions, /v1/responses, /v1/embeddings,
+// /v1/models. No RPC service here — the public ingress is plain HTTP/JSON
+// (+ SSE for streaming), not gRPC; these messages are the typed contract
+// edge-gateway validates incoming bodies against and normalizes from.
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message ChatCompletionRequest {
+  string model = 1;
+  repeated ChatMessage messages = 2;
+  bool stream = 3;
+  optional int32 max_tokens = 4;
+  optional float temperature = 5;
+}
+
+message ChatCompletionChoice {
+  int32 index = 1;
+  ChatMessage message = 2;
+  optional string finish_reason = 3;
+}
+
+message ChatCompletionResponse {
+  string id = 1;
+  string model = 2;
+  repeated ChatCompletionChoice choices = 3;
+}
+
+message ChatCompletionChunkDelta {
+  optional string role = 1;
+  optional string content = 2;
+}
+
+message ChatCompletionChunkChoice {
+  int32 index = 1;
+  ChatCompletionChunkDelta delta = 2;
+  optional string finish_reason = 3;
+}
+
+// Wire shape of each SSE "data:" payload when stream = true.
+message ChatCompletionChunk {
+  string id = 1;
+  string model = 2;
+  repeated ChatCompletionChunkChoice choices = 3;
+}
+
+message ResponsesRequest {
+  string model = 1;
+  string input = 2;
+  bool stream = 3;
+}
+
+message ResponsesResponse {
+  string id = 1;
+  string model = 2;
+  string output_text = 3;
+}
+
+message EmbeddingsRequest {
+  string model = 1;
+  repeated string input = 2;
+}
+
+message Embedding {
+  int32 index = 1;
+  repeated float values = 2;
+}
+
+message EmbeddingsResponse {
+  string model = 1;
+  repeated Embedding data = 2;
+}
+
+message Model {
+  string id = 1;
+  string owned_by = 2;
+}
+
+message ModelsListResponse {
+  repeated Model data = 1;
+}
