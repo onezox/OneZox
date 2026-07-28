@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 
-# services/edge-stub joined this phase (Phase-00 Deployment Step 7).
+# services/edge-stub joined in Phase-00 (Deployment Step 7).
+# services/edge-gateway joined in Phase-01 (Step B), replacing edge-stub.
 # Still to come (Part C, Part Q):
-#   - services/edge-gateway     (later: real public ingress / streaming relay)
 #   - services/sandbox-supervisor (later: Firecracker microVM supervisor)
 #   - libs/tokenizer            (later: Rust/PyO3 extension for the Python data-plane)
-members = ["services/edge-stub"]
+members = ["services/edge-stub", "services/edge-gateway"]
 
 [workspace.package]
 edition = "2024"
