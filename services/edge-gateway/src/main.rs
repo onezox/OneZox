@@ -46,7 +46,14 @@ async fn main() {
 
     let pg_host = env("COCKROACH_HOST", "onezox-crdb-public.default.svc.cluster.local");
     let pool = build_pool(&pg_host);
-    let state = AppState { api_key_store: Arc::new(CockroachApiKeyStore::new(pool)) };
+    // No real JWT issuer exists yet in Phase-01 (see auth/jwt.rs) — this is
+    // a placeholder default so the service boots without a K8s Secret
+    // during local dev; production deployment sets JWT_HMAC_SECRET.
+    let jwt_secret = env("JWT_HMAC_SECRET", "phase01-dev-only-placeholder-secret");
+    let state = AppState {
+        api_key_store: Arc::new(CockroachApiKeyStore::new(pool)),
+        jwt_secret: Arc::from(jwt_secret.into_bytes().into_boxed_slice()),
+    };
 
     let app = ingress::router::<CockroachApiKeyStore>()
         .route("/healthz", get(|| async { StatusCode::OK }))

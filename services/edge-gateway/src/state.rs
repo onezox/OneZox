@@ -9,6 +9,9 @@ use crate::auth::ApiKeyStore;
 
 pub struct AppState<S: ApiKeyStore> {
     pub api_key_store: Arc<S>,
+    /// HS256 shared secret for the JWT verification hook (Step C2). No real
+    /// issuer exists yet in Phase-01 — see auth/jwt.rs's doc comment.
+    pub jwt_secret: Arc<[u8]>,
 }
 
 // Not `#[derive(Clone)]`: that would require `S: Clone`, but `Arc<S>` is
@@ -18,6 +21,9 @@ pub struct AppState<S: ApiKeyStore> {
 // doesn't need.
 impl<S: ApiKeyStore> Clone for AppState<S> {
     fn clone(&self) -> Self {
-        Self { api_key_store: Arc::clone(&self.api_key_store) }
+        Self {
+            api_key_store: Arc::clone(&self.api_key_store),
+            jwt_secret: Arc::clone(&self.jwt_secret),
+        }
     }
 }

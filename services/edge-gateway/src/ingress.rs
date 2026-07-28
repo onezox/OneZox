@@ -168,7 +168,10 @@ mod tests {
         let org_id = Uuid::new_v4();
         let store = FakeApiKeyStore::new();
         store.insert(TEST_KEY, org_id, None);
-        let state = AppState { api_key_store: Arc::new(store) };
+        let state = AppState {
+            api_key_store: Arc::new(store),
+            jwt_secret: Arc::from(b"test-secret".as_slice()),
+        };
         (router::<FakeApiKeyStore>().with_state(state), org_id)
     }
 
@@ -279,6 +282,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn models_authenticates_via_jwt_too() {
+        // Proves the Identity extractor's shape-based dispatch (Step C2)
+        // actually reaches jwt::verify_jwt through the real route, not just
+        // the pure function in isolation (auth/jwt.rs's own unit tests).
+        let (app, _org_id) = test_app();
+        let org_id = Uuid::new_v4();
+        let claims = serde_json::json!({
+            "org_id": org_id,
+            "exp": (chrono::Utc::now().timestamp() + 3600),
+        });
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get("/v1/models")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@
 //! A thin CockroachDB-backed implementation is verified separately against
 //! the live cluster (store.rs).
 
+pub mod jwt;
 pub mod store;
 
 use axum::extract::FromRequestParts;
@@ -138,9 +139,10 @@ fn unauthorized() -> (StatusCode, Json<AuthErrorBody>) {
 }
 
 /// Lets any axum handler take `identity: Identity` as a parameter: extracts
-/// `Authorization: Bearer <key>`, authenticates it against `state`'s store,
-/// and rejects with a generic 401 on any failure. This is the enforcement
-/// point for "no request proceeds without a resolved org_id"
+/// `Authorization: Bearer <token>`, dispatches to whichever verification
+/// path matches the token's shape (Part P.1: "resolves ...  from API key
+/// or JWT"), and rejects with a generic 401 on any failure. This is the
+/// enforcement point for "no request proceeds without a resolved org_id"
 /// (Phase-01.txt, Security Implementation).
 impl<S: ApiKeyStore + 'static> FromRequestParts<AppState<S>> for Identity {
     type Rejection = (StatusCode, Json<AuthErrorBody>);
@@ -149,16 +151,20 @@ impl<S: ApiKeyStore + 'static> FromRequestParts<AppState<S>> for Identity {
         parts: &mut Parts,
         state: &AppState<S>,
     ) -> Result<Self, Self::Rejection> {
-        let raw_key = parts
+        let token = parts
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .unwrap_or("");
 
-        authenticate_api_key(state.api_key_store.as_ref(), raw_key)
-            .await
-            .map_err(|_| unauthorized())
+        let result = if jwt::looks_like_jwt(token) {
+            jwt::verify_jwt(token, &state.jwt_secret)
+        } else {
+            authenticate_api_key(state.api_key_store.as_ref(), token).await
+        };
+
+        result.map_err(|_| unauthorized())
     }
 }
 
