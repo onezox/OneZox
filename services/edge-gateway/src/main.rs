@@ -10,6 +10,8 @@
 mod admission;
 mod auth;
 mod ingress;
+mod normalize;
+mod pb;
 mod pipeline;
 mod ratelimit;
 mod state;
