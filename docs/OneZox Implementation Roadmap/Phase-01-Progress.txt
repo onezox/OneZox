@@ -172,6 +172,39 @@ Net result: EC4 verified complete for one real request across all three
 backends — Tempo (7 correctly-parented spans), Prometheus (real request
 count/histogram/inflight values), and Loki (one structured completion log
 line, request_id and finish_reason present and correct).
+
+--------------------------------------------------------------------------------
+2026-07-29 — Redis Cluster drift, third occurrence: now a documented,
+one-command recovery
+--------------------------------------------------------------------------------
+FINDING: a third full host/WSL2 restart produced the identical failure this
+session already saw twice (Step A's original finding above; promtail's own
+version of the same class of drift noted during Step J): cluster_state:fail,
+10923/16384 slots stuck in pfail, all 6 redis-cluster pods still reporting
+"Running" throughout. Recovered with the exact same sequence as Step A
+(reset the 6 pods, re-run redis-cluster-init), then verified in order:
+(1) cluster_state:ok, 16384/16384 slots ok; (2) dataplane-stub and
+provider-stub both reached 1/1 Ready — provider-stub needed one pod delete
+to force an immediate retry rather than wait out its CrashLoopBackoff timer
+against a Redis error that was already stale; confirmed the Step-A6 Submit
+shim specifically (not just the pod) by driving one real end-to-end
+streamed request through edge-gateway and getting back the shim's actual
+canned content; (3) edge-gateway was 1/1 Running the whole time (it
+survived the restart) and that same end-to-end request confirms it's
+genuinely functional, not just Running; (4) onezox-stubs back to
+Synced/Healthy (was Synced/Progressing during the outage).
+
+REMEDIATION (closes the gap Step A's finding above explicitly flagged —
+"no written recovery procedure anywhere in the docs"): the manual sequence
+is now scripts/recover-redis-cluster.sh — checks cluster_state first and
+exits immediately, untouched, if already "ok" (safe to run proactively as
+part of the session-start liveness check), otherwise runs the full
+reset + reinit + verification sequence, including nudging dataplane-stub/
+provider-stub out of a stale CrashLoopBackoff. Referenced directly from
+Phase-01-Local-Restart-Guide.txt section 3.5, which previously only said
+"expect cluster_state:ok" with nothing to do if it wasn't. Recovery for
+this specific, now-predictable failure is one command, not a re-diagnosis,
+starting from the next occurrence.
 ================================================================================
 END OF PHASE-01-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================

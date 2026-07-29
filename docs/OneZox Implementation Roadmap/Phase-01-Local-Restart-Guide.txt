@@ -1,0 +1,314 @@
+================================================================================
+LOCAL DEVELOPMENT ENVIRONMENT — RESTART & VERIFICATION GUIDE
+================================================================================
+This guide restores the existing local OneZox development environment (the
+onezox-dev kind cluster and everything running on it, built during Phase-00)
+after a full PC / WSL2 restart. It contains only the commands needed to
+start each already-installed component back up and verify it is healthy.
+It does not install anything new and does not cover any Phase-01
+application work.
+
+Everything below assumes the environment described in
+"Phase-00-Complete.txt" already exists on disk: the onezox-dev kind cluster
+(3 Docker containers), the Terraform state at
+platform/terraform/cells/local/, and ~/.kube/config already pointing at the
+"kind-onezox-dev" context. Nothing here re-installs Cilium, Argo CD,
+CockroachDB, Redis, MinIO, or the observability stack — those already exist
+as running Kubernetes objects (StatefulSets/Deployments with their data on
+each node's local-path-provisioner volumes) and come back up on their own
+once the cluster's containers are running again. The only components with
+no persistence across a restart are: the Docker daemon itself, the 3 kind
+node containers, and any kubectl port-forward sessions or CLI logins.
+
+--------------------------------------------------------------------------------
+0. WHAT SURVIVES A RESTART AND WHAT DOES NOT
+--------------------------------------------------------------------------------
+Survives (no action needed beyond starting the containers):
+  - The onezox-dev kind cluster's 3 Docker containers and everything on
+    their filesystems: etcd data, all Kubernetes objects, all Helm release
+    state, all PersistentVolume data (CockroachDB, MinIO, Grafana/Loki/
+    Tempo caches where applicable), the Argo CD Application, the
+    CiliumNetworkPolicy mTLS policies, and the three stub service
+    Deployments.
+  - Terraform state (platform/terraform/cells/local/terraform.tfstate) and
+    the exported kubeconfig (both are plain files on disk).
+  - The cosign key pair, buf/proto workspace, and all source code.
+
+Does NOT survive (must be redone every session):
+  - The Docker daemon process and the 3 kind node containers themselves —
+    their restart policy is "on-failure", not "always", so a full host/WSL
+    shutdown leaves them Exited; they must be started explicitly.
+  - Any "kubectl port-forward" process — these are foreground processes
+    tied to the terminal that started them.
+  - The Argo CD CLI login session and any "mc" (MinIO client) alias that
+    depended on a now-closed port-forward.
+
+Note on ingress: no ingress controller and no Ingress/IngressClass
+resources exist in this cluster. All access to in-cluster services from
+the host is via "kubectl port-forward" (Section 4). There is no ingress
+step to restart.
+
+--------------------------------------------------------------------------------
+1. START WSL2 AND DOCKER
+--------------------------------------------------------------------------------
+1.1 Open a WSL2 terminal (Ubuntu 24.04). This alone starts the WSL2 VM and,
+    because /etc/wsl.conf sets "systemd=true", starts systemd as PID 1.
+
+1.2 Verify systemd and Docker:
+      systemctl is-system-running || true
+      systemctl status docker --no-pager
+
+    Docker is an enabled systemd service, so it should already be
+    "active (running)". If it is not:
+      sudo systemctl start docker
+
+1.3 Verify the Docker CLI works for your user (docker group membership):
+      docker version
+
+--------------------------------------------------------------------------------
+2. START THE ONEZOX-DEV KIND CLUSTER CONTAINERS
+--------------------------------------------------------------------------------
+2.1 Check current container state:
+      docker ps -a --filter "name=onezox-dev"
+
+    After a restart these will show STATUS "Exited (...)".
+
+2.2 Start all three node containers (control-plane first):
+      docker start onezox-dev-control-plane
+      docker start onezox-dev-worker
+      docker start onezox-dev-worker2
+
+2.3 Give the control plane time to come back (etcd, kube-apiserver,
+    kube-scheduler, kube-controller-manager, and the Cilium agents all
+    have to restart inside the node). Then verify:
+      kubectl cluster-info
+      kubectl get nodes
+
+    Expect all 3 nodes to reach STATUS "Ready" within roughly 30–90
+    seconds of starting the containers. If a node briefly shows
+    "NotReady", re-run "kubectl get nodes" after a few seconds rather than
+    taking any corrective action — this is normal warm-up.
+
+2.4 Confirm the correct kubectl context is active (it should already be,
+    since it was merged into ~/.kube/config when the cluster was created):
+      kubectl config current-context
+      # expected: kind-onezox-dev
+
+--------------------------------------------------------------------------------
+3. VERIFY EVERY COMPONENT IS HEALTHY
+--------------------------------------------------------------------------------
+Run these in order. Every command below is read-only / verification-only —
+none of them install, upgrade, or modify anything.
+
+3.1 Cilium (CNI + SPIRE mutual authentication)
+      cilium status --wait
+    Expect: Cilium OK, Operator OK, Envoy DaemonSet OK, and the cilium /
+    cilium-envoy DaemonSets and cilium-operator Deployment all Ready.
+      kubectl get pods -n cilium-spire
+    Expect: spire-server-0 (2/2) and one spire-agent pod per node, all
+    Running.
+
+3.2 Overall pod health
+      kubectl get pods -A
+    Expect every pod across argocd, cilium-spire, cockroach-operator-
+    system, default, and kube-system Running (or "Completed" for the
+    one-shot init Jobs: minio-bucket-init, redis-cluster-init).
+
+3.3 Argo CD
+      kubectl get pods -n argocd
+      kubectl get applications -n argocd
+    Expect the "onezox-stubs" Application to show SYNC STATUS "Synced" and
+    HEALTH STATUS "Healthy". (CLI login, if you need it, is in Section 4.)
+
+3.4 CockroachDB
+      kubectl get pods -n default -l app.kubernetes.io/name=cockroachdb
+      kubectl exec -n default onezox-crdb-0 -- \
+        cockroach sql --insecure --execute "SHOW TABLES;"
+    Expect all 3 onezox-crdb-* pods Running, and SHOW TABLES to list
+    schema_migrations, tenants, and health_probe.
+
+3.5 Redis Cluster
+      kubectl exec -n default redis-cluster-0 -- redis-cli cluster info | grep cluster_state
+    Expect "cluster_state:ok".
+
+    If it is NOT "ok" (typically "fail" with slots stuck in "pfail"): this
+    is a known, predictable failure mode, not a new problem to diagnose.
+    A full host/WSL2 restart stops all three kind node containers at once,
+    and Redis Cluster's gossip protocol comes back up believing its peers
+    are still at their old IPs. It has hit this environment three times
+    now (Phase-01 Step A, again noted for promtail during Step J, and
+    again after a restart later in Phase-01) — every occurrence has been
+    the identical symptom with the identical fix. Run:
+      scripts/recover-redis-cluster.sh
+    This resets the 6 redis-cluster pods (dropping the stale gossip
+    state), re-runs redis-cluster-init to reform the ring, verifies
+    cluster_state:ok with all 16384 slots ok, and nudges dataplane-stub/
+    provider-stub if either is stuck in CrashLoopBackOff from the outage
+    (their own retries otherwise wait out an exponential backoff before
+    trying the now-healthy Redis again). Safe to run any time as part of
+    this liveness check — it checks cluster_state first and exits
+    immediately without touching anything if it's already "ok".
+
+3.6 MinIO
+      kubectl get pods -n default -l app=minio
+      kubectl logs -n default -l app=minio --tail=20
+    Expect the minio pod Running with no error lines in recent logs.
+    (Bucket contents are verified via "mc" over a port-forward — see
+    Section 4.)
+
+3.7 OpenTelemetry Collector
+      kubectl get pods -n default -l app.kubernetes.io/name=opentelemetry-collector
+    Expect the otel-collector pod Running.
+
+3.8 Prometheus
+      kubectl get pods -n default -l app.kubernetes.io/name=prometheus,app.kubernetes.io/component=server
+    Expect the prometheus-server pod Running (2/2, including the
+    config-reloader sidecar).
+
+3.9 Grafana
+      kubectl get pods -n default -l app.kubernetes.io/name=grafana
+    Expect the grafana pod Running.
+
+3.10 Loki
+      kubectl get pods -n default -l app.kubernetes.io/name=loki
+    Expect loki-0 (2/2), loki-gateway, loki-canary, loki-chunks-cache, and
+    loki-results-cache all Running.
+
+3.11 Tempo
+      kubectl get pods -n default -l app.kubernetes.io/name=tempo
+    Expect the tempo-0 pod Running.
+
+3.12 Promtail
+      kubectl get pods -n default -l app.kubernetes.io/name=promtail
+    Expect one promtail pod per node, all Running.
+
+3.13 Cilium mTLS enforcement (CiliumNetworkPolicy)
+      kubectl get ciliumnetworkpolicies.cilium.io -n default
+    Expect edge-stub-mtls, dataplane-stub-mtls, and provider-stub-mtls all
+    present.
+
+3.14 The three stub services
+      kubectl get pods -n default -l 'app in (edge-stub,dataplane-stub,provider-stub)'
+    Expect all three pods "1/1 Running". Each Deployment's kubelet
+    liveness probe already calls GET /healthz and its readiness probe
+    already calls GET /readyz (both on 127.0.0.1:8080, from inside the
+    pod) every few seconds — so "1/1 Ready" is itself live proof both
+    endpoints are responding correctly; no separate manual check is
+    needed. (Do not test these endpoints from a separate pod: the Cilium
+    mTLS policies in 3.13 only allow port 8080 traffic from the "host"
+    entity, the Prometheus pod, and the other two stub services — an
+    unrelated pod's connection will hang/time out by design, which is
+    the policy working correctly, not a failure.)
+
+    If you do want to see the raw response, exec a curl into an already-
+    allowed identity instead of an unrelated pod, e.g. from inside one of
+    the other two stub pods:
+      kubectl exec -n default deploy/dataplane-stub -- python3 -c \
+        "import urllib.request; print(urllib.request.urlopen('http://edge-stub.default.svc.cluster.local:8080/healthz').read())"
+
+    (If any pod shows RESTARTS > 0 immediately after the cluster came
+    back up, that is expected — it reconnected to CockroachDB/Redis/MinIO
+    as they became available — and is not itself a problem as long as the
+    pod is now Running with a recent restart count that has stopped
+    increasing.)
+
+--------------------------------------------------------------------------------
+4. PORT-FORWARDS TO RESUME LOCAL ACCESS
+--------------------------------------------------------------------------------
+None of these survive a restart; re-run whichever ones you need for the
+current session. Each is a foreground command — run each in its own
+terminal, or append " &" to background it.
+
+  Argo CD UI / API:
+    kubectl port-forward -n argocd svc/argocd-server 8081:443
+    # UI: https://localhost:8081  (self-signed cert; browser warning expected)
+
+  Argo CD CLI login (uses the port-forward above):
+    kubectl -n argocd get secret argocd-initial-admin-secret \
+      -o jsonpath='{.data.password}' | base64 -d
+    argocd login localhost:8081 --username admin --password <password-from-above> --insecure
+
+  CockroachDB SQL / DB Console:
+    kubectl port-forward -n default onezox-crdb-0 26257:26257 8082:8080
+    # SQL:     cockroach sql --insecure --host=localhost:26257
+    # Console: http://localhost:8082
+
+  Redis Cluster (for redis-cli from the host):
+    kubectl port-forward -n default svc/redis-cluster-headless 6379:6379
+
+  MinIO API + Console:
+    kubectl port-forward -n default svc/minio 9000:9000 9001:9001
+    # Console: http://localhost:9001
+    # Credentials:
+    kubectl get secret -n default minio-credentials -o jsonpath='{.data.MINIO_ROOT_USER}' | base64 -d; echo
+    kubectl get secret -n default minio-credentials -o jsonpath='{.data.MINIO_ROOT_PASSWORD}' | base64 -d; echo
+    # mc alias set onezox-local http://localhost:9000 <user> <password>
+
+  OpenTelemetry Collector (OTLP, if sending test telemetry manually):
+    kubectl port-forward -n default svc/otel-collector-opentelemetry-collector 4317:4317 4318:4318
+
+  Prometheus:
+    kubectl port-forward -n default svc/prometheus-server 9090:80
+    # http://localhost:9090
+
+  Grafana:
+    kubectl port-forward -n default svc/grafana 3000:80
+    # http://localhost:3000
+    # Admin credentials:
+    kubectl get secret -n default grafana -o jsonpath='{.data.admin-user}' | base64 -d; echo
+    kubectl get secret -n default grafana -o jsonpath='{.data.admin-password}' | base64 -d; echo
+
+  Loki (direct API, independent of Grafana):
+    kubectl port-forward -n default svc/loki 3100:3100
+    # readiness: curl http://localhost:3100/ready
+    # (svc/loki-gateway 3100:80 also works for query traffic, but /ready
+    # is served by the loki service directly, not through the gateway)
+
+  Tempo (direct API, independent of Grafana):
+    kubectl port-forward -n default svc/tempo 3200:3200
+
+  The three stub services (direct HTTP access from the host, if needed
+  instead of "kubectl exec"):
+    kubectl port-forward -n default svc/edge-stub 8083:8080
+    kubectl port-forward -n default svc/dataplane-stub 8084:8080
+    kubectl port-forward -n default svc/provider-stub 8085:8080
+
+--------------------------------------------------------------------------------
+5. RESUMING DEVELOPMENT
+--------------------------------------------------------------------------------
+Once Section 3's checks all pass:
+  - Terraform needs no action: run "terraform plan" from
+    platform/terraform/cells/local/ only if you want to confirm zero
+    drift; it does not need to be applied again.
+  - Argo CD will already show "onezox-stubs" as Synced/Healthy — no sync
+    is required unless you have new commits to deploy. A new commit is
+    picked up automatically (automated sync is enabled) or can be forced
+    with:
+      argocd app sync onezox-stubs
+  - The GitHub repository (https://github.com/onezox/OneZox) and its
+    GitHub Actions CI workflow are unaffected by a local restart — they
+    run on GitHub's own infrastructure, not on this machine.
+  - Local toolchains (Rust/Cargo, Python/.venv, Go, Node/Nx, buf, Helm,
+    Terraform, kind, cilium CLI, argocd CLI, cosign, Syft) are files on
+    disk and require no restart action; just confirm your shell's PATH
+    still includes $HOME/.local/bin (and $HOME/.local/<tool> directories,
+    where applicable) if a new shell session does not pick them up
+    automatically.
+
+--------------------------------------------------------------------------------
+6. IF A KIND NODE CONTAINER NO LONGER EXISTS
+--------------------------------------------------------------------------------
+The steps above assume "docker start" on the 3 existing containers, which
+is the normal case for a PC/WSL restart (the containers are stopped, not
+removed). If "docker ps -a" in Section 2.1 does not list one or more of
+onezox-dev-control-plane / onezox-dev-worker / onezox-dev-worker2 at all
+(for example, they were explicitly removed with "docker rm" or "kind
+delete cluster"), starting the missing container is not possible — the
+cluster must be re-provisioned from Terraform, and every component
+reinstalled from scratch per the sequence in "Phase-00.txt" and
+"Phase-00-Complete.txt". This is a full rebuild, not a restart: it does
+not recover any prior CockroachDB, Redis, or MinIO data, since that data
+lived only on the removed containers' filesystems.
+================================================================================
+END OF PHASE-01-LOCAL-RESTART-GUIDE.TXT
+================================================================================
