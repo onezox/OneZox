@@ -1,0 +1,530 @@
+================================================================================
+PHASE-01 — EDGE GATEWAY — COMPLETION RECORD
+================================================================================
+This document records the work actually completed for Phase-01 on the local
+onezox-dev Kubernetes cluster (kind, WSL2 Ubuntu 24.04). It contains only
+work that was performed and verified. It does not contain Phase-02 work,
+future plans, recommendations, or opinions. Phase-01-Progress.txt remains
+the point-in-time findings record (drift, process gaps); this document is
+the completion summary, in the same style as Phase-00-Complete.txt.
+
+--------------------------------------------------------------------------------
+PHASE-01 OBJECTIVE
+--------------------------------------------------------------------------------
+Replace the throwaway Phase-00 edge-stub with a production-grade Rust edge
+gateway: API-key (hashed) + JWT authentication, Redis-backed rate limiting,
+admission control (accept/queue/shed), normalization to the internal proto
+contract, metering (a request-scoped span with token/cost fields), and an
+SSE streaming relay with backpressure and clean disconnect handling. The
+edge forwards downstream to the existing Phase-00 dataplane-stub — the real
+data plane is Phase-03 and was explicitly out of scope here.
+
+One scoping decision was made before any code was written: the external
+ingress/load balancer and public-facing TLS termination are deferred to a
+cloud phase (kind has no cloud load balancer to stand one up against
+locally). Phase-01 was verified in-cluster instead — port-forward or
+curl-from-a-pod against the deployed Service and the real Cilium mesh path
+— for every exit criterion that would otherwise have gone through a public
+ingress. This was a deliberate, agreed scoping decision, not an omission;
+see DEFERRALS below.
+
+--------------------------------------------------------------------------------
+BUILD SEQUENCE (IN ORDER)
+--------------------------------------------------------------------------------
+Steps A-K below correspond to the commit-sized breakdown agreed before any
+code was written, each independently verified before the next began.
+
+A. Contracts and data-store prerequisites: proto/gateway (ingress
+   request/response contracts) finalized; proto/dataplane's Submit RPC
+   defined (SubmitRequest -> stream SubmitResponse); api_keys and
+   rate_limit_policy CockroachDB migrations created and applied; one test
+   tenant and hashed API key seeded; a minimal Submit shim added to the
+   Phase-00 dataplane-stub as a Phase-01 contract requirement (Phase-00's
+   own health-check verification was not reopened or invalidated by this).
+B. edge-gateway crate skeleton and ingress route stubs (Rust, axum, tokio).
+C. Authentication: API-key auth (SHA-256 hex hash comparison against
+   api_keys.hash, matching the seed script's own hashing convention) wired
+   into every ingress route; a JWT verification hook (HS256, signature +
+   expiry) for website traffic, dispatched by request shape.
+D. Rate limiting (Redis, fixed-window counters keyed
+   ratelimit:{org_id}:{window}) and admission control (accept/queue/shed
+   against a Redis in-flight gauge, admission:{cell}:inflight) composed
+   into one axum extractor (pipeline.rs's `Admitted`). Mid-step
+   architecture correction: an initial generic-parameter design
+   (`AppState<S: ApiKeyStore>`) did not scale once ratelimit needed its own
+   swappable store; converted to `#[async_trait]` dyn-compatible traits and
+   a concrete `AppState` holding `Arc<dyn Trait>` fields.
+E. The full pipeline, split into five independently-verified sub-steps:
+   E1 normalize (ingress request -> internal proto, unit tested); E2 meter
+   (OTel span + token/cost placeholder fields); E3 the gRPC client to
+   dataplane-stub, verified calling Submit and receiving a stream in
+   isolation; E4 the SSE relay itself (backpressure inherent to axum's
+   `Sse` response polling, clean disconnect via Rust's own ownership/Drop
+   semantics, the `AdmissionGuard` held for the stream's full lifetime);
+   E5 the full pipeline wired end-to-end and verified with one real
+   streamed request flowing auth -> ratelimit -> admission -> normalize
+   -> meter -> Submit -> relay -> caller.
+F. Deployment, treated as deployment-risk work rather than "just code":
+   F1 built the image with the same `--provenance=false --sbom=false`
+   flags and save/cp/ctr-import load path Phase-00 established (avoiding
+   the same multi-manifest problem that broke `kind load docker-image` in
+   Phase-00); F2 deployed edge-gateway alongside the still-running
+   edge-stub via the "onezox-stubs" Argo CD Application, with
+   edge-gateway's own mTLS CiliumNetworkPolicy in place before edge-stub's
+   was removed (no mesh-identity gap during cutover); F3 completed the
+   cutover — removed edge-stub's deployed resources, source, CI matrix
+   entry, and its stale Prometheus scrape target.
+G. In-cluster EC1 proof: a real streamed request against the deployed
+   Service and the real Cilium mesh path (not a local binary), replacing
+   what a public-ingress test would otherwise have covered.
+H. Adversarial security verification (EC2), each test built to prove the
+   system fails correctly, not just that it works, and each sanity-checked
+   that it could actually fail before being trusted:
+   H1 raw API key never appears in logs/traces — the Loki query path was
+      proven capable of finding something genuinely logged (a request ID)
+      before trusting an "absent" result on the raw key itself, avoiding a
+      false pass from a broken query.
+   H2 cross-tenant isolation, verified behaviorally: org A was driven to
+      its real rate limit and org B's headroom was confirmed completely
+      unaffected, not merely that the two use different Redis keys.
+   H3 mid-stream disconnect frees resources: the client was killed
+      mid-stream (not a clean completion, which G already covered) against
+      the real deployed service, and the in-flight gauge was confirmed to
+      still drain to 0 — the Rust edge-gateway's own task/connection
+      cleanup, not a garbage-collected runtime's.
+I. Sustained streaming stability (EC3): a 300-second, concurrency-10 load
+   test against a dedicated test tenant, sampling the in-flight gauge,
+   process RSS, and latency distribution continuously through the run, not
+   just before/after.
+J. Telemetry completeness (EC4), treated as a verification task, not a
+   rubber stamp — a real, pre-existing gap was found and fixed in every
+   one of its three parts:
+   J1 the OTel span tree: only one span existed (edge_gateway.request, no
+      children) before this step — auth, ratelimit, and admission all ran
+      before the request span was even created. Fixed by creating the root
+      span at the very start of the pipeline (before auth runs) and giving
+      every stage its own explicit child span.
+   J2 operational metrics: edge-gateway had no /metrics endpoint at all.
+      Added real request-count, latency-histogram (a first attempt
+      silently rendered as a Prometheus summary rather than a true
+      histogram — corrected), and in-flight-gauge metrics.
+   J3 structured logs: edge-gateway logged nothing at all on a successful
+      request — only error branches produced a log line. Added one
+      structured completion log per request.
+K. Close-out: this document, plus a fresh mTLS proof and confirmation that
+   the one-time buf breaking-change ignore from Step A has been removed.
+
+Interleaved with the above: this local environment (kind on WSL2) lost and
+recovered Redis Cluster cluster state three times across the Phase-01 work
+session, each time from the identical cause (a full host/WSL2 restart
+stopping all three kind node containers at once, after which Redis
+Cluster's gossip protocol believed its peers were still at their old IPs).
+See PROBLEMS ENCOUNTERED below and Phase-01-Progress.txt for the full,
+dated account of each occurrence.
+
+--------------------------------------------------------------------------------
+EDGE-GATEWAY SERVICE
+--------------------------------------------------------------------------------
+services/edge-gateway — Rust, axum 0.8, tokio, tonic 0.14 (gRPC client to
+dataplane-stub). Modules: auth (api-key + JWT identity resolution),
+ratelimit (Redis fixed-window), admission (Redis-backed in-flight gauge,
+accept/queue/shed), normalize (request -> proto/dataplane SubmitRequest),
+pipeline (composes auth -> ratelimit -> admission into the `Admitted`
+extractor, and — since Step J — creates the request-scoped root OTel span
+as early as possible), stream (SSE relay via `to_chunks`/`relay`), meter
+(wraps the root span, records token/cost/finish_reason fields on
+completion), metrics (Prometheus recorder + `/metrics` route), pb (prost-
+generated client code, committed to the repo rather than generated at
+Docker build time — see PROBLEMS ENCOUNTERED).
+
+Routes: POST /v1/chat/completions (streamed + non-streamed) and
+POST /v1/responses fully wired end-to-end; GET /v1/models served from a
+static list; POST /v1/embeddings deliberately stays a 501 placeholder per
+Phase-01.txt's own note that it is "wired to real embed in Phase-10" — the
+only one of the four routes with that caveat.
+
+Database tables (CockroachDB): api_keys (key_id UUID PK, org_id UUID, hash
+STRING, scopes STRING[], created_at/revoked_at TIMESTAMPTZ) and
+rate_limit_policy (policy_id UUID PK, org_id UUID, rpm/tpm/concurrency
+INT4), both confirmed present via SHOW TABLES. Redis keys (ephemeral):
+ratelimit:{org_id}:{window} and admission:{cell}:inflight, per
+Phase-01.txt's own naming.
+
+--------------------------------------------------------------------------------
+DOCKER IMAGE AND DEPLOYMENT
+--------------------------------------------------------------------------------
+onezox/edge-gateway:phase01 — multi-stage Dockerfile (builder
+rust:1.97.1-slim-bookworm, runtime debian:bookworm-slim), built with
+`--provenance=false --sbom=false` and loaded into all three onezox-dev kind
+nodes via save/cp/ctr-import (the same path Phase-00 established; kind's
+own `kind load docker-image` still does not work with these images).
+Rebuilt and reloaded four times across Phase-01 as the service grew
+(Step F1's initial deploy, and three further rebuilds during Step J for
+the span-tree fix, the metrics endpoint, and the structured-log fix); each
+rebuild verified with an identical image digest confirmed present on all
+three nodes before rolling the Deployment.
+
+Deployed via the existing "onezox-stubs" Argo CD Application
+(platform/stubs/edge-gateway/), never applied directly with kubectl.
+Because the image tag (phase01) does not change between rebuilds, Argo's
+own diff has nothing new to sync after a rebuild — the running pod was
+refreshed with `kubectl rollout restart deployment/edge-gateway`, which
+patches an annotation to trigger a new rollout of the already Argo-applied
+Deployment rather than applying any manifest directly. The Application
+was confirmed Synced/Healthy after every rebuild.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST (Phase-01.txt's own eight items, with evidence)
+--------------------------------------------------------------------------------
+[x] Ingress routes implemented + payload validation.
+    /v1/chat/completions, /v1/responses, /v1/embeddings, /v1/models all
+    route; axum's Json extractor rejects malformed/missing-field bodies
+    with 422 automatically (unit-tested: missing "model", wrong type for
+    "messages").
+
+[x] API-key (hashed) + JWT auth working.
+    SHA-256 hex hash comparison against api_keys.hash; JWT HS256
+    signature + expiry verification. Unit-tested (valid/unknown/revoked/
+    empty key; valid/expired/tampered/wrong-secret JWT) and live-verified
+    via Step H1's adversarial raw-key test.
+
+[x] Redis rate limiting + admission control working.
+    Fixed-window counters (SET NX EX + INCR) and an accept/queue/shed
+    gauge, composed in pipeline.rs. Unit-tested and live-verified
+    behaviorally via Step H2 (cross-tenant isolation) and Step I (gauge
+    stayed bounded near concurrency and drained to 0 over a 300s run).
+
+[x] Normalization to internal proto.
+    normalize_chat_completions/responses/embeddings map every ingress
+    field to proto/dataplane's SubmitRequest; unit-tested including the
+    proto's plain-string (not optional-string) identity field convention.
+
+[x] SSE streaming relay with backpressure + disconnect handling.
+    Backpressure is inherent to axum's `Sse` response polling semantics
+    (no manual buffering). Clean completion verified in Step G; the
+    adversarial mid-stream-kill case verified in Step H3 (in-flight gauge
+    drains to 0 on a hard client disconnect, not just clean completion).
+
+[x] Metering span emitted with token/cost fields.
+    RequestMeter records tokens_in/tokens_out/usd_cost (Phase-01
+    placeholders — 0/0/0.0, correctly-shaped and deliberately not made
+    real; Phase-03's job once there is an actual model call) and
+    finish_reason onto the request's root span. Live-verified in Tempo
+    (Step J1): a completed real request's root span carries
+    finish_reason="stop" and the correctly-shaped placeholder values.
+
+[x] mTLS to data plane.
+[ ] TLS at edge — DEFERRED TO CLOUD PHASE (see DEFERRALS).
+    mTLS: `cilium-dbg bpf auth list` shows a live, authenticated
+    edge-gateway <-> dataplane-stub pair with AUTH TYPE spire and a
+    future expiration, re-captured fresh during Step K after this
+    session's Redis Cluster recovery (see MTLS VERIFICATION below).
+    Public-facing TLS termination at the edge requires a public ingress
+    that does not exist on local kind and was explicitly scoped out before
+    any Phase-01 code was written.
+
+[x] p99 stable under sustained streaming load.
+    Step I: 300s, concurrency 10, 4195 requests (0 failed), no restart, no
+    upward latency drift (first-half vs second-half p99 ratio 0.83 —
+    actually improved), RSS plateaued after ~60s rather than growing
+    unbounded, in-flight gauge stayed bounded and drained to 0. One
+    isolated latency spike (a single 120s bucket) was reported
+    transparently rather than omitted; it did not recur and did not affect
+    the overall drift measurement. Framed throughout as a stability
+    finding on a kind-on-WSL2 host, not a production p99 claim.
+
+Also from Phase-01.txt's INFRASTRUCTURE REQUIRED section:
+[ ] Ingress/load balancer with anycast-ready configuration — DEFERRED TO
+    CLOUD PHASE. kind has no cloud load balancer; every exit criterion
+    that would otherwise depend on one was instead verified in-cluster
+    (port-forward or curl-from-a-pod against the deployed Service and the
+    real Cilium mesh path), per the scoping decision made before any
+    Phase-01 code was written.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA — EVIDENCE
+--------------------------------------------------------------------------------
+1. Authenticated, rate-limited, metered streamed request flows edge ->
+   stub -> client over SSE.
+   Verified in-cluster (Step G) against the deployed Service over the
+   real Cilium mesh path, and reconfirmed during Step K after this
+   session's Redis Cluster recovery: a real authenticated streamed
+   request returned the dataplane-stub shim's actual content over SSE,
+   ending finish_reason: "stop".
+
+2. Security tests pass (no raw key leakage, tenant isolation at edge,
+   unauth rejected).
+   Step H1 (raw key never logged, adversarial, positive-controlled),
+   Step H2 (cross-tenant isolation, behavioral), Step H3 (mid-stream
+   disconnect frees resources, adversarial hard-kill). Unauthenticated
+   rejection covered by both unit tests (missing/unknown credential ->
+   401) and live verification throughout every other step.
+
+3. Tail-latency test shows no GC-style spikes under sustained streaming.
+   Step I's 300s/concurrency-10 run — see COMPLETION CHECKLIST above for
+   the specific numbers. Framed as a stability finding (no drift/leak/
+   restart), not an absolute p99 claim, per CLAUDE.md's explicit local-kind
+   scoping.
+
+4. All edge telemetry visible in the tracing/metrics backend.
+   Step J, verified for completeness rather than presence: exactly 7
+   correctly-parented OTel spans in Tempo per real request (auth,
+   ratelimit, admission, normalize, submit, relay as children of one root
+   span, which itself carries the meter fields); real, correct
+   request-count/latency-histogram/in-flight-gauge values in Prometheus's
+   own TSDB (the in-flight gauge observed rising 0->5->8 under 8
+   concurrent streamed requests and draining back to 0, not a static
+   reading); one structured completion log line in Loki per real request,
+   carrying request_id and finish_reason.
+
+--------------------------------------------------------------------------------
+MTLS VERIFICATION (fresh capture, Step K, post-recovery)
+--------------------------------------------------------------------------------
+Captured against the live cluster after this session's third Redis
+Cluster recovery (see PROBLEMS ENCOUNTERED), so the entry below is
+freshly re-established, not a stale artifact from earlier in Phase-01:
+
+  $ cilium-dbg bpf auth list
+  SRC IDENTITY   DST IDENTITY   REMOTE NODE ID   AUTH TYPE   EXPIRATION
+  63524          889            0                spire       2026-07-29 10:33:46 +0000 UTC
+
+Identity 63524 resolves to k8s:app=dataplane-stub and identity 889 resolves
+to k8s:app=edge-gateway (confirmed via `cilium-dbg identity list`),
+namespace default, both in the kind-onezox-dev cluster. Captured at
+2026-07-29 09:50:04 UTC — the listed expiration is approximately 43 minutes
+in the future at capture time, confirming this is a live, currently-valid
+authenticated pair, not an expired or cached entry.
+
+--------------------------------------------------------------------------------
+PROBLEMS ENCOUNTERED DURING PHASE-01 AND HOW EACH WAS RESOLVED
+--------------------------------------------------------------------------------
+1. buf's breaking-change check failed with FILE_NO_DELETE when the
+   placeholder proto/gateway and proto/dataplane messages were replaced
+   with the real ingress/Submit contracts, since buf breaking (FILE-level)
+   treats deleting a placeholder message as a breaking change. Resolution:
+   one-time `breaking.ignore` entries were added to proto/buf.yaml for
+   exactly the affected files, and removed again once the transition was
+   complete (commit 82cc0a8) — confirmed at Step K that no `ignore` entry
+   remains anywhere in proto/, so the breaking-change gate is back at full
+   strength.
+
+2. buf lint rejected the initial RPC message names (NormalizedRequest,
+   Delta) under its naming-convention rules. Resolution: renamed to
+   SubmitRequest/SubmitResponse.
+
+3. protoc-gen-go has been broken since Phase-00 (missing go_package option)
+   — rediscovered while finalizing proto/dataplane. Not fixed: Go is not a
+   consumer of these contracts in Phase-01, so this was explicitly flagged
+   as out of scope rather than silently worked around.
+
+4. Redis Cluster gossip-state drift (1st occurrence, Step A): a prior
+   WSL2/host restart, unrelated to any Phase-01 code change, left
+   cluster_state:fail. Resolution: the 6 redis-cluster pods were reset and
+   redis-cluster-init re-run — the same fix later codified into a script
+   (see item 12 below). This same recovery incidentally also cleared
+   edge-stub's and provider-stub's own 44-45 hour CrashLoopBackOff, which
+   had shared the same root cause.
+
+5. AppState<S: ApiKeyStore>'s generic-parameter design did not scale once
+   ratelimit needed its own swappable store (a second generic parameter).
+   Resolution: converted ApiKeyStore/RateLimitCounter to
+   #[async_trait]-based dyn-compatible traits and AppState to a concrete
+   struct holding Arc<dyn Trait> fields.
+
+6. A blanket #[derive(Clone)] on AppState<S> over-constrained it to
+   require S: Clone, when Arc<S> itself does not need that bound.
+   Resolution: replaced with a manual `impl<S: ApiKeyStore> Clone for
+   AppState<S>` — caught before the later generic-to-dyn-trait fix in
+   item 5 made the whole question moot.
+
+7. clippy flagged RequestMeter::span() as never used (Step E5) — the same
+   async-span-context mistake Phase-00 had already hit once (edge-stub):
+   a span created but never actually entered around the async work it was
+   meant to cover. Resolution: each individual `.next()` call in the
+   relay loop, and the initial Submit call, were instrumented explicitly
+   via `.instrument()` (`tracing::Instrument` only covers `Future`, not
+   `Stream` — there is no blanket "instrument every poll" wrapper).
+
+8. The Docker build context scoped to services/edge-gateway/ could not
+   reach proto/ at the repository root, breaking build.rs's codegen step.
+   Resolution (user's explicit choice): generated Rust code was committed
+   directly (src/pb_generated/), matching dataplane-stub's own Phase-00
+   pattern; build.rs was removed, and an #[ignore]-gated regeneration test
+   using tonic-prost-build as a dev-dependency was added and verified to
+   produce byte-identical output.
+
+9. The same Docker build-context scoping broke `edition.workspace = true`
+   ("failed to find a workspace root") immediately after fixing item 8 —
+   same root cause, different symptom. Resolution: a literal
+   `edition = "2024"`, matching edge-stub's existing pattern.
+
+10. tonic 0.14's API no longer exposes `tonic_build::configure()`; message
+    and client codegen moved to a separate tonic-prost-build crate, which
+    also needs the tonic-prost crate (distinct from tonic-prost-build) as
+    a runtime dependency for the generated code to compile.
+
+11. `kubectl port-forward` proved unreliable specifically for the OTLP
+    gRPC export path (a known kubectl limitation with persistent HTTP/2
+    streaming connections) — confirmed not a service-health problem, since
+    the Collector was verified healthy and processing other pods' traces
+    via a direct in-pod socket connection. Distinguished from Tempo's and
+    Loki's own plain-HTTP query APIs, which port-forward without issue and
+    were used throughout Steps H/I/J/K.
+
+12. Redis Cluster gossip-state drift recurred a second and third time
+    (Step J's promtail investigation surfaced the same class of drift in
+    a different component; a full session recovery during Step K's
+    lead-in was the second genuine Redis Cluster occurrence). Resolution,
+    finalized this time rather than repeated ad hoc: the exact reset +
+    reinit + verification sequence was codified as
+    scripts/recover-redis-cluster.sh (idempotent — exits untouched if
+    cluster_state is already "ok") and referenced directly from
+    Phase-01-Local-Restart-Guide.txt section 3.5, which previously had no
+    remediation path if the "expect cluster_state:ok" check failed. During
+    the most recent recovery, provider-stub also needed one pod delete to
+    skip a stale CrashLoopBackoff timer rather than wait it out against an
+    already-resolved Redis error — folded into the same script.
+
+13. A stale Prometheus scrape target (edge-stub.default.svc.cluster.local)
+    was found during Step F3's cutover. Resolution: removed via
+    `helm upgrade` directly against the Prometheus release (not
+    Argo-managed — platform/operators/ is outside the "onezox-stubs"
+    Application's watched path), consistent with how Redis itself is
+    managed.
+
+14. Step H1's raw-key-absence test had two false-pass risks caught during
+    its own development, before being trusted: a 10-minute Loki lookback
+    window that missed a 15-minute-old boot log line (widened to 3600s),
+    and a fixed 6-second sleep for OTel batch flush that was sometimes too
+    short (replaced with a retry loop up to ~30s).
+
+15. Step H2's negative control initially failed at the wrong point (org
+    A's key was still exhausted from a prior run in the same rate-limit
+    window when reused for the "should fail" check, rather than failing at
+    the intended tenant-B assertion). Resolution: redone against a fresh
+    rate-limit window.
+
+16. Step J1 found the OTel span tree was a single span with no children —
+    auth, ratelimit, and admission all completed before the request span
+    even existed (it used to be created at "meter start," well after
+    normalize). Resolution: root-span creation moved to the very start of
+    the pipeline extractor, before auth runs, with every subsequent stage
+    given an explicit `parent:`-linked child span rather than relying on
+    tracing's implicit "current span" tracking (the same implicit-context
+    approach that caused item 7 and Phase-00's edge-stub problem).
+
+17. Step J2's first metrics implementation rendered the latency metric as
+    a Prometheus summary (client-side quantiles) rather than a true
+    histogram, a metrics-exporter-prometheus default when no bucket
+    boundaries are configured. Resolution: explicit `set_buckets()` at
+    install time.
+
+18. Step J3 found edge-gateway logged nothing at all on a successful
+    request (only error branches called tracing::warn!). While verifying
+    the fix, an initial short poll against Loki found nothing, which
+    triggered a detour into whether promtail itself was broken (two of
+    three promtail pods did turn out to have genuinely stale logs, an
+    instance of the same class of drift as item 4/12, though not on the
+    node serving edge-gateway's own traffic). The actual cause of the
+    empty poll was ordinary Loki ingestion lag against too short a wait,
+    not a broken pipeline — resolved with a longer wait and confirmed with
+    a clean single-line result.
+
+--------------------------------------------------------------------------------
+DEFERRALS (explicit, agreed before or during Phase-01 — not omissions)
+--------------------------------------------------------------------------------
+- External ingress/load balancer and public-facing TLS termination:
+  deferred to a cloud phase. kind has no cloud load balancer; every
+  exit criterion that would otherwise route through a public ingress was
+  instead verified in-cluster (port-forward or curl-from-a-pod against the
+  deployed Service and the real Cilium mesh path). This was the first
+  scoping decision made, before any Phase-01 code was written.
+- The real data plane: Phase-03's responsibility. Phase-01 forwards to the
+  Phase-00 dataplane-stub via a minimal Submit shim added as a Phase-01
+  contract requirement.
+- Real token/cost values on the metering span: Phase-03's responsibility,
+  once there is an actual model call to report real usage for. Phase-01's
+  meter fields are placeholders (0/0/0.0), verified as correctly-shaped
+  placeholders rather than flagged as a bug or made real to "realism" any
+  test, including the Step I load test.
+- POST /v1/embeddings: routes and validates, but stays a 501 placeholder
+  per Phase-01.txt's own note — wired to a real embedding call in
+  Phase-10.
+- Terraform cloud-provisioning and Karpenter: carried over from Phase-00's
+  own deferral (platform/ files exist per the folder structure; not made
+  functional locally, not marked complete in this local build).
+- protoc-gen-go's Phase-00 breakage: not fixed, since Go is not a consumer
+  of proto/gateway or proto/dataplane in Phase-01.
+- promtail staleness on the two kind nodes not currently running
+  edge-gateway (see PROBLEMS ENCOUNTERED item 18): left unaddressed, since
+  it does not affect any Phase-01 service's telemetry today; the same
+  class of drift as items 4/12 and covered by the same eventual
+  remediation path if it starts mattering.
+
+--------------------------------------------------------------------------------
+FINAL VERIFICATION RESULTS FOR EVERY COMPONENT
+--------------------------------------------------------------------------------
+edge-gateway build          — cargo build/test/clippy clean throughout;
+                            51 unit tests passing, 2 #[ignore]-gated
+                            (live dataplane-stub call, proto regeneration).
+Docker image                — onezox/edge-gateway:phase01, rebuilt 4 times,
+                            identical digest confirmed on all 3 kind nodes
+                            after every rebuild.
+Argo CD                     — "onezox-stubs" Application Synced/Healthy
+                            after every deploy and every post-recovery
+                            check; no stub/service/CiliumNetworkPolicy
+                            manifest ever applied directly with kubectl.
+buf / proto                 — buf lint and buf breaking both pass cleanly;
+                            zero `ignore` entries remain in buf.yaml.
+CockroachDB                 — api_keys and rate_limit_policy tables
+                            present and populated by real seeded/live data.
+Redis Cluster                — cluster_state:ok, all 16384 slots assigned,
+                            confirmed after a 3rd WSL2-restart recovery;
+                            recovery now a single documented script.
+mTLS (edge-gateway <->
+dataplane-stub)               — AUTH TYPE spire, live and future-expiring,
+                            freshly re-captured post-recovery.
+EC1 (auth/ratelimit/meter/
+SSE end-to-end)                — verified in-cluster against the real mesh
+                            path, twice (Step G, and again at Step K after
+                            recovery).
+EC2 (security)                  — 3 adversarial tests (raw-key,
+                            cross-tenant, mid-stream-kill), each
+                            sanity-checked to be capable of failing.
+EC3 (sustained stability)        — 300s/concurrency-10, 4195 requests,
+                            0 failures, 0 restarts, no upward drift,
+                            gauge bounded and drained, RSS plateaued.
+EC4 (telemetry completeness)      — 7/7 spans correctly parented in Tempo;
+                            real request-count/histogram/gauge values in
+                            Prometheus; 1 structured log line per real
+                            request in Loki.
+
+--------------------------------------------------------------------------------
+FINAL PHASE-01 COMPLETION SUMMARY
+--------------------------------------------------------------------------------
+Phase-01 is complete. The real edge-gateway (Rust, axum, tokio) has
+replaced the Phase-00 edge-stub: API-key and JWT authentication, Redis rate
+limiting, admission control, request normalization, metering, and an SSE
+streaming relay with backpressure and disconnect handling are all built,
+deployed through GitOps via the existing "onezox-stubs" Argo CD
+Application, and verified end to end against the real Phase-00
+dataplane-stub over an authenticated Cilium mesh path. All four Phase-01
+exit criteria have been verified with live, adversarial, and completeness-
+focused evidence rather than passive confirmation: authenticated
+rate-limited metered streaming (EC1); three adversarial security tests,
+each proven capable of failing before being trusted (EC2); a 300-second
+sustained-load run showing no drift, leak, or restart (EC3); and a fully
+complete, gap-free telemetry surface across traces, metrics, and logs
+(EC4) — the last of which required finding and fixing three real,
+pre-existing gaps rather than confirming what was already there. The
+external ingress/load balancer and public TLS termination remain
+deferred to a cloud phase, as agreed before this phase's work began. This
+local environment lost and recovered Redis Cluster's gossip state three
+times across the phase's work session, from an identical WSL2-restart root
+cause each time; recovery is now a single idempotent script rather than a
+re-diagnosis. The buf breaking-change gate, temporarily relaxed during the
+Step A placeholder-to-real proto transition, has been confirmed back at
+full strength with zero ignore entries remaining.
+================================================================================
+END OF PHASE-01-COMPLETE.TXT
+================================================================================
