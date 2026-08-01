@@ -205,6 +205,66 @@ Phase-01-Local-Restart-Guide.txt section 3.5, which previously only said
 "expect cluster_state:ok" with nothing to do if it wasn't. Recovery for
 this specific, now-predictable failure is one command, not a re-diagnosis,
 starting from the next occurrence.
+
+--------------------------------------------------------------------------------
+2026-08-01 — recover-redis-cluster.sh fixed Redis but not the dependent
+stubs; found the real cause before touching anything, then hardened the
+script's own stub-recovery step
+--------------------------------------------------------------------------------
+FINDING: another WSL2 restart produced the same Redis Cluster drift as
+before; scripts/recover-redis-cluster.sh was run and correctly restored
+cluster_state:ok, 16384/16384 slots ok. dataplane-stub and provider-stub,
+however, were still in CrashLoopBackOff afterward — the first time the
+script's own dependent-stub recovery step (added at the end of Phase-01)
+did not do its job.
+
+Per explicit instruction, no pod was deleted or restarted before
+diagnosing. `kubectl logs <pod> --previous` showed: provider-stub —
+an explicit `redis: connection pool: failed to dial after 5 attempts:
+dial tcp 10.244.1.154:6379: i/o timeout`, and a direct check confirmed
+10.244.1.154 matched none of the current redis-cluster pod IPs (a stale,
+pre-reset address); dataplane-stub — no explicit error in its previous
+log (it hung silently after "wrote health_probe row"), but `kubectl
+describe pod` showed Last State Terminated, Exit Code 137 (SIGKILL), with
+Events showing the liveness probe killing it — consistent with a hang on
+the same class of stale-connection problem, just without ever logging an
+exception before being killed. Both classified as the expected "stale
+connection to pre-reset topology" case, not a different root cause (no
+MinIO/CockroachDB/config/OOM signal in either).
+
+Before any corrective action was taken, both pods were rechecked and had
+already reached 1/1 Running with 0 further restarts — they self-recovered
+during the diagnosis window via their own crash-loop backoff cycling,
+roughly 2.5 hours after the Redis recovery. No `kubectl delete pod` was
+needed or performed. Verified functionally, not just Running: a real
+streamed request through edge-gateway returned dataplane-stub's actual
+shim content ending finish_reason:"stop", and the "onezox-stubs" Argo
+Application was Synced/Healthy.
+
+ROOT CAUSE OF THE RUNBOOK GAP: scripts/recover-redis-cluster.sh's
+dependent-stub-recovery step used a kubectl JSONPath boolean-literal
+filter (`?(@.status.containerStatuses[0].ready==false)`) to find not-ready
+stub pods. This silently matched zero pods against the genuinely
+not-ready dataplane-stub/provider-stub — confirmed after the fact, since
+both pods still showed multi-day ages at diagnosis time, proving the
+script's `kubectl delete pod` never actually fired for them despite the
+script completing (Redis's own steps 1-4 succeeded). kubectl's JSONPath
+filter engine comparing a raw boolean literal inside a `?()` expression is
+a known-fragile pattern.
+
+REMEDIATION: scripts/recover-redis-cluster.sh's Step 5 was rewritten to
+emit each pod's raw `ready` value and compare it as a plain string in
+bash, sidestepping the JSONPath filter engine entirely rather than
+depending on it. Step 6's wait timeout was also widened (90s -> 180s),
+since even a freshly recreated pod was observed needing more than one
+retry immediately after a Redis recovery, and a clear failure message
+(distinguishing "still not the stale-connection case" from a fresh
+problem) was added for if the wait times out. Also confirmed the script
+itself is idempotent and non-destructive when Redis is already healthy
+(re-ran it against the already-recovered cluster: exits at step 1 without
+touching anything), and dry-ran the corrected Step 5 logic directly
+against the (by then healthy) stub pods to confirm it correctly reports
+"already Ready" rather than deleting them unnecessarily.
 ================================================================================
 END OF PHASE-01-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
