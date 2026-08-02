@@ -2,16 +2,15 @@
 // real dedicated Go service that owns all provider concerns. Step D5 wired
 // the pipeline's plumbing end-to-end against the fake adapter (worker_ref
 // -> registry lookup -> adapter Invoke -> stream deltas back over gRPC,
-// with real backpressure — the gRPC Send in the loop below only proceeds
-// once the client has consumed the previous message, which is what
-// naturally paces the adapter's own Recv calls, no manual buffering, same
-// discipline as Phase-01's SSE relay). Step E adds the fleet-wide quota
-// governor in front of the adapter call: exhausted quota returns a typed
-// FallbackSignal (reason QUOTA_EXHAUSTED) and closes the stream cleanly —
-// "throttles rather than errors" (Phase-02.txt), not a gRPC error the
-// caller has to specifically catch. Breaker and coalescing (Steps F-G)
-// each insert their own stage between quota and the adapter call as
-// they're built. InvokeEmbedding and ProviderHealth stay unimplemented.
+// with real backpressure). Step E added the fleet-wide quota governor;
+// Step F added the per-provider circuit breaker; both sit in front of the
+// adapter call and return a typed FallbackSignal instead of an error when
+// they say no. Step G wraps the whole quota+breaker+adapter sequence in
+// request coalescing (Phase-02.txt's own flow order: "coalesce check ->
+// quota governor -> breaker check -> adapter") — a concurrent identical
+// call joins an already-in-flight one instead of independently consuming
+// quota or being separately breaker-gated for work it isn't causing.
+// InvokeEmbedding and ProviderHealth stay unimplemented.
 //
 // No CockroachDB or MinIO connection, unlike provider-stub: Phase-02.txt's
 // DATABASE TABLES REQUIRED section is explicit that this phase owns no
@@ -43,6 +42,7 @@ import (
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters/fake"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/breaker"
+	"github.com/onezox/OneZox/services/provider-gateway/internal/coalesce"
 	pb "github.com/onezox/OneZox/services/provider-gateway/internal/pb/provider/v1"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/quota"
 )
@@ -100,6 +100,7 @@ type server struct {
 	quotaPolicy   quota.Policy
 	breakerStore  breaker.Store
 	breakerConfig breaker.Config
+	coalesceGroup *coalesce.Group
 	log           *slog.Logger
 }
 
@@ -113,6 +114,47 @@ func fallbackResponse(requestID, provider string, reason pb.FallbackReason) *pb.
 			},
 		},
 	}
+}
+
+// fallbackError lets the coalesced closure (which only gets to return a
+// Stream or an error — see coalesce.Group.Invoke) signal "quota/breaker
+// said no" distinctly from a genuine adapter failure, so Invoke can still
+// send the correct typed FallbackSignal to every subscriber (leader and
+// followers alike) rather than a generic gRPC error.
+type fallbackError struct {
+	reason pb.FallbackReason
+}
+
+func (e *fallbackError) Error() string { return "fallback: " + e.reason.String() }
+
+// reportingStream wraps the real adapter stream so the breaker outcome is
+// reported exactly once, based on how the stream actually ends — success
+// only on reaching a final delta with no error, failure on any error
+// (including an EOF that arrives before a final delta, an ill-behaved
+// upstream). This wrapping happens inside the coalesced closure, so only
+// the leader's actual drain (coalesce.Group.lead, not any follower)
+// triggers it — a follower riding an in-flight call reports nothing,
+// since it isn't the one that made the call.
+type reportingStream struct {
+	inner    adapters.Stream
+	report   func(success bool)
+	reported bool
+}
+
+func (r *reportingStream) Recv() (adapters.Delta, error) {
+	d, err := r.inner.Recv()
+	if err != nil {
+		if !r.reported {
+			r.reported = true
+			r.report(false)
+		}
+		return d, err
+	}
+	if d.IsFinal && !r.reported {
+		r.reported = true
+		r.report(true)
+	}
+	return d, nil
 }
 
 func toAdapterRequest(req *pb.InvokeRequest, model string) adapters.InvokeRequest {
@@ -168,63 +210,75 @@ func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer
 		return status.Error(codes.NotFound, err.Error())
 	}
 
-	quotaDecision, err := quota.Enforce(stream.Context(), s.quotaCounter, providerName, s.quotaPolicy)
-	if err != nil {
-		// Fails open (quota.Enforce already returned Allow) — a Redis
-		// outage isn't evidence of real provider overload, same
-		// reasoning as edge-gateway's Phase-01 ratelimit/admission.
-		log.Warn("quota check failed, failing open", "provider", providerName, "error", err)
-	}
-	if quotaDecision == quota.Throttle {
-		log.Info("fleet-wide quota exhausted, signaling fallback", "provider", providerName)
-		return stream.Send(fallbackResponse(req.GetRequestId(), providerName, pb.FallbackReason_FALLBACK_REASON_QUOTA_EXHAUSTED))
-	}
+	adapterReq := toAdapterRequest(req, model)
 
-	breakerDecision, err := breaker.Check(stream.Context(), s.breakerStore, providerName, s.breakerConfig)
-	if err != nil {
-		log.Warn("breaker check failed, failing open", "provider", providerName, "error", err)
-	}
-	if breakerDecision == breaker.Deny {
-		log.Info("breaker open, signaling fallback", "provider", providerName)
-		return stream.Send(fallbackResponse(req.GetRequestId(), providerName, pb.FallbackReason_FALLBACK_REASON_BREAKER_OPEN))
-	}
+	// The leader's own context, stripped of cancellation but not values:
+	// this call may end up shared with followers whose own requests
+	// outlive the leader's — if the leader's caller disconnects, the
+	// underlying adapter call must keep running for their sake, not abort
+	// because the leader happened to be the one who triggered it.
+	callCtx := context.WithoutCancel(stream.Context())
 
-	reportOutcome := func(success bool) {
-		if err := breaker.ReportResult(stream.Context(), s.breakerStore, providerName, s.breakerConfig, success); err != nil {
-			log.Warn("failed to report breaker outcome", "provider", providerName, "success", success, "error", err)
+	call := func() (adapters.Stream, error) {
+		quotaDecision, err := quota.Enforce(callCtx, s.quotaCounter, providerName, s.quotaPolicy)
+		if err != nil {
+			// Fails open (quota.Enforce already returned Allow) — a
+			// Redis outage isn't evidence of real provider overload,
+			// same reasoning as edge-gateway's Phase-01
+			// ratelimit/admission.
+			log.Warn("quota check failed, failing open", "provider", providerName, "error", err)
 		}
+		if quotaDecision == quota.Throttle {
+			log.Info("fleet-wide quota exhausted, signaling fallback", "provider", providerName)
+			return nil, &fallbackError{reason: pb.FallbackReason_FALLBACK_REASON_QUOTA_EXHAUSTED}
+		}
+
+		breakerDecision, err := breaker.Check(callCtx, s.breakerStore, providerName, s.breakerConfig)
+		if err != nil {
+			log.Warn("breaker check failed, failing open", "provider", providerName, "error", err)
+		}
+		if breakerDecision == breaker.Deny {
+			log.Info("breaker open, signaling fallback", "provider", providerName)
+			return nil, &fallbackError{reason: pb.FallbackReason_FALLBACK_REASON_BREAKER_OPEN}
+		}
+
+		reportOutcome := func(success bool) {
+			if err := breaker.ReportResult(callCtx, s.breakerStore, providerName, s.breakerConfig, success); err != nil {
+				log.Warn("failed to report breaker outcome", "provider", providerName, "success", success, "error", err)
+			}
+		}
+
+		adapterStream, err := adapter.Invoke(callCtx, adapterReq)
+		if err != nil {
+			log.Warn("adapter invoke failed", "provider", providerName, "error", err)
+			reportOutcome(false)
+			return nil, err
+		}
+		return &reportingStream{inner: adapterStream, report: reportOutcome}, nil
 	}
 
-	adapterStream, err := adapter.Invoke(stream.Context(), toAdapterRequest(req, model))
-	if err != nil {
-		log.Warn("adapter invoke failed", "provider", providerName, "error", err)
-		reportOutcome(false)
-		return status.Error(codes.Unavailable, err.Error())
-	}
+	sharedStream := s.coalesceGroup.Invoke(coalesce.Key(adapterReq), call)
 
 	for {
-		delta, err := adapterStream.Recv()
+		delta, err := sharedStream.Recv()
 		if errors.Is(err, io.EOF) {
-			// Stream ended without ever sending a final delta — an
-			// ill-behaved upstream, counted as a breaker failure rather
-			// than a silent success.
-			reportOutcome(false)
 			return nil
+		}
+		var fbErr *fallbackError
+		if errors.As(err, &fbErr) {
+			return stream.Send(fallbackResponse(req.GetRequestId(), providerName, fbErr.reason))
 		}
 		if err != nil {
 			log.Warn("adapter stream error", "provider", providerName, "error", err)
-			reportOutcome(false)
 			return status.Error(codes.Unavailable, err.Error())
 		}
 		if err := stream.Send(toPbDelta(req.GetRequestId(), delta)); err != nil {
-			// Caller went away mid-stream — not a provider failure, so no
-			// outcome is reported at all; the adapter's own Stream is
-			// responsible for releasing its upstream connection when
-			// Recv stops being called.
+			// Caller went away mid-stream — not a provider failure. The
+			// coalesced call (and any other subscriber) keeps running
+			// independently of this one caller leaving.
 			return err
 		}
 		if delta.IsFinal {
-			reportOutcome(true)
 			return nil
 		}
 	}
@@ -278,6 +332,7 @@ func main() {
 		quotaPolicy:   quotaPolicy,
 		breakerStore:  breakerStore,
 		breakerConfig: breakerConfig,
+		coalesceGroup: coalesce.NewGroup(),
 		log:           log,
 	})
 
