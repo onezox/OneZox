@@ -46,6 +46,74 @@ explicit max-abandoned-call lifetime, independent of coalescing), that's a
 future decision, not a Phase-02 gap — Phase-02.txt's own resilience testing
 requirements are about breaker/quota/coalescing/fan-out, not disconnect
 latency.
+--------------------------------------------------------------------------------
+2026-08-02 — Step J3: credential-isolation check found (and fixed) a real
+cross-service secret-read path, unrelated to anything Phase-02 built
+--------------------------------------------------------------------------------
+FINDING: verifying "provider-gateway-credentials mounted only to
+provider-gateway" per Phase-02.txt's own SECURITY IMPLEMENTATION wording
+was treated as two separate questions, not one: (1) does any OTHER pod's
+spec reference this Secret (a mount check), and (2) could any OTHER pod's
+service account read it via the K8s API regardless of mounting (an RBAC
+check). (1) was clean from the start — scanned all 59 pods across every
+namespace, exactly one (provider-gateway itself) references it.
+
+(2) was not clean. loki-clusterrole (installed by Phase-00's Loki Helm
+chart — nothing Phase-02 touched) grants get/watch/list on `secrets`
+AND `configmaps`, cluster-wide, completely unscoped. Confirmed this was
+genuinely exploitable, not just a theoretical rule: minted a token bound
+to the `loki` ServiceAccount (`kubectl create token loki`) and used it to
+fetch provider-gateway-credentials directly from the K8s API — succeeded,
+HTTP 200, with all three real provider API key field names present in the
+response. Four running pods share this ServiceAccount:
+loki-0, loki-chunks-cache-0, loki-gateway, loki-results-cache-0.
+
+ROOT CAUSE: the grafana/loki chart's templates/backend/clusterrole.yaml
+gates its entire rules list behind a single values flag,
+`sidecar.rules.enabled` (chart default: true) — true grants the blanket
+configmaps/secrets access shown above (needed only for the chart's
+rule-auto-discovery sidecar, which loads Loki alerting/recording rules
+from labeled ConfigMaps/Secrets); false renders `rules: []`. Nothing in
+this cluster stores Loki rules that way, so the feature was already dead
+weight — not a capability anything here actually used.
+
+FIX: set `sidecar.rules.enabled: false` in
+platform/operators/loki/loki-values.yaml (committed, then applied via
+`helm upgrade` directly — platform/operators/ isn't in the "onezox-stubs"
+Argo Application's watched path, same established exception Prometheus's
+own config already uses per Phase-01 Step F3b). Confirmed via `helm
+template` before applying that this produces `rules: []` and removes the
+now-pointless kiwigrid/k8s-sidecar container entirely, not just the RBAC
+grant. Re-verified post-apply: the same loki-scoped token that got HTTP
+200 before now gets HTTP 403 ("... is forbidden: User
+\"system:serviceaccount:default:loki\" cannot get resource \"secrets\"").
+
+VERIFIED LOKI ITSELF STILL WORKS after the fix, not just that the
+permission was removed: loki-0 rolled out cleanly (1/1 Ready); a fresh
+real request through provider-gateway's error path produced a log line
+found in Loki within one poll, both via Loki's own query API and through
+Grafana's proxied datasource query — ingestion and querying both intact.
+
+SEPARATE FINDING, surfaced by accident while chasing what first looked
+like a Loki regression: provider-gateway's Invoke handler has NO log
+line at all on a successful request (main.go only calls log.Warn/
+log.Error on error paths) — the exact same gap Phase-01's edge-gateway
+had before its own Step J3 fixed it. A request that completes cleanly
+currently produces zero structured-log output. Not fixed here — this is
+Step N's job (EC4 telemetry completeness), noted so it doesn't get
+rediscovered as a surprise then.
+
+RESIDUAL, NOT ACTIONABLE: a broader sweep of every ClusterRole for any
+remaining secrets-read grant turned up argocd-application-controller,
+argocd-server, argocd-notifications-controller, cilium-operator, and
+cockroach-operator-role, plus the built-in (unbound-by-default) `admin`/
+`edit` templates. All are legitimate, actively-required control-plane/
+operator permissions (Argo CD's own GitOps engine needs broad secret
+access to function at all; Cilium's operator manages its own mTLS
+certs; CockroachDB's operator manages CRDB's own TLS rotation) — nothing
+here is idle capability the way Loki's sidecar grant was, and narrowing
+any of them risks breaking core cluster function well outside Phase-02's
+scope. Left as-is, deliberately, not overlooked.
 ================================================================================
 END OF PHASE-02-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
