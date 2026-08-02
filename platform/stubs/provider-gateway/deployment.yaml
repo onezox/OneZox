@@ -1,0 +1,84 @@
+# Phase-02: the real provider-gateway (Go), replacing the Phase-00
+# provider-stub. This is a PRELIMINARY deployment, brought forward from
+# Step K so Redis-dependent logic (quota, breaker, coalescing) can be
+# live-verified in-cluster as each is built — Redis Cluster's multi-shard
+# topology makes host-side port-forward testing unreliable for a
+# cluster-aware client following MOVED redirects to pod IPs the host can't
+# reach, so a real in-cluster deployment is the only reliable way to
+# verify these steps live. Coexists alongside provider-stub for now (no
+# cutover yet, different service names, no conflict).
+#
+# NOT yet final: no mTLS CiliumNetworkPolicy, no egress policy, no
+# provider credentials Secret, no cutover from provider-stub. All of that
+# is Step K's own dedicated, rigorous sequencing (mesh-identity-safe,
+# mirroring Phase-01's edge-gateway cutover) once adapters/quota/breaker/
+# coalescing/streaming/prefix-cache are all built and verified against the
+# fake.
+#
+# Image tag is the git commit short-SHA this image was built from
+# (content-addressed, not a static "phase02" string) — a rebuild changes
+# the tag, so a normal git commit + Argo sync rolls it out with no manual
+# `kubectl rollout restart` workaround.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-gateway
+  namespace: default
+  labels:
+    app: provider-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: provider-gateway
+  template:
+    metadata:
+      labels:
+        app: provider-gateway
+    spec:
+      containers:
+        - name: provider-gateway
+          image: onezox/provider-gateway:7f43b0323332
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50051
+              name: grpc
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 192Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-gateway
+  namespace: default
+  labels:
+    app: provider-gateway
+spec:
+  selector:
+    app: provider-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 50051
+      targetPort: 50051
