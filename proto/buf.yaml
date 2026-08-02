@@ -7,3 +7,10 @@ lint:
 breaking:
   use:
     - FILE
+  ignore:
+    # One-time: provider/v1/placeholder.proto was deleted and replaced by
+    # the real Phase-02 internal contract in provider.proto. Same exception
+    # Phase-01 used for dataplane/v1 (commit 82cc0a8 retired it once done).
+    # Remove in the next proto-touching commit once this comparison is no
+    # longer live.
+    - provider/v1/placeholder.proto

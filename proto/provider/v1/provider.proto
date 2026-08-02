@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package provider.v1;
+
+option go_package = "github.com/onezox/OneZox/services/provider-gateway/internal/pb/provider/v1;providerv1";
+
+// Internal contract (Part G.1, Part P) between a caller (the Phase-03 data
+// plane; a test harness for this phase) and provider-gateway. Phase-02
+// defines this self-contained — no import of gateway.v1/dataplane.v1 — since
+// provider-gateway sits behind a different boundary than edge-gateway's
+// ingress contract and has no reason to share those message shapes.
+//
+// worker_ref is a plain string, not a structured scheduler handle: Phase-02
+// has no scheduler and no model registry yet (Dependencies.txt F10 — a
+// signed registry manifest arrives in Phase-04; the scheduler itself is
+// later still). For this phase, worker_ref is a simple "<provider>:<model>"
+// convention (e.g. "openai:gpt-4o-mini", "fake:default") that
+// provider-gateway's own routing parses to select an adapter — not a
+// forward-looking abstraction to be finalized here.
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message InvokeParams {
+  optional int32 max_tokens = 1;
+  optional float temperature = 2;
+}
+
+message InvokeRequest {
+  string request_id = 1;
+  string worker_ref = 2;
+  repeated ChatMessage messages = 3;
+  InvokeParams params = 4;
+}
+
+// One item of a streamed Invoke response. Exactly one of the oneof's two
+// branches is set per message: a normal content delta, or — when the
+// targeted provider's breaker is open — a typed fallback signal instead of
+// an error, per Phase-02.txt's INTERNAL COMMUNICATION FLOW ("Breaker open ->
+// return typed 'use fallback' signal"). A typed oneof, not a gRPC status-
+// code convention, so callers don't have to parse error metadata to tell
+// "provider said no" apart from "breaker says don't even ask".
+message InvokeResponse {
+  oneof event {
+    Delta delta = 1;
+    FallbackSignal fallback = 2;
+  }
+}
+
+message Delta {
+  string request_id = 1;
+  optional string content = 2;
+  optional string finish_reason = 3;
+  bool is_final = 4;
+  // Provider-reported prompt-cache handle (Part P), passed through as-is.
+  // Real KV reuse arrives with self-host in Phase-11 — this phase only
+  // plumbs the handle from adapter response to caller.
+  optional string prefix_cache_handle = 5;
+}
+
+enum FallbackReason {
+  FALLBACK_REASON_UNSPECIFIED = 0;
+  FALLBACK_REASON_BREAKER_OPEN = 1;
+  FALLBACK_REASON_QUOTA_EXHAUSTED = 2;
+}
+
+message FallbackSignal {
+  string request_id = 1;
+  string provider = 2;
+  FallbackReason reason = 3;
+}
+
+message InvokeEmbeddingRequest {
+  string worker_ref = 1;
+  repeated string input = 2;
+}
+
+message Embedding {
+  repeated float values = 1;
+}
+
+message InvokeEmbeddingResponse {
+  repeated Embedding embeddings = 1;
+}
+
+enum BreakerState {
+  BREAKER_STATE_UNSPECIFIED = 0;
+  BREAKER_STATE_CLOSED = 1;
+  BREAKER_STATE_OPEN = 2;
+  BREAKER_STATE_HALF_OPEN = 3;
+}
+
+message ProviderHealthRequest {
+  // Empty = report on every known provider.
+  optional string provider = 1;
+}
+
+message ProviderStatus {
+  string provider = 1;
+  BreakerState breaker_state = 2;
+  // Remaining fraction of the fleet-wide quota window, [0.0, 1.0].
+  float quota_headroom = 3;
+}
+
+message ProviderHealthResponse {
+  repeated ProviderStatus statuses = 1;
+}
+
+service ProviderService {
+  rpc Invoke(InvokeRequest) returns (stream InvokeResponse);
+  rpc InvokeEmbedding(InvokeEmbeddingRequest) returns (InvokeEmbeddingResponse);
+  rpc ProviderHealth(ProviderHealthRequest) returns (ProviderHealthResponse);
+}

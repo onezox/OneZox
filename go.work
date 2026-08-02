@@ -1,7 +1,9 @@
 go 1.26.5
 
 // services/provider-stub joined this phase (Phase-00 Deployment Step 7).
-// Still to come (Part C, Part Q):
-//   - services/provider-gateway (later: real provider abstraction layer)
-//   - services/chat-service     (later: single owner of chat history)
+// services/provider-gateway joined at Phase-02 Step A1 (proto/provider
+// finalized; real provider abstraction layer built out from here).
+// Still to come (Part Q):
+//   - services/chat-service (later: single owner of chat history)
 use ./services/provider-stub
+use ./services/provider-gateway

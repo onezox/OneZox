@@ -5,10 +5,22 @@ inputs:
 
 # Message codegen for all three OneZox languages (Part C), plus gRPC
 # service-stub codegen for Rust and Python — the two languages that consume
-# dataplane.v1.DataplaneService (Phase-01: edge-gateway, dataplane-stub). No
-# Go grpc plugin added: no Go service in this phase calls this contract
-# (provider-stub doesn't touch it; Go's real consumer, the Provider Gateway,
-# is Phase-02). protocolbuffers/go (message-only) is unchanged from Phase-00.
+# dataplane.v1.DataplaneService (Phase-01: edge-gateway, dataplane-stub).
+#
+# Not actually invoked anywhere (no CI step runs `buf generate`; this
+# workspace-wide remote-plugin config isn't what any service's Docker build
+# uses). Every service generates and commits its own bindings locally
+# instead (dataplane-stub's generate_proto.sh, edge-gateway's #[ignore]
+# regenerate_proto test, provider-gateway's own generate_proto.sh from
+# Phase-02 on), because each service's Docker build context is scoped to
+# its own services/<name>/ directory and can't reach proto/ at the repo
+# root — the same reason in each case. Kept here as a still-correct
+# reference for what a workspace-wide generate WOULD produce, not as the
+# real codegen path. No Go grpc plugin added for the same reason
+# protoc-gen-go itself needs a per-file `go_package` option that most
+# packages here still don't set — provider-gateway's own generator invokes
+# protoc directly against just provider/v1, which does set one, rather than
+# depending on this file at all.
 plugins:
   - remote: buf.build/protocolbuffers/go
     out: gen/go
