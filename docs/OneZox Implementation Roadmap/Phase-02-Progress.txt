@@ -1,0 +1,51 @@
+================================================================================
+PHASE-02 — PROVIDER GATEWAY — PROGRESS / FINDINGS RECORD
+================================================================================
+This file is NOT a step-by-step changelog of Phase-02 code changes — git log
+and each commit message are the record for that (every Phase-02 commit is a
+verified, independently-testable checkpoint per CLAUDE.md). This file exists
+for things git history doesn't capture on its own: deviations from expected
+behavior, process gaps, and findings that future sessions (or a fresh
+engineer) need to know about before they re-discover them the hard way.
+Entries are dated and point-in-time. Matches the same convention
+Phase-01-Progress.txt established.
+
+--------------------------------------------------------------------------------
+2026-08-02 — Step H2: mid-stream disconnect cleanup is bounded, not
+immediate — a deliberate trade-off, confirmed live, not a leak
+--------------------------------------------------------------------------------
+FINDING: Phase-01's edge-gateway (Rust) freed its admission-guard resource
+immediately on a mid-stream client disconnect (Step H3, Phase-01). Testing
+the same scenario for provider-gateway (Go) found different, but correct,
+behavior: killing a client mid-stream against a slow (fake:slow, 700ms/chunk)
+call left go_goroutines elevated (12 baseline -> 18 immediately after kill),
+only returning to baseline (11) after ~8 seconds — roughly the time the
+abandoned call's remaining chunks would have taken to arrive naturally.
+
+This is NOT a leak. It is the direct, intended consequence of Step G's
+coalescing design: the leader's context is deliberately stripped of
+cancellation (context.WithoutCancel) before the shared quota+breaker+adapter
+call runs, specifically so that if the caller who happened to trigger the
+call disconnects, the underlying call keeps running for the sake of any
+other subscriber (follower) that joined it — a follower's own request must
+not be silently aborted just because the leader walked away. The
+consequence is that cleanup after a disconnect is bounded by the call's own
+natural duration, not immediate.
+
+Verified live against the real deployed service: baseline goroutine count
+was re-confirmed identical (11) well after the settle window, ruling out
+drift/leak across the test rather than just a single before/after snapshot.
+
+DECISION: left as-is. Phase-02.txt does not specify disconnect-cleanup
+timing, and immediate-abort-on-disconnect would directly conflict with
+Step G's own coalescing requirement ("a follower riding an in-flight call
+[must not be] independently... for work it isn't causing" — aborting the
+shared call on ANY one subscriber's disconnect would break every other
+still-attached subscriber). If this bound ever needs tightening (e.g. an
+explicit max-abandoned-call lifetime, independent of coalescing), that's a
+future decision, not a Phase-02 gap — Phase-02.txt's own resilience testing
+requirements are about breaker/quota/coalescing/fan-out, not disconnect
+latency.
+================================================================================
+END OF PHASE-02-PROGRESS.TXT (living document — append, do not rewrite)
+================================================================================
