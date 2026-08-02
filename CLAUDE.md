@@ -4,8 +4,8 @@
 Implementation of the OneZox AI orchestration engine. The authoritative design
 is in `docs/OneZox-v2-Architecture.md`. The build is split into phases in
 `docs/OneZox Implementation Roadmap/` (Roadmap.txt + Phase-00..14 +
-Dependencies.txt). Phase-00 (Foundation) is complete and verified. We are
-currently building **Phase-01**.
+Dependencies.txt). Phase-00 (Foundation) and Phase-01 (Edge Gateway) are
+complete and verified. We are currently building **Phase-02**.
 
 ## Hard rules
 - NEVER modify `docs/OneZox-v2-Architecture.md`. It is the design source of truth.
@@ -35,25 +35,46 @@ currently building **Phase-01**.
   from Phase-00 failed boots. Do not assume those tables are empty.
 
 ## Current phase
-**Phase-01 — Edge Gateway (Rust).** Replace the throwaway `edge-stub` with the
-real `edge-gateway`: API-key (hashed) + JWT auth, Redis rate limiting, admission
-(accept/queue/shed), normalize to internal proto, meter (span with token/cost
-fields), and SSE streaming relay with backpressure + clean disconnect handling.
-The edge forwards DOWNSTREAM to the existing Phase-00 `dataplane-stub` — the real
-data plane is Phase-03; do NOT build it. New tables: `api_keys`,
-`rate_limit_policy`. New infrastructure this phase: an ingress/load balancer
-(kind has no cloud LB — a local equivalent must be chosen in the plan).
+**Phase-02 — Provider Gateway (Go).** Build the dedicated Go service that owns
+all provider concerns, replacing the throwaway `provider-stub`: provider adapters
+(OpenAI/Anthropic/Google) behind one internal contract, a fleet-wide quota
+governor (shared Redis counters, not per-pod), per-provider circuit breakers with
+fallback signaling, request coalescing, streaming passthrough with backpressure,
+and prefix-cache handle passthrough. Called by the data plane (Phase-03) via
+gRPC — for THIS phase a test harness drives it directly; do NOT build the Phase-03
+data plane. Contract: `proto/provider` (Invoke / InvokeEmbedding / ProviderHealth).
+No relational tables this phase. Redis keys: `provider:{name}:quota:{window}`,
+`provider:{name}:breaker`.
 
-Exit criteria (Phase-01 is NOT done until all four pass — full text in
-`docs/OneZox Implementation Roadmap/Phase-01.txt`):
-1. Authenticated, rate-limited, metered streamed request flows
-   edge -> stub -> client over SSE.
-2. Security tests pass (no raw key leakage, tenant isolation at edge,
-   unauth rejected).
-3. Tail-latency test shows no GC-style spikes under sustained streaming.
-   (On local kind, demonstrate stability/no-leak under sustained load; absolute
-   p99 is a cloud-phase measurement, not a laptop number.)
-4. All edge telemetry visible in the tracing/metrics backend.
+Phase-02 scoping decisions and deferrals:
+- Provider testing is split: the resilience logic (breaker, quota, coalescing,
+  fan-out cap) is tested against a controllable FAKE provider (fail/throttle/
+  slow-stream on command) — a real provider can't be made to fail on demand and
+  hammering it costs money. ONE real streamed call per provider proves adapter
+  wire-format correctness (EC1). A breaker that never trips looks identical to a
+  healthy one; the fake is how we prove it CAN fire.
+- Credentials: real provider API key(s) in a K8s Secret mounted ONLY to
+  provider-gateway (Dependencies.txt F9). Vault-issued tokens are Phase-04 — do
+  NOT stand up Vault. EC3's "credentials never leak" test runs against this setup.
+- Scaling: basic HPA only. Token-aware KEDA + fleet-governor scaling is
+  F2-deferred to Phase-13 — do NOT build the full governor-driven autoscaling.
+- Egress: default-deny with an allow-list for approved provider endpoints (built
+  on kind+Cilium this phase). "Can a pod reach the real provider through the
+  egress policy" is a step to VERIFY, not assume.
+- Network hazard: this network has a TLS-intercepting proxy (confirmed Phase-00,
+  broke cosign's Rekor upload). A real HTTPS provider call may hit it — detect/
+  handle, don't discover mid-test.
+- Deployment via the onezox-stubs Argo Application. Prefer immutable/digest image
+  tags from the start to avoid Phase-01's same-tag-no-diff manual rollout-restart
+  workaround.
+
+Exit criteria (Phase-02 is NOT done until all four pass — full text in
+`docs/OneZox Implementation Roadmap/Phase-02.txt`):
+1. Streamed completion from a real provider via Invoke, end-to-end, metered.
+2. Breaker + fallback signal + fleet-wide quota all demonstrated under fault
+   injection (against the fake provider).
+3. Credential isolation and egress allow-list verified.
+4. Gateway telemetry (per-provider latency, breaker state, headroom) visible.
 
 ## At each phase transition
 Update the "Current phase" section above to the new phase and paste in that
