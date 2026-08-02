@@ -38,7 +38,7 @@ spec:
     spec:
       containers:
         - name: provider-gateway
-          image: onezox/provider-gateway:56dd4366eca1
+          image: onezox/provider-gateway:69be1485d227
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
