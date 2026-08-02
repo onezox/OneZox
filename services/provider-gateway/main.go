@@ -42,6 +42,7 @@ import (
 
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters/fake"
+	"github.com/onezox/OneZox/services/provider-gateway/internal/breaker"
 	pb "github.com/onezox/OneZox/services/provider-gateway/internal/pb/provider/v1"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/quota"
 )
@@ -94,10 +95,24 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 // Invoke is overridden below.
 type server struct {
 	pb.UnimplementedProviderServiceServer
-	registry     *adapters.Registry
-	quotaCounter quota.Counter
-	quotaPolicy  quota.Policy
-	log          *slog.Logger
+	registry      *adapters.Registry
+	quotaCounter  quota.Counter
+	quotaPolicy   quota.Policy
+	breakerStore  breaker.Store
+	breakerConfig breaker.Config
+	log           *slog.Logger
+}
+
+func fallbackResponse(requestID, provider string, reason pb.FallbackReason) *pb.InvokeResponse {
+	return &pb.InvokeResponse{
+		Event: &pb.InvokeResponse_Fallback{
+			Fallback: &pb.FallbackSignal{
+				RequestId: requestID,
+				Provider:  provider,
+				Reason:    reason,
+			},
+		},
+	}
 }
 
 func toAdapterRequest(req *pb.InvokeRequest, model string) adapters.InvokeRequest {
@@ -153,48 +168,63 @@ func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer
 		return status.Error(codes.NotFound, err.Error())
 	}
 
-	decision, err := quota.Enforce(stream.Context(), s.quotaCounter, providerName, s.quotaPolicy)
+	quotaDecision, err := quota.Enforce(stream.Context(), s.quotaCounter, providerName, s.quotaPolicy)
 	if err != nil {
 		// Fails open (quota.Enforce already returned Allow) — a Redis
 		// outage isn't evidence of real provider overload, same
 		// reasoning as edge-gateway's Phase-01 ratelimit/admission.
 		log.Warn("quota check failed, failing open", "provider", providerName, "error", err)
 	}
-	if decision == quota.Throttle {
+	if quotaDecision == quota.Throttle {
 		log.Info("fleet-wide quota exhausted, signaling fallback", "provider", providerName)
-		return stream.Send(&pb.InvokeResponse{
-			Event: &pb.InvokeResponse_Fallback{
-				Fallback: &pb.FallbackSignal{
-					RequestId: req.GetRequestId(),
-					Provider:  providerName,
-					Reason:    pb.FallbackReason_FALLBACK_REASON_QUOTA_EXHAUSTED,
-				},
-			},
-		})
+		return stream.Send(fallbackResponse(req.GetRequestId(), providerName, pb.FallbackReason_FALLBACK_REASON_QUOTA_EXHAUSTED))
+	}
+
+	breakerDecision, err := breaker.Check(stream.Context(), s.breakerStore, providerName, s.breakerConfig)
+	if err != nil {
+		log.Warn("breaker check failed, failing open", "provider", providerName, "error", err)
+	}
+	if breakerDecision == breaker.Deny {
+		log.Info("breaker open, signaling fallback", "provider", providerName)
+		return stream.Send(fallbackResponse(req.GetRequestId(), providerName, pb.FallbackReason_FALLBACK_REASON_BREAKER_OPEN))
+	}
+
+	reportOutcome := func(success bool) {
+		if err := breaker.ReportResult(stream.Context(), s.breakerStore, providerName, s.breakerConfig, success); err != nil {
+			log.Warn("failed to report breaker outcome", "provider", providerName, "success", success, "error", err)
+		}
 	}
 
 	adapterStream, err := adapter.Invoke(stream.Context(), toAdapterRequest(req, model))
 	if err != nil {
 		log.Warn("adapter invoke failed", "provider", providerName, "error", err)
+		reportOutcome(false)
 		return status.Error(codes.Unavailable, err.Error())
 	}
 
 	for {
 		delta, err := adapterStream.Recv()
 		if errors.Is(err, io.EOF) {
+			// Stream ended without ever sending a final delta — an
+			// ill-behaved upstream, counted as a breaker failure rather
+			// than a silent success.
+			reportOutcome(false)
 			return nil
 		}
 		if err != nil {
 			log.Warn("adapter stream error", "provider", providerName, "error", err)
+			reportOutcome(false)
 			return status.Error(codes.Unavailable, err.Error())
 		}
 		if err := stream.Send(toPbDelta(req.GetRequestId(), delta)); err != nil {
-			// Caller went away mid-stream — nothing more to send, and
-			// the adapter's own Stream is responsible for releasing its
-			// upstream connection when Recv stops being called.
+			// Caller went away mid-stream — not a provider failure, so no
+			// outcome is reported at all; the adapter's own Stream is
+			// responsible for releasing its upstream connection when
+			// Recv stops being called.
 			return err
 		}
 		if delta.IsFinal {
+			reportOutcome(true)
 			return nil
 		}
 	}
@@ -227,6 +257,14 @@ func main() {
 	quotaLimit := envInt64Or("QUOTA_LIMIT_PER_MINUTE", 60)
 	quotaPolicy := quota.Policy{Limit: quotaLimit, Window: time.Minute}
 
+	breakerStore := breaker.NewRedisStore(redisClient)
+	// Also placeholders, not tuned against any real provider — same
+	// framing as the quota limit above.
+	breakerConfig := breaker.Config{
+		FailureThreshold: int(envInt64Or("BREAKER_FAILURE_THRESHOLD", 5)),
+		OpenDuration:     time.Duration(envInt64Or("BREAKER_OPEN_DURATION_SECONDS", 30)) * time.Second,
+	}
+
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
@@ -235,10 +273,12 @@ func main() {
 	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterProviderServiceServer(grpcServer, &server{
-		registry:     registry,
-		quotaCounter: quotaCounter,
-		quotaPolicy:  quotaPolicy,
-		log:          log,
+		registry:      registry,
+		quotaCounter:  quotaCounter,
+		quotaPolicy:   quotaPolicy,
+		breakerStore:  breakerStore,
+		breakerConfig: breakerConfig,
+		log:           log,
 	})
 
 	go func() {
