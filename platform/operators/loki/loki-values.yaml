@@ -76,6 +76,25 @@ chunksCache:
 minio:
   enabled: false
 
+# Disables the chart's rule-auto-discovery sidecar (kiwigrid/k8s-sidecar),
+# which we don't use — no Loki alerting/recording rules are stored in
+# ConfigMaps/Secrets anywhere in this cluster. Found and fixed during
+# Phase-02 Step J3's own credential-isolation check: with this left at the
+# chart's default (true), loki-clusterrole grants get/watch/list on
+# *every* Secret and ConfigMap cluster-wide (templates/backend/
+# clusterrole.yaml gates its rules entirely behind
+# sidecar.rules.enabled — true grants blanket secrets/configmaps access,
+# false renders `rules: []`), unscoped to anything Loki actually needs.
+# Confirmed exploitable, not just theoretical: a token minted for the
+# `loki` ServiceAccount successfully read provider-gateway-credentials
+# (Phase-02's real provider API keys) via the K8s API before this fix.
+# Also removes the now-pointless sidecar container and its volume mounts
+# from the pod (the chart gates those the same way), not just the RBAC
+# grant.
+sidecar:
+  rules:
+    enabled: false
+
 # Zero out replica counts for the SimpleScalable/distributed deployment
 # modes' components — SingleBinary mode doesn't use them, but the chart
 # still expects these values to be defined.
