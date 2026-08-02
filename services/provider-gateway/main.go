@@ -1,17 +1,21 @@
 // provider-gateway — Phase-02: replaces the Phase-00 provider-stub with the
-// real dedicated Go service that owns all provider concerns. Step D5 wires
-// the full pipeline end-to-end against the fake adapter — no quota,
-// breaker, or coalescing logic yet (Steps E-G add those on top); this step
-// only proves the plumbing: worker_ref -> registry lookup -> adapter
-// Invoke -> stream deltas back over gRPC, with real backpressure (the
-// gRPC Send in the loop below only proceeds once the client has consumed
-// the previous message, which is what naturally paces the adapter's own
-// Recv calls — no manual buffering, same discipline as Phase-01's SSE
-// relay). InvokeEmbedding and ProviderHealth stay unimplemented for now.
+// real dedicated Go service that owns all provider concerns. Step D5 wired
+// the pipeline's plumbing end-to-end against the fake adapter (worker_ref
+// -> registry lookup -> adapter Invoke -> stream deltas back over gRPC,
+// with real backpressure — the gRPC Send in the loop below only proceeds
+// once the client has consumed the previous message, which is what
+// naturally paces the adapter's own Recv calls, no manual buffering, same
+// discipline as Phase-01's SSE relay). Step E adds the fleet-wide quota
+// governor in front of the adapter call: exhausted quota returns a typed
+// FallbackSignal (reason QUOTA_EXHAUSTED) and closes the stream cleanly —
+// "throttles rather than errors" (Phase-02.txt), not a gRPC error the
+// caller has to specifically catch. Breaker and coalescing (Steps F-G)
+// each insert their own stage between quota and the adapter call as
+// they're built. InvokeEmbedding and ProviderHealth stay unimplemented.
 //
 // No CockroachDB or MinIO connection, unlike provider-stub: Phase-02.txt's
 // DATABASE TABLES REQUIRED section is explicit that this phase owns no
-// relational tables. Redis arrives with Step E's quota governor, not here.
+// relational tables.
 package main
 
 import (
@@ -22,8 +26,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -36,6 +43,7 @@ import (
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters/fake"
 	pb "github.com/onezox/OneZox/services/provider-gateway/internal/pb/provider/v1"
+	"github.com/onezox/OneZox/services/provider-gateway/internal/quota"
 )
 
 const serviceName = "provider-gateway"
@@ -45,6 +53,18 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envInt64Or(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
@@ -74,8 +94,10 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 // Invoke is overridden below.
 type server struct {
 	pb.UnimplementedProviderServiceServer
-	registry *adapters.Registry
-	log      *slog.Logger
+	registry     *adapters.Registry
+	quotaCounter quota.Counter
+	quotaPolicy  quota.Policy
+	log          *slog.Logger
 }
 
 func toAdapterRequest(req *pb.InvokeRequest, model string) adapters.InvokeRequest {
@@ -131,6 +153,26 @@ func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer
 		return status.Error(codes.NotFound, err.Error())
 	}
 
+	decision, err := quota.Enforce(stream.Context(), s.quotaCounter, providerName, s.quotaPolicy)
+	if err != nil {
+		// Fails open (quota.Enforce already returned Allow) — a Redis
+		// outage isn't evidence of real provider overload, same
+		// reasoning as edge-gateway's Phase-01 ratelimit/admission.
+		log.Warn("quota check failed, failing open", "provider", providerName, "error", err)
+	}
+	if decision == quota.Throttle {
+		log.Info("fleet-wide quota exhausted, signaling fallback", "provider", providerName)
+		return stream.Send(&pb.InvokeResponse{
+			Event: &pb.InvokeResponse_Fallback{
+				Fallback: &pb.FallbackSignal{
+					RequestId: req.GetRequestId(),
+					Provider:  providerName,
+					Reason:    pb.FallbackReason_FALLBACK_REASON_QUOTA_EXHAUSTED,
+				},
+			},
+		})
+	}
+
 	adapterStream, err := adapter.Invoke(stream.Context(), toAdapterRequest(req, model))
 	if err != nil {
 		log.Warn("adapter invoke failed", "provider", providerName, "error", err)
@@ -173,6 +215,18 @@ func main() {
 	fakeBaseURL := envOr("PROVIDER_FAKE_URL", "http://provider-fake.default.svc.cluster.local:8080")
 	registry := adapters.NewRegistry(fake.New(fakeBaseURL))
 
+	redisHost := envOr("REDIS_HOST", "redis-cluster-headless.default.svc.cluster.local")
+	redisClient := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{redisHost + ":6379"}})
+	quotaCounter := quota.NewRedisCounter(redisClient, log)
+
+	// Placeholder fleet-wide limit, not tuned against any real provider's
+	// documented cap yet — same "not tuned against real capacity data"
+	// framing Phase-01's admission thresholds used. One shared value
+	// across all providers for now; Phase-02 has no per-provider config
+	// table (no relational tables this phase at all).
+	quotaLimit := envInt64Or("QUOTA_LIMIT_PER_MINUTE", 60)
+	quotaPolicy := quota.Policy{Limit: quotaLimit, Window: time.Minute}
+
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
@@ -180,7 +234,12 @@ func main() {
 		os.Exit(1)
 	}
 	grpcServer := grpc.NewServer()
-	pb.RegisterProviderServiceServer(grpcServer, &server{registry: registry, log: log})
+	pb.RegisterProviderServiceServer(grpcServer, &server{
+		registry:     registry,
+		quotaCounter: quotaCounter,
+		quotaPolicy:  quotaPolicy,
+		log:          log,
+	})
 
 	go func() {
 		log.Info("provider-gateway gRPC listening", "port", grpcPort)
@@ -196,9 +255,12 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		// No dependency yet to check (Redis arrives with Step E) — the
-		// gRPC server binding successfully above is this step's whole
-		// notion of ready.
+		if err := redisClient.Ping(r.Context()).Err(); err != nil {
+			log.Error("readiness check failed", "redis_error", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not ready"))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))
 	})
