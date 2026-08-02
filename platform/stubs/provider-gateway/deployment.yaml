@@ -1,19 +1,23 @@
 # Phase-02: the real provider-gateway (Go), replacing the Phase-00
-# provider-stub. This is a PRELIMINARY deployment, brought forward from
-# Step K so Redis-dependent logic (quota, breaker, coalescing) can be
-# live-verified in-cluster as each is built — Redis Cluster's multi-shard
-# topology makes host-side port-forward testing unreliable for a
-# cluster-aware client following MOVED redirects to pod IPs the host can't
-# reach, so a real in-cluster deployment is the only reliable way to
-# verify these steps live. Coexists alongside provider-stub for now (no
-# cutover yet, different service names, no conflict).
+# provider-stub. Originally brought forward as a PRELIMINARY deployment
+# (Redis Cluster's multi-shard topology makes host-side port-forward
+# testing unreliable for a cluster-aware client following MOVED redirects
+# to pod IPs the host can't reach, so a real in-cluster deployment was the
+# only reliable way to live-verify quota/breaker/coalescing as they were
+# built). Still coexists alongside provider-stub (different service
+# names, no conflict) — the cutover itself is Step K, sequenced after this
+# file's own hardening below is in place.
 #
-# NOT yet final: no mTLS CiliumNetworkPolicy, no egress policy, no
-# provider credentials Secret, no cutover from provider-stub. All of that
-# is Step K's own dedicated, rigorous sequencing (mesh-identity-safe,
-# mirroring Phase-01's edge-gateway cutover) once adapters/quota/breaker/
-# coalescing/streaming/prefix-cache are all built and verified against the
-# fake.
+# Step J3: provider-gateway-credentials mounted here, via envFrom so all
+# three key fields (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY)
+# become container env vars without enumerating each one — the ONLY
+# workload this Secret is referenced from anywhere in this repo (verified
+# live, not just by manifest inspection: no other pod's spec references
+# it). Mounted only after Step J1-J2's egress default-deny + allow-list
+# was built AND verified in both directions (an approved host reachable,
+# an arbitrary unapproved one refused) — a mounted key in a pod that can
+# reach arbitrary hosts is exfiltratable; the Secret existing was never
+# the risk, egress being open would have been.
 #
 # Image tag is the git commit short-SHA this image was built from
 # (content-addressed, not a static "phase02" string) — a rebuild changes
@@ -40,6 +44,9 @@ spec:
         - name: provider-gateway
           image: onezox/provider-gateway:b9152ded57e8
           imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: provider-gateway-credentials
           ports:
             - containerPort: 8080
               name: http
