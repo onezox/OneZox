@@ -1,0 +1,97 @@
+# Phase-02 Step J1: default-deny egress with an allow-list for approved
+# provider endpoints (Part O), for provider-gateway specifically.
+#
+# EGRESS ONLY — no ingress rules here on purpose. Adding ANY egress rule to
+# a CiliumNetworkPolicy switches that endpoint's EGRESS to default-deny for
+# everything not explicitly matched, but leaves ingress untouched (same
+# per-direction independence the existing mtls/ciliumnetworkpolicy.yaml
+# comment documents for ingress). This is deliberate sequencing: Step J
+# closes egress before any real credential is mounted; Step K adds the
+# mTLS ingress rules later, in its own mesh-identity-safe cutover from
+# provider-stub (mirrors Phase-01 Step F2). Doing both in one file now
+# would jump ahead of that ordering.
+#
+# Allow-listed:
+#   - CoreDNS (both plain UDP/TCP :53 for cluster-internal lookups, and the
+#     toFQDNs DNS-visibility rule below, required for the FQDN egress
+#     rules further down to resolve and be tracked at all).
+#   - redis-cluster (quota/breaker, Step E/F) and otel-collector (traces),
+#     both in-cluster, both already required before this policy existed.
+#   - provider-fake (Step D), in-cluster — resilience tests keep using it
+#     after this policy lands.
+#   - The three real provider hosts approved for Step J4-J6's adapter
+#     calls: api.openai.com, api.anthropic.com,
+#     generativelanguage.googleapis.com (Gemini Developer API, chosen over
+#     Vertex AI specifically because it uses a plain API key, matching
+#     Phase-02.txt's K8s-Secret credential model instead of GCP
+#     IAM/service-account auth).
+#
+# Everything else is denied by the endpointSelector's own default-deny
+# egress posture once this policy applies — verified both directions in
+# Step J2 (an approved host reachable, an unapproved one blocked), not
+# assumed from the manifest alone.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: provider-gateway-egress
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: provider-gateway
+  egress:
+    # Plain in-cluster DNS resolution (service names, etc.).
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchPattern: "*"
+    - toEndpoints:
+        - matchLabels:
+            app: redis-cluster
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+            # Redis Cluster's own gossip/redirect bus — a cluster-aware
+            # client (Step E1's RedisCounter) connects directly to
+            # individual shard pod IPs after topology discovery, not just
+            # the seed address, matching Phase-00's own established
+            # cluster-client requirement.
+            - port: "16379"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: opentelemetry-collector
+      toPorts:
+        - ports:
+            - port: "4317"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: provider-fake
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    # The approved real provider endpoints (Step J4-J6). toFQDNs is
+    # Cilium's DNS-aware egress mechanism: it allows the resolved IPs for
+    # exactly these names, dynamically, as DNS answers for them are
+    # observed via the CoreDNS rule above — not a static, fragile IP/CIDR
+    # allow-list.
+    - toFQDNs:
+        - matchName: "api.openai.com"
+        - matchName: "api.anthropic.com"
+        - matchName: "generativelanguage.googleapis.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
