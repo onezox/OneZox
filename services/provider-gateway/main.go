@@ -20,7 +20,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -45,6 +44,7 @@ import (
 	"github.com/onezox/OneZox/services/provider-gateway/internal/coalesce"
 	pb "github.com/onezox/OneZox/services/provider-gateway/internal/pb/provider/v1"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/quota"
+	relay "github.com/onezox/OneZox/services/provider-gateway/internal/stream"
 )
 
 const serviceName = "provider-gateway"
@@ -104,29 +104,6 @@ type server struct {
 	log           *slog.Logger
 }
 
-func fallbackResponse(requestID, provider string, reason pb.FallbackReason) *pb.InvokeResponse {
-	return &pb.InvokeResponse{
-		Event: &pb.InvokeResponse_Fallback{
-			Fallback: &pb.FallbackSignal{
-				RequestId: requestID,
-				Provider:  provider,
-				Reason:    reason,
-			},
-		},
-	}
-}
-
-// fallbackError lets the coalesced closure (which only gets to return a
-// Stream or an error — see coalesce.Group.Invoke) signal "quota/breaker
-// said no" distinctly from a genuine adapter failure, so Invoke can still
-// send the correct typed FallbackSignal to every subscriber (leader and
-// followers alike) rather than a generic gRPC error.
-type fallbackError struct {
-	reason pb.FallbackReason
-}
-
-func (e *fallbackError) Error() string { return "fallback: " + e.reason.String() }
-
 // reportingStream wraps the real adapter stream so the breaker outcome is
 // reported exactly once, based on how the stream actually ends — success
 // only on reaching a final delta with no error, failure on any error
@@ -178,23 +155,6 @@ func toAdapterRequest(req *pb.InvokeRequest, model string) adapters.InvokeReques
 	return out
 }
 
-func toPbDelta(requestID string, d adapters.Delta) *pb.InvokeResponse {
-	delta := &pb.Delta{
-		RequestId: requestID,
-		IsFinal:   d.IsFinal,
-	}
-	if d.Content != nil {
-		delta.Content = d.Content
-	}
-	if d.FinishReason != nil {
-		delta.FinishReason = d.FinishReason
-	}
-	if d.PrefixCacheHandle != nil {
-		delta.PrefixCacheHandle = d.PrefixCacheHandle
-	}
-	return &pb.InvokeResponse{Event: &pb.InvokeResponse_Delta{Delta: delta}}
-}
-
 func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer[pb.InvokeResponse]) error {
 	log := s.log.With("request_id", req.GetRequestId(), "worker_ref", req.GetWorkerRef())
 
@@ -230,7 +190,7 @@ func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer
 		}
 		if quotaDecision == quota.Throttle {
 			log.Info("fleet-wide quota exhausted, signaling fallback", "provider", providerName)
-			return nil, &fallbackError{reason: pb.FallbackReason_FALLBACK_REASON_QUOTA_EXHAUSTED}
+			return nil, &relay.FallbackError{Reason: pb.FallbackReason_FALLBACK_REASON_QUOTA_EXHAUSTED, Provider: providerName}
 		}
 
 		breakerDecision, err := breaker.Check(callCtx, s.breakerStore, providerName, s.breakerConfig)
@@ -239,7 +199,7 @@ func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer
 		}
 		if breakerDecision == breaker.Deny {
 			log.Info("breaker open, signaling fallback", "provider", providerName)
-			return nil, &fallbackError{reason: pb.FallbackReason_FALLBACK_REASON_BREAKER_OPEN}
+			return nil, &relay.FallbackError{Reason: pb.FallbackReason_FALLBACK_REASON_BREAKER_OPEN, Provider: providerName}
 		}
 
 		reportOutcome := func(success bool) {
@@ -259,29 +219,17 @@ func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer
 
 	sharedStream := s.coalesceGroup.Invoke(coalesce.Key(adapterReq), call)
 
-	for {
-		delta, err := sharedStream.Recv()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		var fbErr *fallbackError
-		if errors.As(err, &fbErr) {
-			return stream.Send(fallbackResponse(req.GetRequestId(), providerName, fbErr.reason))
-		}
-		if err != nil {
-			log.Warn("adapter stream error", "provider", providerName, "error", err)
-			return status.Error(codes.Unavailable, err.Error())
-		}
-		if err := stream.Send(toPbDelta(req.GetRequestId(), delta)); err != nil {
-			// Caller went away mid-stream — not a provider failure. The
-			// coalesced call (and any other subscriber) keeps running
-			// independently of this one caller leaving.
-			return err
-		}
-		if delta.IsFinal {
-			return nil
-		}
+	err = relay.Relay(req.GetRequestId(), sharedStream, stream.Send)
+	var upstreamErr *relay.UpstreamError
+	if errors.As(err, &upstreamErr) {
+		log.Warn("adapter stream error", "provider", providerName, "error", upstreamErr.Unwrap())
+		return status.Error(codes.Unavailable, upstreamErr.Unwrap().Error())
 	}
+	// Any other non-nil error came from stream.Send itself — the caller
+	// went away mid-stream, not a provider failure. Propagated as-is; a
+	// coalesced call's other subscribers keep running independently of
+	// this one caller leaving.
+	return err
 }
 
 func main() {
