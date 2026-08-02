@@ -3,7 +3,12 @@ go 1.26.5
 // services/provider-stub joined this phase (Phase-00 Deployment Step 7).
 // services/provider-gateway joined at Phase-02 Step A1 (proto/provider
 // finalized; real provider abstraction layer built out from here).
+// services/provider-fake joined at Phase-02 Step D1: a controllable
+// stand-in for a real provider, test-only infrastructure (not one of
+// Phase-02.txt's own components) that every EC2 resilience test stands
+// on — a real provider can't be made to fail or exhaust quota on demand.
 // Still to come (Part Q):
 //   - services/chat-service (later: single owner of chat history)
 use ./services/provider-stub
 use ./services/provider-gateway
+use ./services/provider-fake

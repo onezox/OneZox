@@ -30,6 +30,19 @@ __pycache__/
 .ruff_cache/
 
 # =========================
+# Go
+# =========================
+# `go build ./services/<name>/...` run from the repo root drops an
+# unadorned binary named after the package at the CURRENT directory (the
+# repo root), not inside services/<name>/ — easy to do by accident and
+# easy to not notice before staging. Named explicitly, not a wildcard,
+# so a legitimately-named source directory is never at risk of being
+# ignored by mistake.
+/provider-stub
+/provider-gateway
+/provider-fake
+
+# =========================
 # Terraform
 # =========================
 **/.terraform/
