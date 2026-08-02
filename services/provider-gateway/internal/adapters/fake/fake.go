@@ -58,10 +58,11 @@ type wireRequest struct {
 }
 
 type wireChunk struct {
-	RequestID    string  `json:"request_id"`
-	Content      *string `json:"content,omitempty"`
-	FinishReason *string `json:"finish_reason,omitempty"`
-	IsFinal      bool    `json:"is_final"`
+	RequestID         string  `json:"request_id"`
+	Content           *string `json:"content,omitempty"`
+	FinishReason      *string `json:"finish_reason,omitempty"`
+	IsFinal           bool    `json:"is_final"`
+	PrefixCacheHandle *string `json:"prefix_cache_handle,omitempty"`
 }
 
 // parseMode turns worker_ref's model portion ("normal" | "slow" | "fail"
@@ -158,8 +159,9 @@ func (s *stream) Recv() (adapters.Delta, error) {
 		_ = s.body.Close()
 	}
 	return adapters.Delta{
-		Content:      chunk.Content,
-		FinishReason: chunk.FinishReason,
-		IsFinal:      chunk.IsFinal,
+		Content:           chunk.Content,
+		FinishReason:      chunk.FinishReason,
+		IsFinal:           chunk.IsFinal,
+		PrefixCacheHandle: chunk.PrefixCacheHandle,
 	}, nil
 }

@@ -47,10 +47,11 @@ type fakeCompleteRequest struct {
 }
 
 type fakeCompleteChunk struct {
-	RequestID    string  `json:"request_id"`
-	Content      *string `json:"content,omitempty"`
-	FinishReason *string `json:"finish_reason,omitempty"`
-	IsFinal      bool    `json:"is_final"`
+	RequestID         string  `json:"request_id"`
+	Content           *string `json:"content,omitempty"`
+	FinishReason      *string `json:"finish_reason,omitempty"`
+	IsFinal           bool    `json:"is_final"`
+	PrefixCacheHandle *string `json:"prefix_cache_handle,omitempty"`
 }
 
 // The canned response body, split into chunks — same "prove it's genuinely
@@ -106,7 +107,21 @@ func handleFakeComplete(log *slog.Logger) http.HandlerFunc {
 				}
 				writeChunk(w, flusher, fakeCompleteChunk{RequestID: req.RequestID, Content: strPtr(text)})
 			}
-			writeChunk(w, flusher, fakeCompleteChunk{RequestID: req.RequestID, FinishReason: strPtr("stop"), IsFinal: true})
+			// A canned cache-handle value on the final chunk (Part P), the
+			// same place real providers surface a prompt-cache token
+			// alongside completion metadata — derived from request_id so a
+			// live check can confirm it's genuinely THIS request's value
+			// passed through, not a coincidental static constant. Real KV
+			// reuse arrives with self-host in Phase-11; this is plumbing
+			// only, matching meter.rs's placeholder-field precedent from
+			// Phase-01.
+			cacheHandle := "fake-cache-" + req.RequestID
+			writeChunk(w, flusher, fakeCompleteChunk{
+				RequestID:         req.RequestID,
+				FinishReason:      strPtr("stop"),
+				IsFinal:           true,
+				PrefixCacheHandle: &cacheHandle,
+			})
 			log.Info("fake: stream complete")
 			return
 
