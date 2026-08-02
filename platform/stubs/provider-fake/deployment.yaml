@@ -1,0 +1,70 @@
+# Phase-02 Step D: a controllable stand-in for a real provider, test-only
+# infrastructure every EC2 resilience test (breaker, quota, coalescing,
+# backpressure, fan-out cap) stands on. Not one of Phase-02.txt's own
+# COMPONENTS IMPLEMENTED — it exists so provider-gateway's `adapters/fake`
+# has something to induce failure/slowness against on command, since a
+# real provider can't be made to fail or exhaust quota on demand.
+#
+# Image tag is the git commit short-SHA this image was built from
+# (content-addressed, not a static "phase02" string): a rebuild changes
+# the tag, so a normal git commit + Argo sync is enough to roll it out —
+# no manual `kubectl rollout restart` workaround, unlike Phase-01's
+# same-tag-no-diff gap with edge-gateway.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-fake
+  namespace: default
+  labels:
+    app: provider-fake
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: provider-fake
+  template:
+    metadata:
+      labels:
+        app: provider-fake
+    spec:
+      containers:
+        - name: provider-fake
+          image: onezox/provider-fake:5f9aa94790ba
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-fake
+  namespace: default
+  labels:
+    app: provider-fake
+spec:
+  selector:
+    app: provider-fake
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
