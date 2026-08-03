@@ -145,3 +145,45 @@ func TestRelayCarriesPrefixCacheHandleThrough(t *testing.T) {
 		t.Errorf("prefix_cache_handle = %q, want %q", got, "handle-123")
 	}
 }
+
+func int32Ptr(i int32) *int32 { return &i }
+
+func TestRelayCarriesUsageThroughOnlyWhenSet(t *testing.T) {
+	src := &sliceStream{deltas: []adapters.Delta{
+		{Content: strPtr("a"), InputTokens: int32Ptr(12), OutputTokens: int32Ptr(34), IsFinal: true},
+	}}
+	var sent *pb.InvokeResponse
+	err := Relay("req-1", src, func(r *pb.InvokeResponse) error {
+		sent = r
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	d := sent.GetDelta()
+	if d.InputTokens == nil || d.GetInputTokens() != 12 {
+		t.Errorf("input_tokens = %v (present=%v), want 12 (present)", d.GetInputTokens(), d.InputTokens != nil)
+	}
+	if d.OutputTokens == nil || d.GetOutputTokens() != 34 {
+		t.Errorf("output_tokens = %v (present=%v), want 34 (present)", d.GetOutputTokens(), d.OutputTokens != nil)
+	}
+}
+
+func TestRelayLeavesUsageUnsetWhenAdapterDidNotReportIt(t *testing.T) {
+	src := &sliceStream{deltas: []adapters.Delta{
+		{Content: strPtr("a"), IsFinal: true},
+	}}
+	var sent *pb.InvokeResponse
+	err := Relay("req-1", src, func(r *pb.InvokeResponse) error {
+		sent = r
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	d := sent.GetDelta()
+	if d.InputTokens != nil || d.OutputTokens != nil {
+		t.Errorf("expected usage fields unset when adapter reports none, got input=%v(present=%v) output=%v(present=%v)",
+			d.GetInputTokens(), d.InputTokens != nil, d.GetOutputTokens(), d.OutputTokens != nil)
+	}
+}

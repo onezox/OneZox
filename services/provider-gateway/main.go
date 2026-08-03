@@ -88,6 +88,12 @@ const serviceName = "provider-gateway"
 
 var tracer = otel.Tracer(serviceName)
 
+// errorFinishReason marks a synthetic best-effort final delta sent on an
+// upstream error (Step A2) — no real provider ever reports this value, so
+// its presence unambiguously tells a caller "provider-gateway injected
+// this, usage below is unset/unknown, not a genuine completion."
+var errorFinishReason = "error"
+
 var (
 	adapterCallDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "provider_gateway_adapter_call_duration_seconds",
@@ -357,6 +363,26 @@ func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer
 		streamSpan.SetStatus(codes.Error, err.Error())
 		streamSpan.End()
 		rootSpan.SetStatus(codes.Error, upstreamErr.Unwrap().Error())
+
+		// Reaching this branch means Relay never got to send a final
+		// delta (an IsFinal delta would have made Relay return nil
+		// instead) — so real usage, if any was genuinely spent before
+		// the provider connection broke, was never reported. Send one
+		// best-effort final delta with usage left UNSET (not zero) before
+		// ending the RPC, so the caller has something to anchor "usage
+		// incomplete" on rather than silently recording zero for a call
+		// that may have actually cost tokens. errorFinishReason marks it
+		// as synthetic — no real provider ever reports finish_reason
+		// "error".
+		bestEffort := &pb.InvokeResponse{Event: &pb.InvokeResponse_Delta{Delta: &pb.Delta{
+			RequestId:    req.GetRequestId(),
+			FinishReason: &errorFinishReason,
+			IsFinal:      true,
+		}}}
+		if sendErr := stream.Send(bestEffort); sendErr != nil {
+			log.Warn("failed to send best-effort final delta on upstream error", "provider", providerName, "error", sendErr)
+		}
+
 		return status.Error(grpccodes.Unavailable, upstreamErr.Unwrap().Error())
 	}
 	streamSpan.End()

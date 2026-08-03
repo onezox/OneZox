@@ -56,6 +56,12 @@ func toPbDelta(requestID string, d adapters.Delta) *pb.InvokeResponse {
 	if d.PrefixCacheHandle != nil {
 		delta.PrefixCacheHandle = d.PrefixCacheHandle
 	}
+	if d.InputTokens != nil {
+		delta.InputTokens = d.InputTokens
+	}
+	if d.OutputTokens != nil {
+		delta.OutputTokens = d.OutputTokens
+	}
 	return &pb.InvokeResponse{Event: &pb.InvokeResponse_Delta{Delta: delta}}
 }
 

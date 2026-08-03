@@ -19,6 +19,13 @@ type Delta struct {
 	FinishReason      *string
 	IsFinal           bool
 	PrefixCacheHandle *string
+	// Real token usage (Phase-03 Step A2), set only alongside IsFinal —
+	// same convention FinishReason already uses. Presence is the signal:
+	// nil means "not reported," never "zero." See provider.proto's own
+	// Delta.input_tokens/output_tokens doc comment for the full boundary
+	// (provider-gateway reports these, it never acts on them).
+	InputTokens  *int32
+	OutputTokens *int32
 }
 
 // Stream is deliberately pull-based (Recv, not a pushed channel): the
