@@ -4,9 +4,8 @@
 # testing unreliable for a cluster-aware client following MOVED redirects
 # to pod IPs the host can't reach, so a real in-cluster deployment was the
 # only reliable way to live-verify quota/breaker/coalescing as they were
-# built). Still coexists alongside provider-stub (different service
-# names, no conflict) — the cutover itself is Step K, sequenced after this
-# file's own hardening below is in place.
+# built). Cutover from provider-stub completed in Step K3 — provider-stub
+# and all its resources (Deployment, Service, mTLS policy) are gone.
 #
 # Step J3: provider-gateway-credentials mounted here, via envFrom so all
 # three key fields (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY)

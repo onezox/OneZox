@@ -35,13 +35,17 @@ server:
 # platform/operators/otel/values.yaml) — the pull side of the push/pull
 # handoff: Collector exposes /metrics, Prometheus scrapes it here.
 #
-# Also scrapes the remaining two Phase-00 stub services directly
-# (Deployment Step 7) — each exposes its own /metrics with a
-# *_boot_total counter, independent of whatever it emits via OTel — plus
-# edge-gateway's own /metrics (Phase-01 Step J2: request count, latency
-# histogram, in-flight gauge), added once it actually existed, matching
-# how this same list only grew to include the three Phase-00 stubs once
-# they existed (Phase-00 Problem #17).
+# Also scrapes the remaining Phase-00 stub service directly (Deployment
+# Step 7) — exposes its own /metrics with a *_boot_total counter,
+# independent of whatever it emits via OTel — plus edge-gateway's own
+# /metrics (Phase-01 Step J2: request count, latency histogram, in-flight
+# gauge), added once it actually existed, matching how this same list
+# only grew to include each stub once it existed (Phase-00 Problem #17).
+#
+# provider-stub's target was removed in Phase-02 Step K3 (cutover to
+# provider-gateway). provider-gateway is NOT added here yet — it has no
+# /metrics endpoint of its own until Step N (EC4 telemetry completeness),
+# same timing precedent edge-gateway itself followed in Phase-01.
 extraScrapeConfigs: |
   - job_name: 'otel-collector'
     scrape_interval: 15s
@@ -52,5 +56,4 @@ extraScrapeConfigs: |
     static_configs:
       - targets:
           - 'dataplane-stub.default.svc.cluster.local:8080'
-          - 'provider-stub.default.svc.cluster.local:8080'
           - 'edge-gateway.default.svc.cluster.local:8080'

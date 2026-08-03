@@ -51,15 +51,6 @@ spec:
         - ports:
             - port: "8080"
               protocol: TCP
-    - fromEndpoints:
-        - matchLabels:
-            app: provider-stub
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-      authentication:
-        mode: "required"
     # Phase-01 Step F2: edge-gateway's real Submit() gRPC calls (Step E3).
     # Added in the SAME commit/sync as edge-gateway's own Deployment and
     # edge-gateway-mtls policy below, so edge-gateway never has a moment
@@ -98,43 +89,6 @@ spec:
             - port: "8080"
               protocol: TCP
     - fromEndpoints:
-        - matchExpressions:
-            - key: app
-              operator: In
-              values:
-                - dataplane-stub
-                - provider-stub
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-      authentication:
-        mode: "required"
----
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: provider-stub-mtls
-  namespace: default
-spec:
-  endpointSelector:
-    matchLabels:
-      app: provider-stub
-  ingress:
-    - fromEntities:
-        - host
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-    - fromEndpoints:
-        - matchLabels:
-            app.kubernetes.io/name: prometheus
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-    - fromEndpoints:
         - matchLabels:
             app: dataplane-stub
       toPorts:
@@ -155,15 +109,22 @@ spec:
 # comment above; Cilium enforces the two directions independently, so a
 # separate CiliumNetworkPolicy object per direction is fine.
 #
-# Preserves the SAME dataplane-stub <-> provider-{stub,gateway}
-# authenticated pair provider-stub-mtls already had (not a new
-# relationship invented for this cutover) — proves the SPIRE mTLS
+# dataplane-stub -> provider-gateway (this rule) proves the SPIRE mTLS
 # mechanism genuinely works for provider-gateway specifically, the same
 # "prove the capability, not necessarily a functionally-exercised call
-# path yet" role this pair already played for provider-stub since
-# Phase-00 (no stub-to-stub RPC logic actually exists; Phase-02.txt's own
-# real caller relationship, data plane -> provider gateway, doesn't
-# arrive until Phase-03).
+# path yet" role dataplane-stub <-> provider-stub played since Phase-00
+# (no stub-to-stub RPC logic actually exists; Phase-02.txt's own real
+# caller relationship, data plane -> provider gateway, doesn't arrive
+# until Phase-03). Port here is 50051 (provider-gateway's real gRPC
+# port), not 8080 like the old stub pair used.
+#
+# The REVERSE direction the old pair also had (provider-stub calling
+# INTO dataplane-stub on 8080, in dataplane-stub-mtls) was deliberately
+# NOT recreated for provider-gateway in the K3 cleanup: that direction
+# never had a functional purpose even for the stubs (pure capability
+# proof), and inventing a new reverse relationship here would be adding
+# scope Phase-02.txt doesn't call for. One proven direction is sufficient
+# to demonstrate the mTLS capability.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
