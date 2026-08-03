@@ -284,6 +284,59 @@ RESULT: EC3 (credential isolation and egress allow-list) verified with
 adversarial, positive-controlled evidence, not passive confirmation —
 same H1 discipline Phase-01 established, applied here against the real,
 fully-hardened Phase-02 deployment.
+--------------------------------------------------------------------------------
+2026-08-03 — Step M1: fleet-wide quota cap proven under real multi-replica
+concurrency (EC2)
+--------------------------------------------------------------------------------
+The E1-E2 quota tests (unit + single-pod live) never actually
+distinguished a fleet-wide cap from a per-pod one — both look identical
+at replicas=1. M1 required proving it against real concurrency across
+multiple pods, since only that setup can expose a per-pod-counter bug.
+
+SETUP: provider-gateway scaled 1 -> 3 replicas; QUOTA_LIMIT_PER_MINUTE
+temporarily set to 30 (test-only convenience value, no real-world basis
+— reverted after the test, replicas left at 3).
+
+METHOD: port-forwarded to each of the 3 running pods individually
+(bypassing the Service's load-balanced ClusterIP, so the split across
+pods is explicit and known rather than approximate) and fired 60
+concurrent requests, 20 per pod, all within one 60s quota window
+(aligned to a fresh window boundary before starting). Each request used
+distinct message content (a per-request nonce) specifically to avoid
+Step G's own request coalescing — coalescing dedupes by
+worker_ref+messages+params, and 60 identical-content concurrent calls
+would have collapsed into a handful of actual quota-consuming calls,
+invalidating the test. worker_ref: fake:normal (provider-fake, not a
+real provider — this is load testing, not adapter verification).
+
+RESULT: 60/60 requests completed. Exactly 30 got a real Delta response
+(allowed), exactly 30 got FALLBACK_REASON_QUOTA_EXHAUSTED (throttled) —
+the configured cap exactly, not 90 (3x the cap, what a per-pod-local
+counter would have produced: each pod only received 20 requests, well
+under a hypothetical per-pod 30 limit, so a broken per-pod
+implementation would have shown 60/60 allowed with zero fallbacks).
+Per-pod breakdown (pod1: 9 allowed/11 throttled, pod2: 13/7, pod3: 8/12)
+is itself further evidence: a genuinely shared, contended counter
+produces exactly this kind of uneven, race-order-dependent split;
+independent per-pod budgets would not.
+
+CONFIRMED DIRECTLY AGAINST REDIS (not inferred from application
+behavior alone): exactly ONE key existed for the window
+(provider:fake:quota:29762330) — not three separate keys, one per pod.
+Its value was exactly 60, matching the total request count across all
+three pods combined. TTL was mid-countdown (31s remaining of the fixed
+60s window), confirming the fixed-window design is also working as
+intended. This is the literal mechanism-level proof that all three
+replicas increment the same shared counter, not the application-level
+outcome alone.
+
+Positive-control requirement satisfied as part of the same run: the cap
+WAS reachably hit (not a limit set so high it never engaged), and every
+one of the 30 over-cap requests received the correctly-typed fallback
+signal (FALLBACK_REASON_QUOTA_EXHAUSTED), not a generic error.
+
+EC2 (fan-out cap) is now verified fleet-wide under real multi-replica
+concurrency, not just single-pod.
 ================================================================================
 END OF PHASE-02-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
