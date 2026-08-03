@@ -29,12 +29,15 @@ func TestEnforceAllowsWithinLimit(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 1; i <= 3; i++ {
-		decision, err := Enforce(ctx, counter, "fake", policy)
+		decision, current, err := Enforce(ctx, counter, "fake", policy)
 		if err != nil {
 			t.Fatalf("Enforce call %d: unexpected error: %v", i, err)
 		}
 		if decision != Allow {
 			t.Errorf("Enforce call %d = %v, want Allow", i, decision)
+		}
+		if current != int64(i) {
+			t.Errorf("Enforce call %d: current = %d, want %d", i, current, i)
 		}
 	}
 }
@@ -45,17 +48,20 @@ func TestEnforceThrottlesOnceLimitExceeded(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 1; i <= 3; i++ {
-		if _, err := Enforce(ctx, counter, "fake", policy); err != nil {
+		if _, _, err := Enforce(ctx, counter, "fake", policy); err != nil {
 			t.Fatalf("Enforce call %d: unexpected error: %v", i, err)
 		}
 	}
 
-	decision, err := Enforce(ctx, counter, "fake", policy)
+	decision, current, err := Enforce(ctx, counter, "fake", policy)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if decision != Throttle {
 		t.Errorf("4th Enforce call (limit=3) = %v, want Throttle", decision)
+	}
+	if current != 4 {
+		t.Errorf("4th Enforce call: current = %d, want 4", current)
 	}
 }
 
@@ -65,12 +71,15 @@ func TestEnforceFailsOpenOnStoreError(t *testing.T) {
 	// that entirely and allow, same reasoning as edge-gateway's
 	// admission/ratelimit fail-open tests.
 	policy := Policy{Limit: 0, Window: time.Minute}
-	decision, err := Enforce(context.Background(), FailingCounter{}, "fake", policy)
+	decision, current, err := Enforce(context.Background(), FailingCounter{}, "fake", policy)
 	if err == nil {
 		t.Fatal("expected an error from FailingCounter, got nil")
 	}
 	if decision != Allow {
 		t.Errorf("Enforce with a failing store = %v, want Allow (fail open)", decision)
+	}
+	if current != 0 {
+		t.Errorf("Enforce with a failing store: current = %d, want 0 (not a trustworthy value on error)", current)
 	}
 }
 
@@ -80,10 +89,10 @@ func TestDifferentProvidersHaveIndependentWindows(t *testing.T) {
 	ctx := context.Background()
 
 	// Exhaust "openai"'s quota.
-	if _, err := Enforce(ctx, counter, "openai", policy); err != nil {
+	if _, _, err := Enforce(ctx, counter, "openai", policy); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	decision, err := Enforce(ctx, counter, "openai", policy)
+	decision, _, err := Enforce(ctx, counter, "openai", policy)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -92,7 +101,7 @@ func TestDifferentProvidersHaveIndependentWindows(t *testing.T) {
 	}
 
 	// "anthropic" must be completely unaffected.
-	decision, err = Enforce(ctx, counter, "anthropic", policy)
+	decision, _, err = Enforce(ctx, counter, "anthropic", policy)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

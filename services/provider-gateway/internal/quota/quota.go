@@ -61,15 +61,20 @@ func Decide(current int64, policy Policy) Decision {
 }
 
 // Enforce increments the fleet-wide counter for a provider's current
-// window and returns the resulting decision. Fails OPEN on a store error
-// (same reasoning as edge-gateway's ratelimit.enforce): quota is fleet
-// protection against overrunning a provider's own limits, not a security
-// boundary, and a Redis outage isn't evidence of real overload.
-func Enforce(ctx context.Context, counter Counter, provider string, policy Policy) (Decision, error) {
+// window and returns the resulting decision, plus the counter's new
+// value — Step N2 surfaces this as the quota_headroom metric
+// (policy.Limit - current) without a second Redis round-trip. Fails OPEN
+// on a store error (same reasoning as edge-gateway's ratelimit.enforce):
+// quota is fleet protection against overrunning a provider's own limits,
+// not a security boundary, and a Redis outage isn't evidence of real
+// overload. On a store error, current is 0 and must not be trusted as a
+// real headroom value — callers should skip updating any metric derived
+// from it in that case.
+func Enforce(ctx context.Context, counter Counter, provider string, policy Policy) (Decision, int64, error) {
 	key := windowKey(provider, policy.Window, time.Now())
 	current, err := counter.Increment(ctx, key, policy.Window)
 	if err != nil {
-		return Allow, err
+		return Allow, 0, err
 	}
-	return Decide(current, policy), nil
+	return Decide(current, policy), current, nil
 }

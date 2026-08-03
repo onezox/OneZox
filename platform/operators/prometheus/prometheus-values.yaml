@@ -43,9 +43,14 @@ server:
 # only grew to include each stub once it existed (Phase-00 Problem #17).
 #
 # provider-stub's target was removed in Phase-02 Step K3 (cutover to
-# provider-gateway). provider-gateway is NOT added here yet — it has no
-# /metrics endpoint of its own until Step N (EC4 telemetry completeness),
-# same timing precedent edge-gateway itself followed in Phase-01.
+# provider-gateway). provider-gateway's own /metrics HTTP handler existed
+# from Step C1 (promhttp.Handler()), but had nothing but Go runtime
+# defaults registered until Step N2 added the three provider-gateway-
+# specific series (adapter call duration, breaker state, quota headroom)
+# — correcting this comment's earlier claim that the endpoint itself was
+# "absent"; it existed, just with nothing meaningful to scrape. Added to
+# the target list below now that there's something worth scraping, same
+# timing precedent edge-gateway followed in Phase-01 (Step J2).
 extraScrapeConfigs: |
   - job_name: 'otel-collector'
     scrape_interval: 15s
@@ -57,3 +62,4 @@ extraScrapeConfigs: |
       - targets:
           - 'dataplane-stub.default.svc.cluster.local:8080'
           - 'edge-gateway.default.svc.cluster.local:8080'
+          - 'provider-gateway.default.svc.cluster.local:8080'
