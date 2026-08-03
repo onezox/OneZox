@@ -12,6 +12,16 @@
 // quota or being separately breaker-gated for work it isn't causing.
 // InvokeEmbedding and ProviderHealth stay unimplemented.
 //
+// Step J4-J6: the real openai/anthropic/google adapters register here
+// too, each only if its own API key env var is actually set (envFrom
+// mounts provider-gateway-credentials, Step J3) — a missing key means
+// that provider is simply absent from the registry, not a startup
+// failure, same "proceed with what's available" discipline used
+// elsewhere in Phase-02. All three normalize a genuinely different wire
+// format behind the same adapters.Adapter contract: OpenAI's uniform SSE
+// chunks, Anthropic's named-event stream, and Google's alt=sse variant of
+// its own contents/parts shape.
+//
 // No CockroachDB or MinIO connection, unlike provider-stub: Phase-02.txt's
 // DATABASE TABLES REQUIRED section is explicit that this phase owns no
 // relational tables.
@@ -39,7 +49,10 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters"
+	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters/anthropic"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters/fake"
+	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters/google"
+	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters/openai"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/breaker"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/coalesce"
 	pb "github.com/onezox/OneZox/services/provider-gateway/internal/pb/provider/v1"
@@ -245,7 +258,30 @@ func main() {
 	defer func() { _ = tp.Shutdown(ctx) }()
 
 	fakeBaseURL := envOr("PROVIDER_FAKE_URL", "http://provider-fake.default.svc.cluster.local:8080")
-	registry := adapters.NewRegistry(fake.New(fakeBaseURL))
+	registeredAdapters := []adapters.Adapter{fake.New(fakeBaseURL)}
+
+	// Real adapters only register if their key is actually present —
+	// "proceed with what's available" (Step J3's own scaffolding
+	// discipline), not a hard requirement that all three exist. Only
+	// presence is ever logged, never the key value itself
+	// (Phase-02.txt SECURITY IMPLEMENTATION: "never logged").
+	if os.Getenv("OPENAI_API_KEY") != "" {
+		registeredAdapters = append(registeredAdapters, openai.New(os.Getenv("OPENAI_API_KEY"), ""))
+	} else {
+		log.Warn("OPENAI_API_KEY not set, openai adapter not registered")
+	}
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		registeredAdapters = append(registeredAdapters, anthropic.New(os.Getenv("ANTHROPIC_API_KEY"), ""))
+	} else {
+		log.Warn("ANTHROPIC_API_KEY not set, anthropic adapter not registered")
+	}
+	if os.Getenv("GOOGLE_API_KEY") != "" {
+		registeredAdapters = append(registeredAdapters, google.New(os.Getenv("GOOGLE_API_KEY"), ""))
+	} else {
+		log.Warn("GOOGLE_API_KEY not set, google adapter not registered")
+	}
+
+	registry := adapters.NewRegistry(registeredAdapters...)
 
 	redisHost := envOr("REDIS_HOST", "redis-cluster-headless.default.svc.cluster.local")
 	redisClient := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{redisHost + ":6379"}})
