@@ -393,8 +393,27 @@ type Delta struct {
 	// Real KV reuse arrives with self-host in Phase-11 — this phase only
 	// plumbs the handle from adapter response to caller.
 	PrefixCacheHandle *string `protobuf:"bytes,5,opt,name=prefix_cache_handle,json=prefixCacheHandle,proto3,oneof" json:"prefix_cache_handle,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Real token usage (Phase-03 Step A: completes Phase-02.txt's own
+	// "end-to-end, metered" EC1 wording — Phase-01/02-Complete.txt both
+	// already named real metering as Phase-03's job, this is the wire
+	// plumbing that makes it possible). Set ONLY on the final delta
+	// (is_final = true), same convention finish_reason already uses.
+	// PRESENCE IS THE SIGNAL: set = a real number from the provider's own
+	// response; unset = not reported, MUST NOT be treated as zero by any
+	// caller. On an upstream/adapter error, provider-gateway sends one
+	// best-effort final delta (finish_reason = "error") with these left
+	// unset rather than silently reporting zero tokens for a call that may
+	// have genuinely spent some — callers must handle "final delta arrived
+	// with no usage" as incomplete, not as zero usage.
+	//
+	// provider-gateway's job stops at reporting these numbers accurately —
+	// it must never gain logic that ACTS on them (no token-based rate
+	// limiting, no cost-routing, no analytics; those are Dependencies.txt
+	// F2/P13, the learned router/P12-P14, and P13 respectively).
+	InputTokens   *int32 `protobuf:"varint,6,opt,name=input_tokens,json=inputTokens,proto3,oneof" json:"input_tokens,omitempty"`
+	OutputTokens  *int32 `protobuf:"varint,7,opt,name=output_tokens,json=outputTokens,proto3,oneof" json:"output_tokens,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Delta) Reset() {
@@ -460,6 +479,20 @@ func (x *Delta) GetPrefixCacheHandle() string {
 		return *x.PrefixCacheHandle
 	}
 	return ""
+}
+
+func (x *Delta) GetInputTokens() int32 {
+	if x != nil && x.InputTokens != nil {
+		return *x.InputTokens
+	}
+	return 0
+}
+
+func (x *Delta) GetOutputTokens() int32 {
+	if x != nil && x.OutputTokens != nil {
+		return *x.OutputTokens
+	}
+	return 0
 }
 
 type FallbackSignal struct {
@@ -836,18 +869,22 @@ const file_provider_v1_provider_proto_rawDesc = "" +
 	"\x0eInvokeResponse\x12*\n" +
 	"\x05delta\x18\x01 \x01(\v2\x12.provider.v1.DeltaH\x00R\x05delta\x129\n" +
 	"\bfallback\x18\x02 \x01(\v2\x1b.provider.v1.FallbackSignalH\x00R\bfallbackB\a\n" +
-	"\x05event\"\xf5\x01\n" +
+	"\x05event\"\xea\x02\n" +
 	"\x05Delta\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1d\n" +
 	"\acontent\x18\x02 \x01(\tH\x00R\acontent\x88\x01\x01\x12(\n" +
 	"\rfinish_reason\x18\x03 \x01(\tH\x01R\ffinishReason\x88\x01\x01\x12\x19\n" +
 	"\bis_final\x18\x04 \x01(\bR\aisFinal\x123\n" +
-	"\x13prefix_cache_handle\x18\x05 \x01(\tH\x02R\x11prefixCacheHandle\x88\x01\x01B\n" +
+	"\x13prefix_cache_handle\x18\x05 \x01(\tH\x02R\x11prefixCacheHandle\x88\x01\x01\x12&\n" +
+	"\finput_tokens\x18\x06 \x01(\x05H\x03R\vinputTokens\x88\x01\x01\x12(\n" +
+	"\routput_tokens\x18\a \x01(\x05H\x04R\foutputTokens\x88\x01\x01B\n" +
 	"\n" +
 	"\b_contentB\x10\n" +
 	"\x0e_finish_reasonB\x16\n" +
-	"\x14_prefix_cache_handle\"\x80\x01\n" +
+	"\x14_prefix_cache_handleB\x0f\n" +
+	"\r_input_tokensB\x10\n" +
+	"\x0e_output_tokens\"\x80\x01\n" +
 	"\x0eFallbackSignal\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1a\n" +

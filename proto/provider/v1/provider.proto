@@ -58,6 +58,25 @@ message Delta {
   // Real KV reuse arrives with self-host in Phase-11 — this phase only
   // plumbs the handle from adapter response to caller.
   optional string prefix_cache_handle = 5;
+  // Real token usage (Phase-03 Step A: completes Phase-02.txt's own
+  // "end-to-end, metered" EC1 wording — Phase-01/02-Complete.txt both
+  // already named real metering as Phase-03's job, this is the wire
+  // plumbing that makes it possible). Set ONLY on the final delta
+  // (is_final = true), same convention finish_reason already uses.
+  // PRESENCE IS THE SIGNAL: set = a real number from the provider's own
+  // response; unset = not reported, MUST NOT be treated as zero by any
+  // caller. On an upstream/adapter error, provider-gateway sends one
+  // best-effort final delta (finish_reason = "error") with these left
+  // unset rather than silently reporting zero tokens for a call that may
+  // have genuinely spent some — callers must handle "final delta arrived
+  // with no usage" as incomplete, not as zero usage.
+  //
+  // provider-gateway's job stops at reporting these numbers accurately —
+  // it must never gain logic that ACTS on them (no token-based rate
+  // limiting, no cost-routing, no analytics; those are Dependencies.txt
+  // F2/P13, the learned router/P12-P14, and P13 respectively).
+  optional int32 input_tokens = 6;
+  optional int32 output_tokens = 7;
 }
 
 enum FallbackReason {
