@@ -22,6 +22,15 @@
 # (content-addressed, not a static "phase02" string) — a rebuild changes
 # the tag, so a normal git commit + Argo sync rolls it out with no manual
 # `kubectl rollout restart` workaround.
+#
+# Step M1: replicas bumped 1 -> 3 specifically to prove the quota governor
+# is FLEET-WIDE (shared Redis counter, provider:{name}:quota:{window})
+# and not per-pod — a per-pod cap is indistinguishable from a fleet-wide
+# one in a single-replica test, so this is the first time Phase-02's own
+# multi-replica claim is actually exercised. QUOTA_LIMIT_PER_MINUTE=30 is
+# a TEST-ONLY override (main.go's own comment already notes the default
+# is an untuned placeholder, not tuned against any real provider cap) —
+# kept low purely so the cap is reachable within one test run.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,7 +39,7 @@ metadata:
   labels:
     app: provider-gateway
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: provider-gateway
@@ -46,6 +55,9 @@ spec:
           envFrom:
             - secretRef:
                 name: provider-gateway-credentials
+          env:
+            - name: QUOTA_LIMIT_PER_MINUTE
+              value: "30"
           ports:
             - containerPort: 8080
               name: http
