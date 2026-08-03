@@ -13,9 +13,12 @@ import (
 
 // A canned, real-shaped Anthropic Messages API stream: named SSE events,
 // text deltas, then message_delta carrying stop_reason, then message_stop.
+// message_start carries usage.input_tokens; message_delta carries
+// usage.output_tokens — the two halves this adapter has to reunite onto
+// one final delta.
 const cannedStream = "" +
 	"event: message_start\n" +
-	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n" +
+	"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":9}}}\n\n" +
 	"event: content_block_start\n" +
 	"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
 	"event: content_block_delta\n" +
@@ -85,12 +88,69 @@ func TestInvokeParsesCannedStreamCorrectly(t *testing.T) {
 			if d.FinishReason == nil || *d.FinishReason != "end_turn" {
 				t.Errorf("finish reason = %v, want \"end_turn\"", d.FinishReason)
 			}
+			if d.InputTokens == nil || *d.InputTokens != 9 {
+				t.Errorf("input tokens = %v, want 9 (present, from message_start)", d.InputTokens)
+			}
+			if d.OutputTokens == nil || *d.OutputTokens != 5 {
+				t.Errorf("output tokens = %v, want 5 (present, from message_delta)", d.OutputTokens)
+			}
 			break
 		}
 	}
 
 	if content != "Hello world" {
 		t.Errorf("assembled content = %q, want %q", content, "Hello world")
+	}
+	if !gotFinal {
+		t.Error("stream never produced a final delta")
+	}
+}
+
+func TestInputTokensStaysUnsetWithoutMessageStart(t *testing.T) {
+	// A malformed/truncated stream missing message_start entirely —
+	// output_tokens still arrives on message_delta, but input_tokens must
+	// stay genuinely nil (unknown), never silently 0.
+	const streamNoStart = "" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n" +
+		"event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamNoStart))
+	}))
+	defer srv.Close()
+
+	a := New("test-key", srv.URL)
+	s, err := a.Invoke(context.Background(), adapters.InvokeRequest{
+		Model:    "claude-3-5-haiku-20241022",
+		Messages: []adapters.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	var gotFinal bool
+	for {
+		d, err := s.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if d.IsFinal {
+			gotFinal = true
+			if d.InputTokens != nil {
+				t.Errorf("input tokens = %v, want nil (message_start never arrived)", *d.InputTokens)
+			}
+			if d.OutputTokens == nil || *d.OutputTokens != 3 {
+				t.Errorf("output tokens = %v, want 3 (present, from message_delta)", d.OutputTokens)
+			}
+			break
+		}
 	}
 	if !gotFinal {
 		t.Error("stream never produced a final delta")

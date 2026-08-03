@@ -7,6 +7,16 @@
 // sentinel — message_delta carries the stop_reason and is where this
 // adapter stops (IsFinal), same "don't wait for the trailing event"
 // discipline the openai adapter uses.
+//
+// Step A4 (Phase-03): real token usage. Unlike OpenAI, Anthropic splits
+// usage across two different events instead of one dedicated final chunk:
+// message_start carries usage.input_tokens (available at the very start
+// of the stream, before any content), and message_delta carries
+// usage.output_tokens (cumulative) alongside stop_reason. This adapter now
+// captures input_tokens off message_start (previously ignored entirely —
+// message_start fell into the catch-all "no data this adapter needs"
+// default branch) and attaches both to the final delta built from
+// message_delta.
 package anthropic
 
 import (
@@ -74,11 +84,26 @@ type wireContentBlockDelta struct {
 	} `json:"delta"`
 }
 
-// message_delta's data payload — carries the stop reason, not text.
+// message_start's data payload — only field this adapter needs is the
+// input token count, present from the very first event of the stream.
+type wireMessageStart struct {
+	Message struct {
+		Usage struct {
+			InputTokens int32 `json:"input_tokens"`
+		} `json:"usage"`
+	} `json:"message"`
+}
+
+// message_delta's data payload — carries the stop reason and the
+// cumulative output token count (input_tokens is NOT repeated here; it
+// only ever appears in message_start).
 type wireMessageDelta struct {
 	Delta struct {
 		StopReason *string `json:"stop_reason"`
 	} `json:"delta"`
+	Usage struct {
+		OutputTokens int32 `json:"output_tokens"`
+	} `json:"usage"`
 }
 
 type wireErrorEvent struct {
@@ -165,6 +190,9 @@ func (a *Adapter) Invoke(ctx context.Context, req adapters.InvokeRequest) (adapt
 type stream struct {
 	scanner *sse.Scanner
 	body    io.ReadCloser
+	// Captured off message_start, the very first event — held until
+	// message_delta so both usage halves land on the one final delta.
+	inputTokens *int32
 }
 
 func (s *stream) Recv() (adapters.Delta, error) {
@@ -179,6 +207,16 @@ func (s *stream) Recv() (adapters.Delta, error) {
 		}
 
 		switch ev.Name {
+		case "message_start":
+			var d wireMessageStart
+			if err := json.Unmarshal([]byte(ev.Data), &d); err != nil {
+				_ = s.body.Close()
+				return adapters.Delta{}, fmt.Errorf("anthropic adapter: decode message_start: %w", err)
+			}
+			inputTokens := d.Message.Usage.InputTokens
+			s.inputTokens = &inputTokens
+			continue
+
 		case "content_block_delta":
 			var d wireContentBlockDelta
 			if err := json.Unmarshal([]byte(ev.Data), &d); err != nil {
@@ -198,7 +236,13 @@ func (s *stream) Recv() (adapters.Delta, error) {
 				return adapters.Delta{}, fmt.Errorf("anthropic adapter: decode message_delta: %w", err)
 			}
 			_ = s.body.Close()
-			return adapters.Delta{FinishReason: d.Delta.StopReason, IsFinal: true}, nil
+			outputTokens := d.Usage.OutputTokens
+			return adapters.Delta{
+				FinishReason: d.Delta.StopReason,
+				IsFinal:      true,
+				InputTokens:  s.inputTokens,
+				OutputTokens: &outputTokens,
+			}, nil
 
 		case "error":
 			var e wireErrorEvent
@@ -207,9 +251,8 @@ func (s *stream) Recv() (adapters.Delta, error) {
 			return adapters.Delta{}, fmt.Errorf("anthropic adapter: stream error: %s", e.Error.Message)
 
 		default:
-			// message_start, content_block_start, content_block_stop,
-			// message_stop, ping — no data this adapter needs to
-			// surface. Keep reading.
+			// content_block_start, content_block_stop, message_stop,
+			// ping — no data this adapter needs to surface. Keep reading.
 			continue
 		}
 	}
