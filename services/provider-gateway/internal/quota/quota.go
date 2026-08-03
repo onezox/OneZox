@@ -42,6 +42,11 @@ type Counter interface {
 	// creating the key with the given TTL if this is the first
 	// increment observed for it.
 	Increment(ctx context.Context, key string, window time.Duration) (int64, error)
+	// Peek returns the counter's CURRENT value without incrementing it —
+	// 0 if the key doesn't exist yet (no requests this window). Step A7:
+	// ProviderHealth is a read-only status check, not an enforcement
+	// decision, so it must not consume quota just by being asked.
+	Peek(ctx context.Context, key string) (int64, error)
 }
 
 // windowKey buckets `now` into a fixed window and builds the Redis key
@@ -77,4 +82,29 @@ func Enforce(ctx context.Context, counter Counter, provider string, policy Polic
 		return Allow, 0, err
 	}
 	return Decide(current, policy), current, nil
+}
+
+// Headroom reports the fraction of a provider's fleet-wide quota window
+// remaining, [0.0, 1.0], WITHOUT incrementing the counter (Peek, not
+// Increment) — for ProviderHealth (Step A7), a status read, not an
+// admission decision. A non-positive Limit reports 0 headroom rather than
+// dividing by zero.
+func Headroom(ctx context.Context, counter Counter, provider string, policy Policy) (float64, error) {
+	key := windowKey(provider, policy.Window, time.Now())
+	current, err := counter.Peek(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	if policy.Limit <= 0 {
+		return 0, nil
+	}
+	remaining := policy.Limit - current
+	if remaining < 0 {
+		remaining = 0
+	}
+	headroom := float64(remaining) / float64(policy.Limit)
+	if headroom > 1.0 {
+		headroom = 1.0
+	}
+	return headroom, nil
 }

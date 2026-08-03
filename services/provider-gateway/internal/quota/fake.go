@@ -25,9 +25,19 @@ func (f *FakeCounter) Increment(ctx context.Context, key string, window time.Dur
 	return f.counts[key], nil
 }
 
+func (f *FakeCounter) Peek(ctx context.Context, key string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.counts[key], nil // zero value if absent — correctly "no requests yet"
+}
+
 // FailingCounter always errors, for exercising Enforce's fail-open path.
 type FailingCounter struct{}
 
 func (FailingCounter) Increment(ctx context.Context, key string, window time.Duration) (int64, error) {
+	return 0, errors.New("simulated outage")
+}
+
+func (FailingCounter) Peek(ctx context.Context, key string) (int64, error) {
 	return 0, errors.New("simulated outage")
 }

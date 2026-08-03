@@ -2,6 +2,7 @@ package quota
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -35,6 +36,20 @@ func (r *RedisCounter) Increment(ctx context.Context, key string, window time.Du
 			// failing the whole request over.
 			r.log.Warn("quota: failed to set window TTL", "key", key, "error", err)
 		}
+	}
+	return val, nil
+}
+
+// Peek reads the counter's current value without incrementing it. A
+// missing key (redis.Nil — no requests in this window yet) is 0, not an
+// error: that's a legitimate, common state, not a failure.
+func (r *RedisCounter) Peek(ctx context.Context, key string) (int64, error) {
+	val, err := r.client.Get(ctx, key).Int64()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return 0, nil
+		}
+		return 0, err
 	}
 	return val, nil
 }

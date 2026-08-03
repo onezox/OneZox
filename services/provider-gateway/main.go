@@ -420,6 +420,59 @@ func breakerDecisionToStateValue(d breaker.Decision) float64 {
 	}
 }
 
+// ProviderHealth reports each provider's breaker state and quota headroom
+// (Step A7) — declared in Phase-02.txt's own APIS CREATED section
+// ("feeds scheduler") and left Unimplemented since no consumer existed
+// yet. Phase-03's scheduler is that first consumer; this completes the
+// contract at that point, per the same "defined here, wired when
+// consumed" pattern already used for real token usage (Step A1-A6). A
+// pure status READ, not a decision: it never increments quota (Peek, not
+// Increment) and never trips or resets the breaker.
+func (s *server) ProviderHealth(ctx context.Context, req *pb.ProviderHealthRequest) (*pb.ProviderHealthResponse, error) {
+	names := s.registry.Names()
+	if p := req.GetProvider(); p != "" {
+		names = []string{p}
+	}
+
+	statuses := make([]*pb.ProviderStatus, 0, len(names))
+	for _, name := range names {
+		state, err := breaker.CurrentState(ctx, s.breakerStore, name, s.breakerConfig)
+		if err != nil {
+			// Same fail-open reasoning used throughout this service:
+			// absence of data isn't evidence the breaker is tripped.
+			s.log.Warn("ProviderHealth: breaker state check failed, reporting closed", "provider", name, "error", err)
+			state = breaker.Closed
+		}
+
+		headroom, err := quota.Headroom(ctx, s.quotaCounter, name, s.quotaPolicy)
+		if err != nil {
+			s.log.Warn("ProviderHealth: quota headroom check failed, reporting full headroom", "provider", name, "error", err)
+			headroom = 1.0
+		}
+
+		statuses = append(statuses, &pb.ProviderStatus{
+			Provider:      name,
+			BreakerState:  breakerStateToPb(state),
+			QuotaHeadroom: float32(headroom),
+		})
+	}
+
+	return &pb.ProviderHealthResponse{Statuses: statuses}, nil
+}
+
+func breakerStateToPb(s breaker.State) pb.BreakerState {
+	switch s {
+	case breaker.Closed:
+		return pb.BreakerState_BREAKER_STATE_CLOSED
+	case breaker.HalfOpen:
+		return pb.BreakerState_BREAKER_STATE_HALF_OPEN
+	case breaker.Open:
+		return pb.BreakerState_BREAKER_STATE_OPEN
+	default:
+		return pb.BreakerState_BREAKER_STATE_UNSPECIFIED
+	}
+}
+
 func main() {
 	handler := slog.NewJSONHandler(os.Stdout, nil)
 	log := slog.New(handler).With("service", serviceName)

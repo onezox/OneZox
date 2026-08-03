@@ -127,3 +127,58 @@ func TestWindowKeyBucketsByFixedWindow(t *testing.T) {
 		t.Errorf("different-window instants produced the same key: %q", k0)
 	}
 }
+
+func TestHeadroomReflectsCurrentUsageWithoutConsumingIt(t *testing.T) {
+	counter := NewFakeCounter()
+	policy := Policy{Limit: 4, Window: time.Minute}
+	ctx := context.Background()
+
+	// Peek before any Enforce call: full headroom, no key created.
+	h, err := Headroom(ctx, counter, "fake", policy)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if h != 1.0 {
+		t.Errorf("headroom before any use = %v, want 1.0", h)
+	}
+
+	// Two real requests.
+	if _, _, err := Enforce(ctx, counter, "fake", policy); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, _, err := Enforce(ctx, counter, "fake", policy); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Peek repeatedly — must not itself consume quota.
+	for i := 0; i < 3; i++ {
+		h, err = Headroom(ctx, counter, "fake", policy)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if h != 0.5 {
+			t.Errorf("headroom after 2/4 used (peek %d) = %v, want 0.5", i, h)
+		}
+	}
+
+	// A 3rd real Enforce call must still see exactly 3, not inflated by
+	// any of the Peek calls above.
+	_, current, err := Enforce(ctx, counter, "fake", policy)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if current != 3 {
+		t.Errorf("current after 3 Enforce calls = %d, want 3 (Peek must not have incremented anything)", current)
+	}
+}
+
+func TestHeadroomFailsOpenOnStoreError(t *testing.T) {
+	policy := Policy{Limit: 4, Window: time.Minute}
+	h, err := Headroom(context.Background(), FailingCounter{}, "fake", policy)
+	if err == nil {
+		t.Fatal("expected an error from FailingCounter, got nil")
+	}
+	if h != 0 {
+		t.Errorf("Headroom with a failing store = %v, want 0 (not a trustworthy value on error)", h)
+	}
+}

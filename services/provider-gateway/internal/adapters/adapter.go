@@ -96,6 +96,17 @@ func (e ErrUnknownProvider) Error() string {
 	return fmt.Sprintf("no adapter registered for provider %q", e.Provider)
 }
 
+// Names returns every registered provider name, order not significant —
+// ProviderHealth (Step A7) uses this to report on "every known provider"
+// when the caller doesn't ask for one specifically.
+func (r *Registry) Names() []string {
+	names := make([]string, 0, len(r.adapters))
+	for name := range r.adapters {
+		names = append(names, name)
+	}
+	return names
+}
+
 func (r *Registry) Lookup(provider string) (Adapter, error) {
 	a, ok := r.adapters[provider]
 	if !ok {
