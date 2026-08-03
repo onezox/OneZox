@@ -1,12 +1,16 @@
-# Cilium mTLS enforcement between edge-gateway (Phase-01) and the two
-# remaining Phase-00 stubs (dataplane-stub, provider-stub).
+# Cilium mTLS enforcement between edge-gateway (Phase-01), provider-gateway
+# (Phase-02), and dataplane-stub (still Phase-00/01, real replacement
+# arrives in Phase-03).
 #
 # Completes the last Phase-00 acceptance item: SPIRE (Step 9) installed the
 # mTLS *capability* only, deliberately not enforced at the time, pending
 # real services to enforce it between. edge-stub-mtls (the third original
 # Phase-00 policy) was removed in Phase-01 Step F3 once edge-gateway-mtls
 # below was confirmed healthy — edge-stub itself was removed in the same
-# cutover, replaced by edge-gateway.
+# cutover, replaced by edge-gateway. provider-stub-mtls was removed the
+# same way in Phase-02 Step K3, once provider-gateway-mtls below was
+# confirmed healthy — provider-stub itself removed in that same cutover,
+# replaced by provider-gateway.
 #
 # Design constraint that shaped every rule below: adding ANY ingress rule
 # to a CiliumNetworkPolicy switches that endpoint's ingress to default-deny
@@ -136,6 +140,65 @@ spec:
       toPorts:
         - ports:
             - port: "8080"
+              protocol: TCP
+      authentication:
+        mode: "required"
+---
+# Phase-02 Step K3: provider-gateway's own mTLS ingress policy, added and
+# verified healthy BEFORE provider-stub-mtls/provider-stub's Deployment
+# are removed in a later, separate commit — no window where
+# provider-gateway is deployed but has no mesh identity, same
+# mesh-identity-safe sequencing Phase-01 Step F2 used for edge-gateway.
+#
+# No egress rules here (those are provider-gateway/egress-policy.yaml,
+# Step J1) — this file is ingress-only by convention, matching the header
+# comment above; Cilium enforces the two directions independently, so a
+# separate CiliumNetworkPolicy object per direction is fine.
+#
+# Preserves the SAME dataplane-stub <-> provider-{stub,gateway}
+# authenticated pair provider-stub-mtls already had (not a new
+# relationship invented for this cutover) — proves the SPIRE mTLS
+# mechanism genuinely works for provider-gateway specifically, the same
+# "prove the capability, not necessarily a functionally-exercised call
+# path yet" role this pair already played for provider-stub since
+# Phase-00 (no stub-to-stub RPC logic actually exists; Phase-02.txt's own
+# real caller relationship, data plane -> provider gateway, doesn't
+# arrive until Phase-03).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: provider-gateway-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: provider-gateway
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+            # kubectl port-forward (used throughout Phase-02 for
+            # host-based live verification, same as dataplane-stub-mtls's
+            # own justification) authenticates as "host", not as any
+            # peer's own SPIRE identity.
+            - port: "50051"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app: dataplane-stub
+      toPorts:
+        - ports:
+            - port: "50051"
               protocol: TCP
       authentication:
         mode: "required"
