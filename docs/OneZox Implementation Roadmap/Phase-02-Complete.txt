@@ -1,0 +1,606 @@
+================================================================================
+PHASE-02 — PROVIDER GATEWAY — COMPLETION RECORD
+================================================================================
+This document records the work actually completed for Phase-02 on the local
+onezox-dev Kubernetes cluster (kind, WSL2 Ubuntu 24.04). It contains only
+work that was performed and verified. It does not contain Phase-03 work,
+future plans, recommendations, or opinions. Phase-02-Progress.txt remains
+the point-in-time findings record (drift, process gaps); this document is
+the completion summary, in the same style as Phase-00-Complete.txt and
+Phase-01-Complete.txt.
+
+--------------------------------------------------------------------------------
+PHASE-02 OBJECTIVE
+--------------------------------------------------------------------------------
+Replace the throwaway Phase-00 provider-stub with a dedicated Go service that
+owns all provider concerns: adapters for OpenAI/Anthropic/Google behind one
+internal contract, a fleet-wide quota governor (shared Redis counters, not
+per-pod), per-provider circuit breakers with typed fallback signaling, request
+coalescing, streaming passthrough with backpressure, and prefix-cache handle
+passthrough. Called by the data plane over gRPC in the real architecture;
+Phase-03 does not exist yet, so a test harness (grpcurl, plus a purpose-built
+provider-fake service) drove it directly throughout.
+
+One ordering decision was made before any real credential touched the
+service, at the user's explicit direction: security scaffolding had to be
+real and verified BEFORE any real provider API key entered a running pod.
+Egress default-deny + allow-list was built and verified in BOTH directions
+first; only then was the credential Secret created; only then was it mounted;
+only then did the mTLS cutover happen; only then did real provider calls run.
+This is why the phase's own step lettering (J1 through N3) does not run in a
+flat A-Z order — J's sub-steps are interleaved with K3's mTLS cutover by
+design, not by accident.
+
+--------------------------------------------------------------------------------
+BUILD SEQUENCE (IN ORDER)
+--------------------------------------------------------------------------------
+A. proto/provider finalized (Invoke / InvokeEmbedding / ProviderHealth);
+   provider-gateway's Go module skeleton and gRPC server stub built.
+B. TLS-interception diagnostic run from an unrestricted debug pod against all
+   three real provider hosts (api.openai.com, api.anthropic.com,
+   generativelanguage.googleapis.com) — this network has a confirmed
+   TLS-intercepting proxy (Phase-00, broke cosign's Rekor upload) that had to
+   be ruled out as a hazard before any real adapter work began, not
+   discovered mid-test later. Came back clean for all three hosts.
+C. provider-gateway HTTP/gRPC server skeleton, health/ready endpoints.
+D. provider-fake: a controllable stand-in provider (fail/slow/normal modes on
+   command) built specifically because a real provider can't be made to fail
+   or exhaust quota on demand, and hammering one to find out costs money. The
+   fake adapter and the full worker_ref -> registry -> adapter -> stream
+   pipeline wired end-to-end against it.
+E. Fleet-wide quota governor: shared Redis counter
+   (provider:{name}:quota:{window}), fixed-window, unit-tested and live-
+   verified single-pod before Step M1 later proved it fleet-wide.
+F. Per-provider circuit breaker (provider:{name}:breaker), Closed/HalfOpen/
+   Open with a typed fallback signal on Deny, unit-tested and live-verified
+   against provider-fake's fail mode. (A timestamp-truncation bug found and
+   fixed during this step — see PROBLEMS ENCOUNTERED.)
+G. Request coalescing: identical concurrent calls (same worker_ref/messages/
+   params) join an already-in-flight one instead of independently consuming
+   quota or being separately breaker-gated.
+H. Streaming passthrough with real backpressure (pull-based Recv, no manual
+   buffering) and live-verified mid-stream disconnect behavior — found to be
+   bounded, not immediate, a deliberate consequence of coalescing's
+   context.WithoutCancel design, not a leak (Phase-02-Progress.txt).
+I. Prefix-cache handle passthrough — the provider's own prompt-cache token
+   surfaced through Delta.PrefixCacheHandle end-to-end to the caller.
+J1-J2. Egress CiliumNetworkPolicy: default-deny with an allow-list for the
+   three provider hosts. Verified BOTH directions before anything else in the
+   hardening sequence proceeded — an approved host reachable, and (the test
+   that actually matters) an arbitrary non-allow-listed host refused.
+J3. The credential Secret: an interactive helper script
+   (scripts/create-provider-secret.sh) created for the user to run themselves
+   — hidden input, --from-file only, temp files shredded on exit, keys never
+   touch shell history or this session's transcript. Mounted to
+   provider-gateway only, via envFrom. Isolation verified as two separate
+   questions, not one: no other pod's spec references the Secret (mount
+   check), AND no other ServiceAccount can read it via the K8s API regardless
+   of mounting (RBAC check) — the RBAC check found a real, unrelated gap (see
+   PROBLEMS ENCOUNTERED) and closed it before this step was considered done.
+K3. mTLS cutover from provider-stub to provider-gateway, mesh-identity-safe
+   sequencing (same pattern Phase-01 Step F2 used): provider-gateway-mtls
+   added and confirmed VALID:true with a live SPIRE-authenticated connection
+   BEFORE provider-stub-mtls and provider-stub itself were removed, in two
+   separate commits. Cleanup completeness matched Phase-01 F3: Deployment,
+   Service, policy, source tree, go.work entry, CI matrix entry, and stale
+   Prometheus scrape target all removed.
+J4-J6. The real openai/anthropic/google adapters — built from scratch (only
+   the fake adapter existed before this step), unit-tested against canned
+   real-shaped SSE payloads first, then exactly one real streamed call per
+   provider. Full result in EXIT CRITERIA EVIDENCE below (EC1).
+J7. Azure/Bedrock/self-host(vllm) adapters scaffolded per Phase-02.txt's own
+   folder structure — each compiles and satisfies the Adapter contract, each
+   returns a typed ErrNotImplemented, none registered in the live registry.
+L1-L2. Adversarial security tests against the fully-hardened, real-key-
+   bearing deployment: credential-leak grep (positive-controlled — proven
+   capable of finding a planted fake secret before trusting a clean result on
+   the real keys) and egress-block (positive control reaches an allow-listed
+   host, negative test confirmed as a genuine kernel-level Cilium drop, not
+   an inferred timeout).
+M1. Fleet-wide fan-out cap proven under real multi-replica concurrency —
+   scaled to 3 replicas specifically because a per-pod cap is
+   indistinguishable from a fleet-wide one at replicas=1. Full result in EC2
+   below.
+N1-N3. Telemetry completeness, treated as verification, not rubber-stamping
+   — starting state was zero spans anywhere in the code, an empty /metrics
+   endpoint, and no success-path logging, the exact same class of gaps
+   Phase-01's edge-gateway had before its own J1-J3 fixes, inherited fresh
+   here because this is a different service in a different language. Full
+   result in EC4 below.
+O. Close-out: this document, plus a fresh mTLS proof captured after every
+   other step above, not reused from K3.
+
+--------------------------------------------------------------------------------
+PROVIDER-GATEWAY SERVICE
+--------------------------------------------------------------------------------
+services/provider-gateway — Go 1.26, google.golang.org/grpc, prometheus/
+client_golang, go.opentelemetry.io/otel. 3,433 lines of non-test Go across
+main.go plus internal/{adapters,quota,breaker,coalesce,stream}. 42 unit tests
+passing across the module (adapters/openai, adapters/anthropic,
+adapters/google, adapters/sse, adapters/azure, adapters/bedrock,
+adapters/vllm, quota, breaker, coalesce, stream), zero skipped.
+
+internal/adapters: the shared Adapter/Stream/Registry contract (Part G.1),
+plus per-provider packages — fake (test harness only), openai (uniform SSE
+chunks, Bearer auth), anthropic (named-event SSE, x-api-key +
+anthropic-version headers, system-message hoisting), google (Gemini's
+?alt=sse streamGenerateContent variant chosen specifically so it could reuse
+the same SSE scanner as the other two; contents/parts shape, role mapping,
+x-goog-api-key header so the key never lands in a URL any proxy might log),
+and three unwired scaffolds (azure, bedrock, vllm). internal/adapters/sse is
+a small shared SSE line-scanner used by all three real adapters — the
+per-provider JSON payload shape stays in each adapter's own package.
+internal/quota: fleet-wide Redis counter governor. internal/breaker:
+fleet-wide Redis circuit breaker with a CurrentState reader built for
+ProviderHealth. internal/coalesce: in-flight call dedup, per-pod/in-memory by
+design (Phase-02.txt lists no coalesce Redis key). internal/stream: the
+gRPC-facing relay translating adapter deltas and fallback signals.
+
+Prefix-cache handle passthrough (Part P) is implemented inline as
+adapters.Delta.PrefixCacheHandle, carried through relay.Relay to the proto
+response, rather than as a separate internal/prefixcache/ package —
+Phase-02.txt's own folder structure lists prefixcache/ as a named module;
+this is a minor structural deviation from that listing, noted here rather
+than left implicit, though the passthrough itself is fully implemented and
+verified (Step I1, and visible in every real Invoke response's
+prefix_cache_handle field).
+
+InvokeEmbedding and ProviderHealth remain unimplemented (return
+codes.Unimplemented via the embedded UnimplementedProviderServiceServer) —
+Phase-02.txt's own APIS CREATED section marks these "used from Phase-10" and
+"feeds scheduler" respectively, so this is expected non-scope, not a gap
+against this phase's four exit criteria.
+
+Database tables: none owned by this phase, per Phase-02.txt's own DATABASE
+TABLES REQUIRED section — confirmed, no CockroachDB or MinIO connection
+anywhere in the service. Redis keys (ephemeral): provider:{name}:quota:
+{window} and provider:{name}:breaker, exactly as specified.
+
+--------------------------------------------------------------------------------
+DOCKER IMAGE AND DEPLOYMENT
+--------------------------------------------------------------------------------
+onezox/provider-gateway — content-addressed tags (git commit short-SHA),
+chosen from the very first deployment specifically to avoid Phase-01's
+same-tag-no-diff manual rollout-restart workaround. Rebuilt and reloaded
+across the phase as the service grew; current running tag 22e8836a576f
+(Steps N1-N3: span tree, metrics, success log). Built with the same
+`--provenance=false --sbom=false` flags established in Phase-00/01, loaded
+into all three onezox-dev kind nodes via `kind load docker-image`.
+
+Deployed via the existing "onezox-stubs" Argo CD Application
+(platform/stubs/provider-gateway/), never applied directly with kubectl.
+Confirmed Synced/Healthy after every deploy this phase, most recently at
+commit 2b36d18.
+
+Originally brought forward as a PRELIMINARY deployment (Step E2 prep) — a
+real in-cluster deployment was the only reliable way to live-verify quota/
+breaker/coalescing against Redis Cluster's multi-shard topology, which
+host-side port-forward can't follow MOVED redirects to pod IPs for. The
+preliminary deployment BECAME the hardened one at Steps J/K, per the ordering
+decision in PHASE-02 OBJECTIVE above — nothing preliminary remains: real
+provider keys live only in the scoped provider-gateway-credentials Secret,
+egress is default-deny with an allow-list (verified both directions,
+re-verified post-hardening), mTLS is a genuine SPIRE-authenticated pair (see
+MTLS VERIFICATION below, freshly captured at close-out), and provider-stub —
+Deployment, Service, mTLS policy, source tree, go.work entry, CI matrix
+entry, Prometheus scrape target — is confirmed fully pruned (checked live at
+the time of writing this document: `kubectl get deployment,svc,pods -l
+app=provider-stub` returns nothing in the default namespace).
+
+replicas: 3 (Step M1's scale-up, kept afterward as a more representative
+fleet state — see COMPLETION CHECKLIST's HPA note below for what this does
+and does not cover).
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST (Phase-02.txt's own seven items, with evidence)
+--------------------------------------------------------------------------------
+[x] OpenAI/Anthropic/Google adapters normalized behind one contract.
+    All three implement adapters.Adapter, unit-tested against canned
+    real-shaped SSE payloads (openai_test.go, anthropic_test.go,
+    google_test.go). Real-API verification is 2/3 complete — see EC1 below,
+    marked PARTIALLY MET, not flattened into this checkbox.
+
+[x] Fleet-wide quota governor enforced via shared Redis counters.
+    See EC2 below — proven fleet-wide under real 3-replica concurrency, not
+    just single-pod.
+
+[x] Circuit breakers with fallback signaling.
+    Unit-tested (Closed -> Open on threshold, Open -> HalfOpen after
+    OpenDuration, HalfOpen trial -> Closed/Open) and live-verified against
+    provider-fake's fail mode, producing FALLBACK_REASON_BREAKER_OPEN.
+
+[x] Request coalescing.
+    Unit-tested (concurrent identical calls join one leader; a distinct
+    call does not coalesce) and live-verified. Also load-bearing
+    infrastructure for Step M1's test design: 60 concurrent DISTINCT
+    (nonce'd) requests were required specifically to avoid coalescing
+    collapsing them into a handful of actual quota-consuming calls.
+
+[x] Streaming passthrough with backpressure.
+    Pull-based Recv, no manual buffering (Step H). Mid-stream disconnect
+    cleanup confirmed bounded-not-immediate, a deliberate consequence of
+    coalescing's design, not a leak (Phase-02-Progress.txt, Step H2 entry).
+
+[x] Prefix-cache handle surfaced.
+    adapters.Delta.PrefixCacheHandle end-to-end to the caller — visible on
+    every real Invoke response's is_final chunk (e.g.
+    "fake-cache-<request_id>" in every fake:normal test call this phase).
+
+[x] Credentials isolated to the gateway; egress allow-list enforced.
+    See EC3 below.
+
+Also from Phase-02.txt's INFRASTRUCTURE REQUIRED section:
+[ ] Basic HPA — NOT ACTUALLY CONFIGURED THIS PHASE. Phase-02.txt's
+    INFRASTRUCTURE REQUIRED line calls for "basic HPA now" (token-aware
+    KEDA + fleet governor deferred to Phase-13 per Dependencies.txt F2).
+    No HorizontalPodAutoscaler resource was created; replicas were scaled
+    manually to 3 for Step M1's fan-out test and left there as a static
+    count. Not gated by any of Phase-02.txt's 5 DEPLOYMENT STEPS or its 4
+    EXIT CRITERIA, so it did not block completion — but it is a real,
+    undone item, stated plainly here rather than implied as done by
+    proximity to the replicas=3 change.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA — EVIDENCE
+--------------------------------------------------------------------------------
+1. Streamed completion from a real provider via Invoke, end-to-end, metered.
+   ---- PARTIALLY MET (2 of 3 providers fully verified against the real API;
+   Google's content-delta path is not) ----
+
+   OpenAI (gpt-4o-mini): FULLY MET. Content streamed as three deltas
+   ("ack"+"now"+"ledged" -> "acknowledged"), then finish_reason="stop",
+   is_final=true. Uniform SSE-chunk wire format parsed correctly end-to-end,
+   adapter -> relay -> caller.
+
+   Anthropic (claude-haiku-4-5-20251001, after an outdated model ID 404'd
+   cleanly at zero cost): FULLY MET. Content delta "acknowledged", then
+   finish_reason="end_turn" (decoded from the message_delta named event),
+   is_final=true. Named-event SSE stream (message_start/
+   content_block_delta/message_delta/message_stop) parsed correctly.
+
+   Google (Gemini): PARTIALLY MET. Reachability, auth, egress, and TLS are
+   all clean — every attempt against the real endpoint returned well-formed
+   JSON, including its errors, ruling out the known TLS-intercepting-proxy
+   hazard entirely. The finish-signal SSE parse path is proven against a
+   genuine real response (finish_reason="MAX_TOKENS", is_final=true,
+   correctly decoded from a real payload where the model's whole token
+   budget was consumed by internal reasoning before any visible output).
+   The CONTENT-DELTA parse path (candidates[].content.parts[].text) was
+   NEVER exercised against real Gemini: every attempt that would have
+   returned visible text hit a clean 429 RESOURCE_EXHAUSTED — this key's
+   Google Cloud project has generate_content quota=0 on the free tier, an
+   account/billing constraint, not a code or infrastructure defect. Tracked
+   as an open forward reference — see DEFERRALS below and Dependencies.txt
+   row F13. THIS ROW IS NOT FLATTENED TO "MET" ANYWHERE IN THIS DOCUMENT.
+
+2. Breaker + fallback signal + fleet-wide quota all demonstrated under fault
+   injection (against the fake provider).
+   Breaker: unit + live verification against provider-fake's fail mode,
+   producing FALLBACK_REASON_BREAKER_OPEN (Step F).
+   Fleet-wide quota (Step M1): scaled to 3 replicas — a per-pod cap is
+   indistinguishable from a fleet-wide one at replicas=1, so this is the
+   first test that could actually have caught a per-pod-counter bug. 60
+   concurrent DISTINCT requests (nonce'd to defeat coalescing), 20 fired at
+   each of the 3 pods' own individually port-forwarded ports, all within
+   one 60s quota window. Result: exactly 30 allowed / 30
+   FALLBACK_REASON_QUOTA_EXHAUSTED — the configured cap exactly, not 90 (3x
+   it, what a per-pod-local counter would have produced, since each pod
+   only received 20 requests, under any hypothetical per-pod 30 limit).
+   Per-pod split was uneven (9/11, 13/7, 8/12) — itself further evidence of
+   genuine cross-pod contention on one counter, not independent budgets.
+   CONFIRMED DIRECTLY AGAINST REDIS, not inferred from application behavior
+   alone: exactly ONE key existed for the window
+   (provider:fake:quota:29762330), value exactly 60 — not three separate
+   per-pod keys. TTL mid-countdown, confirming the fixed-window design.
+
+3. Credential isolation and egress allow-list verified.
+   Credential isolation (Step J3): checked as two separate questions — no
+   other pod's spec mounts the Secret (59 pods scanned, exactly one
+   reference: provider-gateway itself), AND no other ServiceAccount can
+   read it via the K8s API regardless of mounting. The second check found a
+   real, pre-existing, unrelated gap: loki-clusterrole granted cluster-wide
+   get/watch/list on ALL secrets and configmaps (a Loki Helm chart default,
+   sidecar.rules.enabled, for a rule-auto-discovery feature nothing in this
+   cluster uses). Confirmed genuinely exploitable, not theoretical: a token
+   minted for the `loki` ServiceAccount successfully read
+   provider-gateway-credentials via the K8s API (HTTP 200, all three real
+   key field names present) before the fix. Fixed via
+   platform/operators/loki/loki-values.yaml (sidecar.rules.enabled: false),
+   applied via `helm upgrade` directly (the established operator-config
+   exception, same as Prometheus). Re-verified: the same token now gets
+   HTTP 403; Loki itself re-confirmed still fully functional (ingestion AND
+   Grafana-proxied query) after the fix, not just that the permission was
+   removed.
+   L1 (credential-leak, positive-controlled, run twice — once at Step L1
+   and again after Step N3 added a new log surface): planted a fake
+   secret-shaped value first and confirmed grep finds it, THEN grepped both
+   kubectl logs (all pods) and Loki's durable store for all three real key
+   values, in both bare and "Bearer <key>" concatenated form. Zero matches,
+   both times.
+   Egress (Steps J1-J2, re-verified as L2 against the fully-hardened
+   deployment): positive control confirmed the pod reaches api.openai.com
+   (HTTP 401 on a deliberately wrong token, TCP+TLS+DNS all working,
+   ~99ms). Negative test to example.com timed out, and this was not merely
+   trusted as a timeout — a live `cilium-dbg monitor -t drop` capture
+   showed a genuine kernel-level "Policy denied" drop for
+   provider-gateway's own Cilium identity (47734) against both of
+   example.com's resolved IPs, at bpf_lxc.c:1651.
+
+4. Gateway telemetry (per-provider latency, breaker state, headroom)
+   visible.
+   Starting state (confirmed before building anything, Steps N1-N3): zero
+   spans anywhere in the code (the TracerProvider was initialized but
+   nothing ever called tracer.Start); /metrics existed since Step C1 but
+   had zero provider-gateway-specific series, only Go runtime defaults;
+   zero log lines on any successful request. All three closed:
+   Span tree: root span "provider_gateway.invoke" with coalesce/quota/
+   breaker/adapter/stream as five DIRECT children (a flat tree, matching
+   Phase-02.txt's own module list). Verified in Tempo against one real
+   request: exactly 6 spans, and parentSpanId was checked EXPLICITLY on
+   every single span (not inferred from the count) — all five stages
+   parent directly to the root, no orphans, no unexpected nesting.
+   Metrics: provider_gateway_adapter_call_duration_seconds (histogram, by
+   provider+outcome), provider_gateway_breaker_state (gauge, 0/1/2, set
+   only from a live breaker.Check decision), provider_gateway_quota_
+   headroom (gauge, limit-current, floored at 0). VALUES checked, not just
+   endpoint 200: the raw scrape showed adapter duration sum=0.006000932s
+   count=1 (matches the trace's adapter span, 6000.4us, almost exactly),
+   breaker_state=0 (matches the trace's "allow" decision), headroom=59
+   (60-limit fresh window minus the one test request) — then re-confirmed
+   the same three values through Prometheus's own query API, target
+   reporting health="up".
+   Success-path log: one line, "request completed" — request_id (already
+   attached), worker_ref, provider, outcome, finish_reason. Re-verified
+   leak-free using L1's exact methodology against all three replicas
+   running the new code — zero key matches.
+
+--------------------------------------------------------------------------------
+MTLS VERIFICATION (fresh capture, Step O, post everything else)
+--------------------------------------------------------------------------------
+Captured after every other step in this document, not reused from Step K3's
+own capture (which is now well over an hour stale relative to this record):
+
+  $ cilium-dbg bpf auth list
+  SRC IDENTITY   DST IDENTITY   REMOTE NODE ID   AUTH TYPE   EXPIRATION
+  47734          63524          0                spire       2026-08-03 07:53:38 +0000 UTC
+
+Identity 47734 resolves to k8s:app=provider-gateway and identity 63524
+resolves to k8s:app=dataplane-stub (confirmed via `cilium-dbg identity
+list`), namespace default, onezox-dev cluster. Captured at 2026-08-03
+07:20:09 UTC — the listed expiration is approximately 33 minutes in the
+future at capture time, confirming this is a live, currently-valid
+authenticated pair, not an expired or cached entry. Triggered by a fresh
+raw-socket connection from dataplane-stub to
+provider-gateway.default.svc.cluster.local:50051, the same proof mechanism
+used throughout Phase-01 and earlier in this phase.
+
+--------------------------------------------------------------------------------
+PROBLEMS ENCOUNTERED DURING PHASE-02 AND HOW EACH WAS RESOLVED
+--------------------------------------------------------------------------------
+1. Circuit breaker (Step F): OpenedAt originally used time.Now().Unix()
+   (whole-second truncation), causing sub-second OpenDuration test values to
+   always compare as already-elapsed (an Open breaker would immediately
+   read back as HalfOpen in any test running faster than 1 second).
+   Resolution: switched to UnixMilli() throughout the breaker package.
+
+2. Loki cluster-wide secrets-read RBAC gap (Step J3): see EC3 above for the
+   full account. Root cause was a Helm chart default
+   (sidecar.rules.enabled: true) enabling a rule-auto-discovery feature
+   nothing in this cluster uses; fixed by disabling it, not by hand-patching
+   the generated ClusterRole (which would have drifted back on the next
+   Helm upgrade). A broader sweep of every other ClusterRole with any
+   secrets-read grant (argocd-*, cilium-operator, cockroach-operator-role)
+   found all of them to be legitimate, actively-required control-plane
+   permissions — left alone, deliberately, not overlooked.
+
+3. Ephemeral debug containers (kubectl debug --target=X) do not
+   automatically inherit the target container's volume mounts, specifically
+   the projected service-account-token — discovered while first trying to
+   test Loki's own RBAC exposure by attaching a debug container and reading
+   the token file directly (got "No such file or directory", and a
+   subsequent unauthenticated curl's 403 was not a genuine test of Loki's
+   permissions at all). Resolution: switched methodology entirely — used
+   `kubectl create token loki --duration=10m` to mint a token genuinely
+   bound to the ServiceAccount's own RBAC identity, used directly from this
+   session's own shell against the cluster's external API server address,
+   with no pod involved at all. (`kubectl create token` itself has a
+   10-minute minimum duration; a first attempt at 5m was rejected.)
+
+4. A Loki query during Step J3's post-fix re-verification found zero
+   results across 15 poll attempts, initially read as a possible ingestion
+   regression from the RBAC fix. Root-caused through a chain of checks
+   (loki-gateway's own access log showed continuous successful pushes;
+   {app="provider-gateway"} was a known label with historical data; the
+   specific new-request time window just had nothing) to the real cause:
+   provider-gateway's Invoke handler had zero log statements on the success
+   path at all — every log call was on an error/control-signal branch. Not
+   fixed at the time (this was Step J3, telemetry completeness is Step N);
+   verification was redone correctly by triggering an error-path log
+   instead, found on the first poll. The success-path gap itself was
+   fixed properly at Step N3, and the whole chain — false alarm, root
+   cause, deferred fix, actual fix — is recorded across both progress-log
+   entries rather than only the final one.
+
+5. Google (Gemini) real-call attempts surfaced a genuine account
+   constraint, not a bug: two outdated model-ID guesses 404'd cleanly at
+   zero cost; a real response came back but with zero content (the whole
+   token budget consumed by internal reasoning under a max_tokens=10 cap);
+   a retry timed out at the adapter's own 60s client timeout; a specific
+   model (gemini-2.0-flash) returned a clean 429 RESOURCE_EXHAUSTED
+   showing generate_content quota=0 on this key's free tier. Every attempt
+   reached the real endpoint and returned well-formed JSON (including
+   errors), which is what distinguished this from the known TLS-
+   intercepting-proxy hazard or an adapter bug. Not fixed — cannot be, from
+   code — filed as Dependencies.txt row F13 (see DEFERRALS).
+
+6. Step N1's span design had a non-obvious wrinkle that shaped the
+   implementation rather than being a bug caught after the fact:
+   coalesce.Group.Invoke (Step G) returns immediately and runs the
+   coalescing leader's real work (quota+breaker+adapter) on a goroutine it
+   spawns internally, not on the calling goroutine. A span naively wrapping
+   the Invoke() call itself would therefore be near-instant and
+   structurally wrong. Resolved by creating the quota/breaker/adapter spans
+   INSIDE the `call` closure using the same root-anchored context the outer
+   function already held, which correctly makes them siblings of
+   "coalesce" (both derived from the root span) rather than children of it,
+   and propagates correctly across the goroutine boundary — verified in
+   Tempo afterward (EC4 above), not just reasoned through.
+
+7. An earlier comment (written during Step K3's provider-stub cleanup, in
+   prometheus-values.yaml) claimed provider-gateway "has no /metrics
+   endpoint of its own" — imprecise. The HTTP handler
+   (mux.Handle("GET /metrics", promhttp.Handler())) existed since Step C1
+   and returned 200 the whole time; what was actually missing, discovered
+   while building Step N2, was that nothing provider-gateway-specific had
+   ever been registered with it — only Go runtime defaults. The comment was
+   corrected in place rather than left to mislead a future reader, and the
+   provider-gateway scrape target was added to Prometheus's list only once
+   there was something real to scrape (Step N2), the same timing precedent
+   edge-gateway followed in Phase-01.
+
+8. Recurring "Exit code 144" on backgrounded `kubectl port-forward`
+   commands in this sandboxed environment, at least half a dozen times
+   across the phase — consistently not a real failure (the underlying
+   process either survived or needed a simple, immediate retry). Treated
+   throughout as a known environment artifact, same handling established in
+   Phase-01.
+
+--------------------------------------------------------------------------------
+DEFERRALS (explicit — agreed before or during Phase-02, or genuinely open,
+not omissions)
+--------------------------------------------------------------------------------
+- Google Gemini content-delta wire-format verification against the real
+  API — Dependencies.txt Forward-Reference Tracker row F13. Defined P02,
+  finalized in the cloud phase (first real Gemini content call once a
+  billed/paid-tier key exists). Reason: this key's Google Cloud project has
+  generate_content quota=0 on the free tier (confirmed via a clean 429
+  RESOURCE_EXHAUSTED — an account/billing constraint, not a TLS or adapter
+  fault). Risk: a real Gemini dialect difference in the content-delta shape
+  (candidates[].content.parts[].text) would not be caught by the existing
+  unit test (a canned payload) or by provider-fake — only a real paid-tier
+  call closes this gap. Interim measure: the unit test stands in for
+  real-API proof of this one path; the finish-signal path IS proven against
+  the real API (a genuine MAX_TOKENS response decoded correctly). Trigger:
+  first real Gemini content call once a billed key is available; re-run EC1
+  for google specifically and close this row.
+- Vault-issued provider tokens (Dependencies.txt F9): provider credentials
+  are a Kubernetes Secret mounted only to provider-gateway, per this
+  phase's own SECURITY IMPLEMENTATION section. F9 is explicitly "resolved
+  within P04" — the same phase that introduces Vault switches
+  provider-gateway to short-lived Vault tokens. Not this phase's job to
+  close; carried forward unchanged.
+- Token-aware KEDA + fleet-governor scaling (Dependencies.txt F2): basic
+  HPA was the phase's own stated ceiling — and, per the COMPLETION
+  CHECKLIST note above, even basic HPA was not actually configured as a
+  HorizontalPodAutoscaler resource this phase (replicas fixed manually at
+  3). F2's real scope (token-aware, fleet-governor-driven) remains
+  correctly deferred to Phase-13 regardless.
+- Azure/Bedrock/self-host(vllm) adapters: scaffolded (Step J7), not wired.
+  Self-host has an assigned wire-in phase (Phase-11, per Phase-02.txt's own
+  FEATURES IMPLEMENTED line). Azure and Bedrock have no wire-in phase
+  assigned anywhere in the roadmap as of this writing — left as open
+  scaffolds, not silently assumed to be someone else's problem on a
+  specific date.
+- Terraform cloud-provisioning and Karpenter: carried over from Phase-00's
+  own deferral, untouched this phase (platform/ files exist per the folder
+  structure; not made functional locally, not marked complete).
+- InvokeEmbedding and ProviderHealth RPCs: unimplemented, per Phase-02.txt's
+  own APIs CREATED section ("used from Phase-10" / "feeds scheduler") — not
+  a gap against this phase, listed here only so it isn't mistaken for one
+  later.
+- internal/prefixcache/ as a separate module: Phase-02.txt's own folder
+  structure names this as a distinct package; the passthrough was
+  implemented inline (adapters.Delta.PrefixCacheHandle) instead. Functional
+  behavior is fully verified either way; noted as a structural deviation
+  from the phase file's own listing, not hidden.
+- promtail/Loki staleness class of issue and the WSL2-restart Redis Cluster
+  gossip-drift pattern, both first documented in Phase-01: neither recurred
+  in a way that blocked Phase-02 work, and both remain covered by the same
+  remediation paths established there (scripts/recover-redis-cluster.sh;
+  the promtail staleness note in Phase-01-Complete.txt's own DEFERRALS).
+
+--------------------------------------------------------------------------------
+FINAL VERIFICATION RESULTS FOR EVERY COMPONENT
+--------------------------------------------------------------------------------
+provider-gateway build       — go build/vet/test clean throughout; 42 unit
+                             tests passing, 0 skipped, across 11 packages.
+Docker image                 — onezox/provider-gateway:22e8836a576f (current),
+                             content-addressed tags throughout, confirmed
+                             loaded on all 3 kind nodes after every rebuild.
+Argo CD                      — "onezox-stubs" Application Synced/Healthy
+                             after every deploy this phase; no stub/service/
+                             CiliumNetworkPolicy manifest ever applied
+                             directly with kubectl.
+Redis (quota + breaker)      — live-verified fleet-wide under real 3-replica
+                             concurrency (Step M1), not just single-pod.
+mTLS (provider-gateway <->
+dataplane-stub)               — AUTH TYPE spire, live and future-expiring,
+                             freshly re-captured at close-out (see above).
+provider-stub                — fully pruned: Deployment, Service, mTLS
+                             policy, source tree, go.work entry, CI matrix
+                             entry, Prometheus scrape target all confirmed
+                             gone, live, at time of writing.
+EC1 (real provider streaming) — PARTIALLY MET: OpenAI and Anthropic fully
+                             verified against the real API; Google's
+                             content-delta path deferred (F13), finish-
+                             signal path proven.
+EC2 (fault injection + fleet
+quota)                        — breaker fault injection verified (Step F);
+                             fleet-wide quota proven under real 3-replica
+                             concurrency with a direct Redis check (Step
+                             M1) — 30/60 allowed, one shared key at value
+                             60, not three.
+EC3 (credential isolation +
+egress)                        — Loki RBAC gap found, exploited to confirm
+                             it was real, and closed; L1/L2 adversarial
+                             tests both positive-controlled and both
+                             re-verified against the fully-hardened
+                             deployment.
+EC4 (telemetry completeness)   — 6/6 spans correctly parented in Tempo
+                             (verified explicitly per span, not by count
+                             alone); 3 real metric series in Prometheus
+                             with values cross-checked against the trace;
+                             1 structured success-path log line in Loki,
+                             re-confirmed leak-free after being added.
+
+--------------------------------------------------------------------------------
+FINAL PHASE-02 COMPLETION SUMMARY
+--------------------------------------------------------------------------------
+Phase-02 is complete, with one explicit, tracked exception. The real
+provider-gateway (Go) has replaced the Phase-00 provider-stub: adapters for
+OpenAI, Anthropic, and Google behind one internal contract, a fleet-wide
+quota governor backed by shared Redis counters, per-provider circuit
+breakers with typed fallback signaling, request coalescing, streaming
+passthrough with real backpressure, and prefix-cache handle passthrough are
+all built, deployed through GitOps via the existing "onezox-stubs" Argo CD
+Application, and verified with live, adversarial, and completeness-focused
+evidence rather than passive confirmation. Security scaffolding was built
+and verified in strict order before any real credential was exposed to a
+running pod — egress allow-list, then the credential Secret, then mTLS —
+exactly as directed, and that ordering discipline caught a real, unrelated
+credential-isolation gap (Loki's cluster-wide secrets RBAC) that would
+otherwise have sat open for three more phases. EC2 (fleet-wide quota) was
+proven under conditions a single-pod test cannot distinguish from a broken
+per-pod implementation — real 3-replica concurrency, confirmed directly
+against Redis. EC3 (credential isolation, egress) was proven adversarially
+and positive-controlled throughout, re-run against the fully-hardened
+deployment rather than trusted from build time. EC4 (telemetry) required
+building a span tree, real metrics, and success-path logging from a
+starting point of zero on all three, the same class of gap Phase-01's
+edge-gateway had before its own equivalent fixes — closed and verified
+against all three backends from a single real request. EC1 is the one
+exception: OpenAI and Anthropic are fully verified against their real APIs,
+including two genuinely different SSE wire formats; Google's finish-signal
+path is proven real but its content-delta path is not, blocked by a
+free-tier billing constraint on the available key rather than any defect in
+this phase's own work, and is tracked as an open forward reference
+(Dependencies.txt F13) rather than quietly folded into a blanket "done."
+Also disclosed rather than implied: basic HPA, listed in Phase-02.txt's own
+infrastructure requirements, was not actually configured this phase —
+replicas were scaled manually and left static. The provider-stub cutover
+(Step K3) is fully pruned, confirmed live at the time of writing, and the
+mTLS pair between provider-gateway and dataplane-stub was freshly
+re-captured at close-out rather than reused from earlier in the phase.
+================================================================================
+END OF PHASE-02-COMPLETE.TXT
+================================================================================
