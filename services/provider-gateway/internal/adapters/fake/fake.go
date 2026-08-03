@@ -67,12 +67,13 @@ type wireChunk struct {
 	OutputTokens      *int32  `json:"output_tokens,omitempty"`
 }
 
-// parseMode turns worker_ref's model portion ("normal" | "slow" | "fail"
-// | "fail:<status>") into provider-fake's own wire fields.
+// parseMode turns worker_ref's model portion ("normal" | "slow" | "fail" |
+// "fail:<status>" | "fail_mid_stream") into provider-fake's own wire
+// fields.
 func parseMode(model string) (mode string, failStatus int, err error) {
 	provider, rest, _ := strings.Cut(model, ":")
 	switch provider {
-	case "normal", "slow":
+	case "normal", "slow", "fail_mid_stream":
 		return provider, 0, nil
 	case "fail":
 		if rest == "" {
@@ -84,7 +85,7 @@ func parseMode(model string) (mode string, failStatus int, err error) {
 		}
 		return "fail", status, nil
 	default:
-		return "", 0, fmt.Errorf("fake adapter: unknown mode %q (want normal, slow, fail, or fail:<status>)", model)
+		return "", 0, fmt.Errorf("fake adapter: unknown mode %q (want normal, slow, fail, fail:<status>, or fail_mid_stream)", model)
 	}
 }
 
