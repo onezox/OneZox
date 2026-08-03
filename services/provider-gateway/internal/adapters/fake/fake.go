@@ -63,6 +63,8 @@ type wireChunk struct {
 	FinishReason      *string `json:"finish_reason,omitempty"`
 	IsFinal           bool    `json:"is_final"`
 	PrefixCacheHandle *string `json:"prefix_cache_handle,omitempty"`
+	InputTokens       *int32  `json:"input_tokens,omitempty"`
+	OutputTokens      *int32  `json:"output_tokens,omitempty"`
 }
 
 // parseMode turns worker_ref's model portion ("normal" | "slow" | "fail"
@@ -163,5 +165,7 @@ func (s *stream) Recv() (adapters.Delta, error) {
 		FinishReason:      chunk.FinishReason,
 		IsFinal:           chunk.IsFinal,
 		PrefixCacheHandle: chunk.PrefixCacheHandle,
+		InputTokens:       chunk.InputTokens,
+		OutputTokens:      chunk.OutputTokens,
 	}, nil
 }

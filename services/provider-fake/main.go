@@ -42,7 +42,7 @@ type chatMessage struct {
 type fakeCompleteRequest struct {
 	RequestID  string        `json:"request_id"`
 	Messages   []chatMessage `json:"messages"`
-	Mode       string        `json:"mode"`        // "normal" | "fail" | "slow"
+	Mode       string        `json:"mode"`        // "normal" | "fail" | "slow" | "fail_mid_stream"
 	FailStatus int           `json:"fail_status"` // used only when mode == "fail"; default 503
 }
 
@@ -52,7 +52,19 @@ type fakeCompleteChunk struct {
 	FinishReason      *string `json:"finish_reason,omitempty"`
 	IsFinal           bool    `json:"is_final"`
 	PrefixCacheHandle *string `json:"prefix_cache_handle,omitempty"`
+	// Phase-03 Step A6: deterministic canned usage, real-shaped so
+	// data-plane's metering tests (Phase-03 Step H4) have a fixed known
+	// value to assert against without spending a real provider call.
+	InputTokens  *int32 `json:"input_tokens,omitempty"`
+	OutputTokens *int32 `json:"output_tokens,omitempty"`
 }
+
+// Fixed, not derived from the canned response's actual word count —
+// deterministic is the only property that matters here.
+const (
+	cannedInputTokens  int32 = 42
+	cannedOutputTokens int32 = 17
+)
 
 // The canned response body, split into chunks — same "prove it's genuinely
 // this service answering, not a fluke" convention dataplane-stub's own
@@ -116,17 +128,46 @@ func handleFakeComplete(log *slog.Logger) http.HandlerFunc {
 			// only, matching meter.rs's placeholder-field precedent from
 			// Phase-01.
 			cacheHandle := "fake-cache-" + req.RequestID
+			inputTokens, outputTokens := cannedInputTokens, cannedOutputTokens
 			writeChunk(w, flusher, fakeCompleteChunk{
 				RequestID:         req.RequestID,
 				FinishReason:      strPtr("stop"),
 				IsFinal:           true,
 				PrefixCacheHandle: &cacheHandle,
+				InputTokens:       &inputTokens,
+				OutputTokens:      &outputTokens,
 			})
 			log.Info("fake: stream complete")
 			return
 
+		case "fail_mid_stream":
+			// Phase-03 Step A6: simulates a real provider connection
+			// breaking after SOME content was already delivered — the
+			// scenario provider-gateway's own best-effort-final-delta
+			// design (Step A2) exists for for real providers, and what
+			// data-plane's metering (Phase-03 Step H) must handle as
+			// "usage incomplete," not silently as zero. Writes two real
+			// chunks, then a deliberately truncated, syntactically
+			// invalid JSON fragment and returns — the client's decoder
+			// hits an unexpected-EOF/syntax error, a genuine non-EOF
+			// error, not a clean stream end.
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, `{"error":"streaming unsupported"}`, http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			w.WriteHeader(http.StatusOK)
+			for _, text := range cannedChunks[:2] {
+				writeChunk(w, flusher, fakeCompleteChunk{RequestID: req.RequestID, Content: strPtr(text)})
+			}
+			_, _ = w.Write([]byte(`{"request_id":"` + req.RequestID + `","content":"trunc`))
+			flusher.Flush()
+			log.Info("fake: induced mid-stream truncation")
+			return
+
 		default:
-			http.Error(w, `{"error":"mode must be one of: normal, fail, slow"}`, http.StatusBadRequest)
+			http.Error(w, `{"error":"mode must be one of: normal, fail, slow, fail_mid_stream"}`, http.StatusBadRequest)
 			return
 		}
 	}

@@ -41,6 +41,11 @@ __pycache__/
 /provider-stub
 /provider-gateway
 /provider-fake
+# Same accident, but from `go build ./...` run FROM WITHIN a service's own
+# directory instead of the repo root — hit this for real during Phase-03
+# Step A6.
+/services/provider-fake/provider-fake
+/services/provider-gateway/provider-gateway
 
 # =========================
 # Terraform
