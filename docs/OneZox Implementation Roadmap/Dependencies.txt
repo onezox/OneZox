@@ -1,0 +1,222 @@
+================================================================================
+ONEZOX IMPLEMENTATION ROADMAP — DEPENDENCIES.TXT
+================================================================================
+Companion index to Roadmap.txt and Phase-00..Phase-14.
+This file does not introduce new build work. It consolidates, in one place:
+  1. The phase dependency matrix (who needs whom).
+  2. The FORWARD-REFERENCE TRACKER — things DEFINED in one phase but only
+     FINALIZED/WIRED in a later phase (with the interim measure to use meanwhile).
+  3. Infrastructure provisioning order (which datastore/operator lands when).
+  4. Contract (proto/schema) ownership and first-use.
+  5. Parallelization rules (what a second team may start early, and the hard
+     serialization points).
+  6. Datastore readiness map (created vs. production-wired).
+
+This roadmap implements the existing v2 architecture exactly as written; nothing
+here redesigns, optimizes, or changes a technology choice. Where a phase file and
+this file appear to differ, the phase file is authoritative.
+
+--------------------------------------------------------------------------------
+1. PHASE DEPENDENCY MATRIX
+--------------------------------------------------------------------------------
+Legend: "needs" = hard upstream requirement (must be GREEN first).
+        Milestones (M0-M9) are gate markers from Roadmap.txt.
+
+Phase     Needs (hard upstream)                         Milestone at exit
+-------   -------------------------------------------   -----------------
+Phase-00  (root)                                        M0 Foundation
+Phase-01  00                                            -
+Phase-02  00 (01 for the full slice, not to build)      -
+Phase-03  00, 01, 02                                    M1 SHIPPABLE
+Phase-04  00, 03                                        -
+Phase-05  00, 03, 04                                    M2 Safe Model Ops
+Phase-06  03, 04, 05                                    -
+Phase-07  04, 06                                        M3 Multi-Agent
+Phase-08  00, 03                                        -
+Phase-09  03, 04, 06                                    M4 Stateful Domains
+Phase-10  02, 06, 07, 09                                M5 Quality Layer
+Phase-11  02, 04, 07, 10                                M6 Secure Execution
+Phase-12  03, 05, 06                                    M7 Measurable Quality
+Phase-13  03-12 (all emit spans/events)                 M8 Full Observability
+Phase-14  00-13 (ALL)                                   M9 Production Launch
+
+Critical path (single-track):
+00 -> 01 -> 02 -> 03 -> 04 -> 05 -> 06 -> 07 -> 08 -> 09 -> 10 -> 11 -> 12 ->
+13 -> 14.
+
+Note on 08/09 ordering: in the single-track build, Phase-08 (Chat) is sequenced
+before Phase-09 (Memory) but they share no hard dependency on each other. Either
+order is valid; both must precede Phase-10.
+
+--------------------------------------------------------------------------------
+2. FORWARD-REFERENCE TRACKER  (the "defined here / finalized there" table)
+--------------------------------------------------------------------------------
+These are capabilities a phase STANDS UP in a minimal/interim form and a LATER
+phase makes production-final. Each row: what it is, where it is first defined,
+where it is finalized, and the interim measure to run in between. This is the
+authoritative list of every cross-phase "reach-forward" in the roadmap.
+
+ID   Capability                     Defined in   Finalized in   Interim measure until finalized
+--   ----------------------------   ----------   ------------   ------------------------------------------------
+F1   Async work/queue backbone      P09, P10     P13            Create the NATS subject now, or run an interim
+     (NATS JetStream subjects:                                  durable queue; consumers must be idempotent so the
+     memory.write, ingest.jobs,                                 swap to JetStream is transparent.
+     embed.jobs, summarize.jobs)
+F2   Token-aware autoscaling         P02, P03    P13            Basic HPA now (connections/RPS); token-aware KEDA
+     (KEDA + global governor)                                   + fleet governor scaling finalized in P13.
+F3   Tool execution sandbox          P07         P11            P07 runs tool calls stubbed/allow-listed; real
+     (Firecracker microVM)                                      Firecracker isolation + the P07 tool-calling
+                                                                integration test complete in P11.
+F4   Self-hosted embeddings          P09, P10    P11            Use a frontier embedding API via the Provider
+     (GPU embed service)                                        Gateway now; switch to self-hosted GPU embeddings
+                                                                when P11 lands (no interface change).
+F5   GPU cross-encoder rerank        P10         P11            P10 may call a frontier reranker via the Provider
+     (hardened embed-rerank svc)                                Gateway; P11 hardens the self-hosted GPU service.
+F6   ClickHouse analytics store      P12         P13            P12 CREATES the eval/analytics tables; P13 wires
+                                                                ClickHouse ingestion + dashboards to full scale.
+F7   Learned router                  P12         P14            P12 trains + emits optimizer_policy proposals;
+     (optimizer_policy -> routing)                              P14 enables the router in-path, behind a flag,
+                                                                gated by the eval regression gate.
+F8   Semantic response cache         P10         P14            P10 defines the cache TIER (Part F.6); P14
+                                                                activates near-duplicate reuse in-path, behind a
+                                                                flag, with a freshness policy + eval gate.
+F9   Vault-issued provider tokens    P04         P04            P02 mounts provider creds via K8s secret; the
+     (replaces K8s secret)                                      SAME phase that introduces Vault (P04) switches
+                                                                the Provider Gateway to short-lived Vault tokens.
+                                                                (Listed for traceability; resolved within P04.)
+F10  Model source (static -> registry) P03       P04            P03 serves one frontier model via a static ref;
+                                                                P04 replaces it with a signed registry manifest.
+F11  Admin panel data panels          P05        P12/P13        Panel scaffolds in P05; trace/cost panels populate
+     (traces, cost, eval)                                       in P13, eval views in P12. Scaffold is inert until
+                                                                its source phase lands.
+F12  Website chat storage cutover     P08        P08            P08 requires the Website Backend to STOP storing
+                                                                chat directly and route all chat ops to the Chat
+                                                                Service. No interim dual-write is retained past
+                                                                P08 exit. (Listed because it is an external-system
+                                                                change, not an engine-internal one.)
+F13  Gemini content-delta wire-format P02        cloud phase    P02 verified the google adapter's request shape,
+     verification (real API)                     (first real    auth, egress reachability, and finish-signal SSE
+                                                   Gemini call   parse against the real API (a real MAX_TOKENS
+                                                   once billing  response decoded correctly: finish_reason + is_final
+                                                   exists)       set from a genuine payload). The CONTENT-DELTA parse
+                                                                path — the `candidates[].content.parts[].text` shape
+                                                                — was never exercised against real Gemini: the
+                                                                free-tier key hit generate_content quota=0 (clean 429
+                                                                RESOURCE_EXHAUSTED, not a TLS/adapter fault) on every
+                                                                model that would have returned visible text. Interim
+                                                                measure: unit tests against a canned, real-shaped SSE
+                                                                payload (internal/adapters/google/google_test.go)
+                                                                stand in for real-API proof of this one path. Risk:
+                                                                a real Gemini dialect difference in the content-delta
+                                                                shape would not be caught by those unit tests or by
+                                                                provider-fake — only a real paid-tier call closes
+                                                                this gap. Revisit: first real Gemini content call once
+                                                                a billed/paid-tier key is available (expected cloud
+                                                                phase); re-run EC1 for google specifically and update
+                                                                this row to closed.
+
+RULE FOR ALL FORWARD REFERENCES:
+- The interim measure must never leak into a public contract. Callers see the
+  final interface from day one; only the backing implementation swaps.
+- A forward reference is NOT closed until the finalizing phase's exit criteria
+  pass AND the interim measure is removed (no orphaned durable queue, no lingering
+  K8s-secret provider creds, no dual chat writes).
+
+--------------------------------------------------------------------------------
+3. INFRASTRUCTURE / OPERATOR PROVISIONING ORDER
+--------------------------------------------------------------------------------
+Each datastore or platform component is DECLARED in Terraform at Phase-00 but
+DEPLOYED (operator + cluster) in the phase that first needs it. Deploying earlier
+is allowed but adds idle cost; deploying later than the "Deploy in" phase blocks
+that phase.
+
+Component                     Declared   Deploy in   First consumer
+---------------------------   --------   ---------   -------------------------
+CockroachDB                   P00        P00         P00 (schema), P01/P03 (tables)
+Redis / Dragonfly             P00        P00         P01 (ratelimit), P03 (workingmem)
+Object store (S3/GCS+MinIO)   P00        P00         P00 buckets, P08 (chat cold)
+OTel Collector + Prometheus   P00        P00         all phases
+Cilium (mesh/mTLS)            P00        P00         all phases
+Argo CD                       P00        P00         all phases
+Karpenter                     P00        P00         all phases
+etcd                          P00        P04         P04 (manifest distribution)
+HashiCorp Vault               P00        P04         P04 (provider tokens)
+Argo Rollouts                 P00        P05         P05 (canary)
+FoundationDB                  P00        P06         P06 (workflow state), P09 (episodic)
+Temporal                      P00        P06         P06 (durable execution)
+ScyllaDB                      P00        P08         P08 (chat primary)
+Qdrant                        P00        P09         P09 (memory embeddings), P10 (corpus)
+OpenSearch                    P00        P10         P10 (lexical/BM25)
+Firecracker runtime           P00        P11         P11 (tool sandbox)
+GPU pools (inference/rerank)  P00        P11         P11 (self-hosted models); P10 provisions rerank pool
+Redpanda                      P00        P13         P13 (event bus)
+NATS JetStream                P00        P13*        P09/P10 async (*interim queue until P13)
+ClickHouse                    P00        P13         P12 tables created; P13 ingestion/dashboards
+
+--------------------------------------------------------------------------------
+4. CONTRACT (PROTO / SCHEMA) OWNERSHIP AND FIRST USE
+--------------------------------------------------------------------------------
+Contracts are scaffolded in Phase-00 (buf) and finalized by the phase that owns
+the service behind them. Breaking-change CI (buf) guards every edit.
+
+Contract               Owner phase   First cross-service use
+--------------------   -----------   ------------------------------
+proto/gateway          P01           P01 (client -> edge)
+proto/dataplane        P01/P03       P01->P03 (edge -> data plane); extended P06
+proto/provider         P02           P03 (data plane -> provider gateway)
+proto/admin + GraphQL  P05           P05 (panel -> admin-api); extended P13
+libs/ir-schema         P06           P06 (planner -> scheduler); replay in P12
+Chat Service gRPC      P08           P08 (website + engine -> chat)
+Memory Service gRPC    P09           P09 (engine -> memory)
+eval proto             P12           P12 (CI gate + shadow + replay)
+Event topics/subjects  P13           P13 (finalizes F1 subjects + bus topics)
+
+--------------------------------------------------------------------------------
+5. PARALLELIZATION RULES
+--------------------------------------------------------------------------------
+ALLOWED (only if team capacity permits; hard dependencies in section 1 still hold):
+- Phase-08 (Chat Service) may start once Phase-03 is GREEN — it does not need the
+  deliberate path (06/07). A second team can build it in parallel with 04-07.
+- Phase-11 (sandbox + GPU) skeleton may start after Phase-03, BUT its integration
+  test requires Phase-07 (multi-agent tool calls) and its retrieval-serving path
+  requires Phase-10.
+- Datastore operators may be deployed ahead of their "Deploy in" phase (section 3)
+  to de-risk, at the cost of idle spend.
+
+FORBIDDEN (hard serialization points — never reorder):
+- 04 before 03            (registry needs a running slice to replace static config)
+- 06 before 05            (deliberate path needs manifests authored + rolled out)
+- 07 before 06            (multi-agent needs IR + scheduler + Temporal)
+- 10 before 09            (retrieval complements the Memory Service; Qdrant shared)
+- 11 integration before 07 (sandbox isolates real multi-agent tool calls)
+- 12 before 06            (replay needs stored IR + recorded outputs)
+- 13 before the services it instruments exist (03-12)
+- 14 before everything    (multi-region composes all services)
+
+--------------------------------------------------------------------------------
+6. DATASTORE READINESS MAP  (created vs. production-wired)
+--------------------------------------------------------------------------------
+Some stores are CREATED (schema/collection exists, usable) in one phase and only
+PRODUCTION-WIRED (at scale, replicated, dashboarded) later. This prevents the
+mistake of assuming a store is "done" when only its schema exists.
+
+Store            Created (schema/usable)   Production-wired (scale/replica/DR)
+--------------   -----------------------   -----------------------------------
+CockroachDB      P00                       P14 (multi-region sync replication)
+ScyllaDB (chat)  P08 (RF>=3 AZ)            P14 (cross-region RF, residency)
+Memory Postgres  P09                       P14 (cross-region replica)
+Qdrant           P09 (memory) / P10 (corpus) P14 (rebuild-from-text DR proven)
+FoundationDB     P06                       P14 (replication + Temporal multi-cluster)
+OpenSearch       P10                       P14 (index rebuild-from-object-store DR)
+Redpanda         P13                       P14 (cross-region replication)
+ClickHouse       P12 (tables) / P13 (ingest) P14 (backups + multi-region aggregation)
+Object store     P00                       P00 already cross-region-capable; residency in P14
+Caches (Redis)   P00                       ephemeral; rebuild-on-demand, no DR needed
+
+DR targets (RPO/RTO) for each class are defined in the architecture DR table and
+exercised in Phase-14 drills; this map only tracks WHEN each store reaches that
+posture.
+
+================================================================================
+END OF DEPENDENCIES.TXT
+================================================================================

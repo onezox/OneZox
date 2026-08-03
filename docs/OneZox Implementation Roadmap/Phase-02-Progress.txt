@@ -161,6 +161,75 @@ provider-gateway entry (it still has no /metrics endpoint — that's Step
 N); a real streamed Invoke call through provider-gateway against
 provider-fake (fake:normal) succeeded end-to-end after the old identity
 was fully removed, confirming the cutover didn't regress functionality.
+--------------------------------------------------------------------------------
+2026-08-03 — Steps J4-J6: real adapters built + one real call each; EC1 met
+2/3, Google content-delta path deferred (Dependencies.txt F13)
+--------------------------------------------------------------------------------
+Prerequisite finding: only the fake adapter existed going into this step
+(Step D1) — the registry had no openai/anthropic/google entries at all.
+Building the three real adapters (internal/adapters/{openai,anthropic,
+google}, plus a small shared internal/adapters/sse SSE-framing helper)
+WAS this step, not a preamble to it — matches Phase-02.txt's own
+COMPLETION CHECKLIST item and FOLDER STRUCTURE
+(adapters/{openai,anthropic,google,azure,bedrock,vllm}). Each adapter
+unit-tested against a canned, real-shaped SSE payload before any real
+call was made (httptest.Server, no network, no cost) — caught wire-format
+and normalization issues (role mapping, system-message hoisting for
+Anthropic/Google, [DONE]-sentinel handling for OpenAI) cheaply, ahead of
+spending real provider calls. All pass; full module builds/vets/tests
+clean.
+
+REAL-CALL RESULTS:
+
+OpenAI (gpt-4o-mini): full success. Content streamed as three deltas
+("ack"+"now"+"ledged" -> "acknowledged"), then finish_reason="stop",
+is_final=true. Uniform SSE-chunk wire format parsed correctly end-to-end,
+adapter -> relay -> caller.
+
+Anthropic (claude-haiku-4-5-20251001, after an outdated first model ID
+404'd cleanly with no cost): full success. Single content delta
+"acknowledged", then finish_reason="end_turn" (from the message_delta
+event), is_final=true. Named-event SSE stream (message_start /
+content_block_delta / message_delta / message_stop) parsed correctly.
+
+Google (Gemini): PARTIAL, not a code defect. Sequence of attempts:
+1. Two outdated model IDs (gemini-1.5-flash, gemini-2.5-flash) -> clean
+   404s, zero cost, confirmed reachability/auth fine.
+2. gemini-flash-latest, max_tokens=10 -> a genuine real response,
+   correctly parsed (finish_reason="MAX_TOKENS", is_final=true) but ZERO
+   content — the model's whole token budget was consumed by internal
+   reasoning before any visible output. This proved the finish-signal SSE
+   parse path against the real API but never exercised the content-delta
+   path (candidates[].content.parts[].text).
+3. Retried with max_tokens=50 on the same model -> 60s client timeout
+   awaiting response headers.
+4. gemini-2.0-flash -> clean 429 RESOURCE_EXHAUSTED: "Quota exceeded ...
+   limit: 0 ... generate_content_free_tier_requests". This key's Google
+   Cloud project has NO generate_content quota on the free tier. Every
+   attempt in this sequence reached the real endpoint and returned
+   well-formed JSON (including the errors) — ruled out the known
+   TLS-intercepting-proxy hazard and any adapter bug; this is an
+   account/billing constraint, not a wire-format or infra problem.
+
+Confirmed via `kubectl logs`: no key value ever appears in any log line
+across this entire sequence, only presence/absence and upstream error
+bodies — the "never logged" requirement held throughout, including
+through five failed/partial real-call attempts.
+
+DECISION (per explicit instruction): do not chase further Google model
+names against a confirmed 0-quota project. EC1 is recorded as MET for
+OpenAI and Anthropic, PARTIALLY MET for Google — the content-delta parse
+path is a genuine, tracked open item, not silently accepted as "done."
+Filed as Dependencies.txt Forward-Reference Tracker row F13: defined P02,
+finalized in the cloud phase (first real Gemini content call once a
+billed/paid-tier key exists), interim measure is the unit test against a
+canned payload, explicit risk noted (a real Gemini dialect difference in
+the content-delta shape would not be caught by that unit test or by
+provider-fake). Also noted in CLAUDE.md's Phase-02 scoping/deferrals list
+so it surfaces immediately in a fresh session, not just in this file.
+MUST be carried into Phase-02's own completion record (Step O1) as an
+explicit DEFERRALS entry, same pattern Phase-01-Complete.txt used for the
+external-ingress deferral — not yet written since O1 hasn't happened.
 ================================================================================
 END OF PHASE-02-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================

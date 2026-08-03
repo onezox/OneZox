@@ -64,6 +64,16 @@ Phase-02 scoping decisions and deferrals:
 - Network hazard: this network has a TLS-intercepting proxy (confirmed Phase-00,
   broke cosign's Rekor upload). A real HTTPS provider call may hit it — detect/
   handle, don't discover mid-test.
+- EC1 real-call outcome: fully met for OpenAI and Anthropic (real streamed
+  content -> finish cycle, wire format parsed end-to-end). PARTIALLY met for
+  Google — reachability, auth, egress, and the finish-signal SSE parse path are
+  verified against the real Gemini API; the CONTENT-DELTA parse path is NOT,
+  because this key's Google Cloud project has generate_content quota=0 (free
+  tier, confirmed via a clean 429 RESOURCE_EXHAUSTED, not a TLS/adapter fault).
+  Tracked as Dependencies.txt F13 — DEFERRED TO CLOUD PHASE, revisit on the
+  first real Gemini content call once a billed key exists. Do not mark EC1 or
+  the google adapter flatly "done"; it's 2/3 real-verified plus one open
+  forward reference.
 - Deployment via the onezox-stubs Argo Application. Prefer immutable/digest image
   tags from the start to avoid Phase-01's same-tag-no-diff manual rollout-restart
   workaround.
