@@ -114,6 +114,53 @@ certs; CockroachDB's operator manages CRDB's own TLS rotation) — nothing
 here is idle capability the way Loki's sidecar grant was, and narrowing
 any of them risks breaking core cluster function well outside Phase-02's
 scope. Left as-is, deliberately, not overlooked.
+--------------------------------------------------------------------------------
+2026-08-03 — Step K3: mTLS cutover from provider-stub to provider-gateway,
+mesh-identity-safe sequencing confirmed both halves
+--------------------------------------------------------------------------------
+Two-commit cutover, same pattern Phase-01 Step F2 used for edge-gateway:
+
+(1/2, commit 33ab9b6): added provider-gateway-mtls (ingress-only, mirrors
+dataplane-stub-mtls/edge-gateway-mtls's host+Prometheus no-auth rules, plus
+one SPIRE-authenticated rule for dataplane-stub -> provider-gateway on
+50051) and synced it BEFORE touching provider-stub at all. Verified
+VALID:true, Cilium endpoint for provider-gateway flipped Disabled->Enabled
+on ingress. Live proof: a raw socket connection from dataplane-stub to
+provider-gateway:50051 produced a fresh `cilium-dbg bpf auth list` entry
+(SRC 47734 = provider-gateway, DST 63524 = dataplane-stub, AUTH TYPE spire,
+EXPIRATION ~51 min in the future at check time) — genuinely SPIRE-issued,
+not stale/cached.
+
+(2/2, commit 0786836): only once (1) was confirmed healthy — removed
+provider-stub-mtls entirely, the stale provider-stub rule from
+dataplane-stub-mtls, and provider-stub from edge-gateway-mtls's
+matchExpressions; deleted platform/stubs/provider-stub/deployment.yaml and
+services/provider-stub/ outright; dropped provider-stub from go.work, the
+CI build-sign matrix (replaced with provider-gateway), and Prometheus's
+onezox-stubs scrape job (applied via `helm upgrade` directly, same
+operator-config exception as Loki/Step J3 and Phase-01 F3b). At no point
+was provider-gateway deployed without its own mTLS policy in place — no
+mesh-identity gap.
+
+NOTE, deliberately NOT carried forward: the old stub pair
+(dataplane-stub<->provider-stub) was bidirectional test-capability proof
+(both directions on port 8080, neither backed by real RPC logic).
+provider-gateway-mtls only recreates ONE direction (dataplane-stub ->
+provider-gateway, on 50051, the real gRPC port) — the reverse direction
+was not recreated since provider-gateway has no reason to call
+dataplane-stub and inventing that relationship would be scope beyond
+Phase-02.txt. One proven direction is sufficient to demonstrate the SPIRE
+mTLS capability.
+
+VERIFIED POST-CUTOVER: `kubectl get deployment,svc,pods -l app=provider-stub`
+returns nothing; onezox-stubs Argo app Synced/Healthy; remaining 3
+CiliumNetworkPolicies (dataplane-stub-mtls, edge-gateway-mtls,
+provider-gateway-mtls) all VALID:true; live Prometheus target list
+(`/api/v1/targets`) shows provider-stub gone and no premature
+provider-gateway entry (it still has no /metrics endpoint — that's Step
+N); a real streamed Invoke call through provider-gateway against
+provider-fake (fake:normal) succeeded end-to-end after the old identity
+was fully removed, confirming the cutover didn't regress functionality.
 ================================================================================
 END OF PHASE-02-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
