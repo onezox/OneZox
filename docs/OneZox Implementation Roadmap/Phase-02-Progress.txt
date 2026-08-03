@@ -230,6 +230,60 @@ so it surfaces immediately in a fresh session, not just in this file.
 MUST be carried into Phase-02's own completion record (Step O1) as an
 explicit DEFERRALS entry, same pattern Phase-01-Complete.txt used for the
 external-ingress deferral — not yet written since O1 hasn't happened.
+--------------------------------------------------------------------------------
+2026-08-03 — Steps L1-L2: adversarial security tests, positive-controlled,
+against the fully-hardened real-key-bearing deployment
+--------------------------------------------------------------------------------
+Both tests follow the same discipline Phase-01's H1 established: prove the
+detection method CAN catch a real positive before trusting a clean/
+negative result on it.
+
+L1 — credential-leak test.
+Positive control: planted a fake secret-shaped value
+("sk-FAKE-positive-control-leak-...") in a JSON line matching
+provider-gateway's own slog.JSONHandler shape, confirmed grep finds it —
+proves the methodology itself works before trusting an "absent" result.
+Real test: exec'd into the running provider-gateway pod, read all three
+real key values (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY) into
+shell variables via `kubectl exec ... printenv` — never echoed, only
+their lengths were ever printed. Grepped two independent sources
+client-side (never sent the key value itself in any query, to avoid
+creating a NEW leak surface in Loki's own access log): (1) the pod's full
+kubectl logs since last restart (14 lines, covering every real-provider
+call made in Steps J4-J6 including all five Google attempts), and (2)
+Loki's durable store via /loki/api/v1/query_range for {app=
+"provider-gateway"} over the last 2 hours (25 lines). Checked the bare
+key value AND "Bearer <key>" (OpenAI's actual header form). All six
+checks (3 keys x 2 sources, plus the Bearer-form recheck): zero matches.
+Consistent with the source-level finding already established (Step J4-J6
+commit message): no adapter package contains a single log/slog call, and
+apiKey is an unexported struct field only ever used to set an HTTP
+header, never marshaled or logged.
+
+L2 — egress-block test, re-run against the CURRENT state (real key
+mounted, mTLS cutover complete, provider-stub fully removed) rather than
+relying on the original J1/J2 build-time result.
+Positive control: from an ephemeral debug container (nicolaka/netshoot)
+sharing provider-gateway's network namespace, curl to
+https://api.openai.com/v1/models succeeded (HTTP 401 — a deliberately
+wrong bearer token, the point was TCP+TLS+DNS all working, not auth) in
+~99ms. Proves the egress policy is actually being evaluated, not
+blanket-blocking everything by accident.
+Negative test: curl to https://example.com/ timed out. Confirmed this
+was a genuine Cilium policy enforcement, not an unrelated network hiccup,
+by capturing a live `cilium-dbg monitor -t drop` event on
+provider-gateway's node during the attempt: "drop (Policy denied) ...
+identity 47734->world: 10.244.1.41:xxxxx -> {172.66.147.243,
+104.20.23.154}:443 tcp SYN" — identity 47734 is provider-gateway's own
+Cilium identity (same one captured in the K3 mTLS proof), "world" is
+everything outside the allow-list, both example.com's resolved IPs were
+dropped at the kernel/BPF level (bpf_lxc.c:1651), not just timed out at
+the application layer.
+
+RESULT: EC3 (credential isolation and egress allow-list) verified with
+adversarial, positive-controlled evidence, not passive confirmation —
+same H1 discipline Phase-01 established, applied here against the real,
+fully-hardened Phase-02 deployment.
 ================================================================================
 END OF PHASE-02-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
