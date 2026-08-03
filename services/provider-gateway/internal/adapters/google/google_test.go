@@ -12,11 +12,13 @@ import (
 )
 
 // A canned, real-shaped Gemini streamGenerateContent(alt=sse) stream: two
-// content chunks, then a final chunk carrying finishReason.
+// content chunks, then a final chunk carrying finishReason and
+// usageMetadata (a top-level field, present on every real chunk as a
+// running cumulative count — only the final chunk's values matter here).
 const cannedStream = "" +
 	"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}],\"role\":\"model\"},\"index\":0}]}\n\n" +
 	"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" world\"}],\"role\":\"model\"},\"index\":0}]}\n\n" +
-	"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}]}\n\n"
+	"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":4}}\n\n"
 
 func TestInvokeParsesCannedStreamCorrectly(t *testing.T) {
 	var gotAPIKey, gotPath, gotBody string
@@ -78,12 +80,61 @@ func TestInvokeParsesCannedStreamCorrectly(t *testing.T) {
 			if d.FinishReason == nil || *d.FinishReason != "STOP" {
 				t.Errorf("finish reason = %v, want \"STOP\"", d.FinishReason)
 			}
+			if d.InputTokens == nil || *d.InputTokens != 11 {
+				t.Errorf("input tokens = %v, want 11 (present)", d.InputTokens)
+			}
+			if d.OutputTokens == nil || *d.OutputTokens != 4 {
+				t.Errorf("output tokens = %v, want 4 (present)", d.OutputTokens)
+			}
 			break
 		}
 	}
 
 	if content != "Hello world" {
 		t.Errorf("assembled content = %q, want %q", content, "Hello world")
+	}
+	if !gotFinal {
+		t.Error("stream never produced a final delta")
+	}
+}
+
+func TestUsageStaysUnsetWhenChunkOmitsUsageMetadata(t *testing.T) {
+	const streamNoUsage = "" +
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"},\"index\":0}]}\n\n" +
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}]}\n\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamNoUsage))
+	}))
+	defer srv.Close()
+
+	a := New("test-key", srv.URL)
+	s, err := a.Invoke(context.Background(), adapters.InvokeRequest{
+		Model:    "gemini-1.5-flash",
+		Messages: []adapters.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	var gotFinal bool
+	for {
+		d, err := s.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if d.IsFinal {
+			gotFinal = true
+			if d.InputTokens != nil || d.OutputTokens != nil {
+				t.Errorf("usage = input:%v output:%v, want both unset (never coerced to zero)", d.InputTokens, d.OutputTokens)
+			}
+			break
+		}
 	}
 	if !gotFinal {
 		t.Error("stream never produced a final delta")

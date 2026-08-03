@@ -12,6 +12,17 @@
 // differ from OpenAI/Anthropic: "contents"/"parts" instead of "messages",
 // role "model" instead of "assistant", and system text goes in a separate
 // systemInstruction field, not a message role.
+//
+// Step A5 (Phase-03): real token usage. Gemini's usageMetadata is a
+// top-level chunk field (not nested under candidates), and — unlike
+// OpenAI's dedicated final chunk or Anthropic's two-event split — it's
+// present on every chunk as a running cumulative count, simplest of the
+// three: just read it off the same chunk that carries finishReason. Note
+// this adapter is not exercised against the real API this phase (F13:
+// the available key has generate_content quota=0 on the free tier; the
+// EC1 real-model proof routes through OpenAI/Anthropic instead) — usage
+// parsing here is verified against a canned real-shaped payload only,
+// same as F13 already documents for the rest of this adapter.
 package google
 
 import (
@@ -75,8 +86,17 @@ type wireCandidate struct {
 	FinishReason *string     `json:"finishReason"`
 }
 
+// A top-level chunk field (not nested under candidates), present on every
+// chunk as a running cumulative count — unlike OpenAI/Anthropic, Gemini
+// doesn't withhold usage for a dedicated final event.
+type wireUsageMetadata struct {
+	PromptTokenCount     int32 `json:"promptTokenCount"`
+	CandidatesTokenCount int32 `json:"candidatesTokenCount"`
+}
+
 type wireChunk struct {
-	Candidates []wireCandidate `json:"candidates"`
+	Candidates    []wireCandidate    `json:"candidates"`
+	UsageMetadata *wireUsageMetadata `json:"usageMetadata"`
 }
 
 type UpstreamError struct {
@@ -195,11 +215,18 @@ func (s *stream) Recv() (adapters.Delta, error) {
 			if text != "" {
 				content = &text
 			}
-			return adapters.Delta{
+			delta := adapters.Delta{
 				Content:      content,
 				FinishReason: candidate.FinishReason,
 				IsFinal:      true,
-			}, nil
+			}
+			if chunk.UsageMetadata != nil {
+				inputTokens := chunk.UsageMetadata.PromptTokenCount
+				outputTokens := chunk.UsageMetadata.CandidatesTokenCount
+				delta.InputTokens = &inputTokens
+				delta.OutputTokens = &outputTokens
+			}
+			return delta, nil
 		}
 		if text == "" {
 			continue
