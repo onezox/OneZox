@@ -2,10 +2,19 @@
 // provider-gateway's internal adapters.Adapter contract (Part G.1).
 // Wire format: POST /v1/chat/completions with "stream": true returns
 // Server-Sent Events, each `data:` line a JSON chunk, terminated by a
-// literal `data: [DONE]` frame. This adapter stops (IsFinal) as soon as a
-// chunk carries a non-null finish_reason — it never needs to see [DONE],
-// since Relay (internal/stream) never calls Recv again once IsFinal is
-// set (Step H's design).
+// literal `data: [DONE]` frame.
+//
+// Step A3 (Phase-03): real token usage. With stream_options.include_usage
+// set, OpenAI sends usage in a DEDICATED final chunk — empty choices,
+// populated usage — that arrives AFTER the chunk carrying finish_reason,
+// not on it. So this adapter can no longer return IsFinal the moment it
+// sees finish_reason (that used to be the design, per the old comment
+// here); it now defers finish_reason in pendingFinishReason and keeps
+// reading one more chunk for the usage payload, only returning the final
+// delta (finish_reason + usage together) once that arrives — or, if a
+// misbehaving/older-shaped response reaches [DONE] without ever sending
+// it, returns the deferred finish_reason anyway with usage left unset
+// rather than losing the finish signal entirely.
 package openai
 
 import (
@@ -52,12 +61,17 @@ type wireReqMessage struct {
 	Content string `json:"content"`
 }
 
+type wireStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type wireRequest struct {
-	Model       string           `json:"model"`
-	Messages    []wireReqMessage `json:"messages"`
-	Stream      bool             `json:"stream"`
-	MaxTokens   *int32           `json:"max_tokens,omitempty"`
-	Temperature *float32         `json:"temperature,omitempty"`
+	Model         string             `json:"model"`
+	Messages      []wireReqMessage   `json:"messages"`
+	Stream        bool               `json:"stream"`
+	StreamOptions *wireStreamOptions `json:"stream_options,omitempty"`
+	MaxTokens     *int32             `json:"max_tokens,omitempty"`
+	Temperature   *float32           `json:"temperature,omitempty"`
 }
 
 type wireDelta struct {
@@ -69,8 +83,14 @@ type wireChoice struct {
 	FinishReason *string   `json:"finish_reason"`
 }
 
+type wireUsage struct {
+	PromptTokens     int32 `json:"prompt_tokens"`
+	CompletionTokens int32 `json:"completion_tokens"`
+}
+
 type wireChunk struct {
 	Choices []wireChoice `json:"choices"`
+	Usage   *wireUsage   `json:"usage"`
 	Error   *wireError   `json:"error"`
 }
 
@@ -100,11 +120,12 @@ func (a *Adapter) Invoke(ctx context.Context, req adapters.InvokeRequest) (adapt
 	}
 
 	body, err := json.Marshal(wireRequest{
-		Model:       req.Model,
-		Messages:    messages,
-		Stream:      true,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Model:         req.Model,
+		Messages:      messages,
+		Stream:        true,
+		StreamOptions: &wireStreamOptions{IncludeUsage: true},
+		MaxTokens:     req.MaxTokens,
+		Temperature:   req.Temperature,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("openai adapter: marshal request: %w", err)
@@ -134,6 +155,10 @@ func (a *Adapter) Invoke(ctx context.Context, req adapters.InvokeRequest) (adapt
 type stream struct {
 	scanner *sse.Scanner
 	body    io.ReadCloser
+	// Set when a chunk carries finish_reason; held until the dedicated
+	// usage chunk (or, failing that, [DONE]) so both can be returned
+	// together on the one true final delta.
+	pendingFinishReason *string
 }
 
 func (s *stream) Recv() (adapters.Delta, error) {
@@ -147,14 +172,20 @@ func (s *stream) Recv() (adapters.Delta, error) {
 			return adapters.Delta{}, fmt.Errorf("openai adapter: read stream: %w", err)
 		}
 		if ev.Data == "[DONE]" {
-			// Reached without ever seeing a finish_reason — a
-			// malformed/truncated stream. Close and report as
-			// incomplete (a plain EOF here, like an interrupted
-			// body, correctly reads as a breaker failure upstream —
-			// Relay/reportingStream in main.go treat "Recv returned
-			// an error without ever setting IsFinal" as a failed
-			// call).
 			_ = s.body.Close()
+			if s.pendingFinishReason != nil {
+				// finish_reason arrived but the usage chunk never did
+				// (e.g. stream_options wasn't honored by whatever's on
+				// the other end) — return the finish signal anyway,
+				// usage left unset rather than losing it entirely.
+				return adapters.Delta{FinishReason: s.pendingFinishReason, IsFinal: true}, nil
+			}
+			// Reached without ever seeing a finish_reason — a
+			// malformed/truncated stream. A plain EOF here, like an
+			// interrupted body, correctly reads as a breaker failure
+			// upstream (Relay/reportingStream in main.go treat "Recv
+			// returned an error without ever setting IsFinal" as a
+			// failed call).
 			return adapters.Delta{}, io.EOF
 		}
 
@@ -167,17 +198,30 @@ func (s *stream) Recv() (adapters.Delta, error) {
 			_ = s.body.Close()
 			return adapters.Delta{}, fmt.Errorf("openai adapter: stream error: %s", chunk.Error.Message)
 		}
+
 		if len(chunk.Choices) == 0 {
-			continue
-		}
-		choice := chunk.Choices[0]
-		if choice.FinishReason != nil {
+			// The dedicated usage chunk (stream_options.include_usage)
+			// has empty choices and populated usage — arrives after the
+			// finish_reason chunk, not on it. Any other empty-choices
+			// chunk (usage absent) has nothing to forward.
+			if chunk.Usage == nil {
+				continue
+			}
 			_ = s.body.Close()
 			return adapters.Delta{
-				Content:      choice.Delta.Content,
-				FinishReason: choice.FinishReason,
+				FinishReason: s.pendingFinishReason,
 				IsFinal:      true,
+				InputTokens:  &chunk.Usage.PromptTokens,
+				OutputTokens: &chunk.Usage.CompletionTokens,
 			}, nil
+		}
+
+		choice := chunk.Choices[0]
+		if choice.FinishReason != nil {
+			// Defer: don't return final yet, wait for the usage chunk
+			// that follows.
+			s.pendingFinishReason = choice.FinishReason
+			continue
 		}
 		if choice.Delta.Content == nil {
 			// Role-only chunk (the first event sets delta.role with
