@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: provider-fake
-          image: onezox/provider-fake:b9152ded57e8
+          image: onezox/provider-fake:29ba589634a3
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
