@@ -337,6 +337,89 @@ signal (FALLBACK_REASON_QUOTA_EXHAUSTED), not a generic error.
 
 EC2 (fan-out cap) is now verified fleet-wide under real multi-replica
 concurrency, not just single-pod.
+--------------------------------------------------------------------------------
+2026-08-03 — Steps N1-N3: telemetry completeness verified against all
+three backends with one real request (EC4)
+--------------------------------------------------------------------------------
+Treated as completeness-verification, not rubber-stamping, per explicit
+instruction — provider-gateway is Go, not Rust, so it inherited none of
+Phase-01 edge-gateway's own J1/J2/J3 fixes. Starting state (confirmed
+before building anything): ZERO spans were ever created anywhere in the
+code (the TracerProvider was initialized but nothing called
+tracer.Start) — worse than Phase-01's ordering bug, there was no tracing
+at all. /metrics existed (Step C1, promhttp.Handler()) and returned 200,
+but had zero provider-gateway-specific series registered — only Go
+runtime defaults — which is the precise reason Prometheus was never
+scraping anything meaningful, not literally "no endpoint" as an earlier
+Step K3 comment imprecisely claimed (corrected in
+prometheus-values.yaml). The success-path log gap was exactly as
+expected: main.go's Invoke handler logged only on error/fallback paths.
+
+N1 — SPAN TREE: root span "provider_gateway.invoke" per request, with
+coalesce/quota/breaker/adapter/stream as five DIRECT children (a flat
+tree, not nested under each other), matching Phase-02.txt's own module
+list under Part Q. Non-obvious wrinkle that shaped the design:
+coalesce.Group.Invoke (Step G) returns immediately and does the leader's
+real work (quota+breaker+adapter) on a goroutine it spawns — so a span
+wrapping the Invoke() call itself would be near-instant and meaningless;
+quota/breaker/adapter spans are instead created inside the `call`
+closure using the SAME root-anchored context, which is what makes them
+true siblings of "coalesce" rather than children of it, and lets them
+correctly propagate across the goroutine boundary.
+
+VERIFIED IN TEMPO against one real request (fake:normal, request_id
+n-verify-1785741046): queried by the request_id span attribute, found
+exactly ONE trace, spanCount 6. Fetched the full trace and inspected
+parentSpanId on every span explicitly (not inferred from span count
+alone) — all five stage spans have parent_name="provider_gateway.invoke"
+with no orphans and no unexpected nesting. Durations corroborate the
+architecture: "coalesce" = 36us (confirms Invoke() really is
+near-instant), "quota" = 789us and "breaker" = 289us (ran on the
+background leader goroutine), "adapter" = 6000us (matches the metric
+below almost exactly), "stream" = 7937us (nearly the full 8019us root
+duration — expected, since draining the response is most of the
+request's real wall-clock time).
+
+N2 — METRICS: added provider_gateway_adapter_call_duration_seconds
+(histogram, provider+outcome), provider_gateway_breaker_state (gauge,
+0=closed/1=half_open/2=open, set directly from a live breaker.Check
+decision — never asserted on a Redis error, same fail-open-but-honest
+reasoning used throughout), and provider_gateway_quota_headroom (gauge,
+policy.Limit - current, floored at 0; quota.Enforce's signature was
+extended to also return the post-increment count so this needs no
+second Redis round-trip — updated all 6 existing call sites, 5 in
+quota_test.go + 1 in main.go).
+
+VERIFIED VALUES, not just endpoint 200: raw scrape from the pod that
+handled the test request showed adapter_call_duration_seconds_sum=
+0.006000932 count=1 (matches the Tempo "adapter" span's 6000.4us almost
+exactly), breaker_state=0 (matches the trace's breaker decision
+"allow"), quota_headroom=59 (60 default limit - 1 request, a fresh
+window). Then re-confirmed the SAME three values through Prometheus's
+own query API (not just the raw pod scrape) — Prometheus's
+provider-gateway target (scraped via the Service, same pattern
+dataplane-stub/edge-gateway already use) reports health="up". Added
+provider-gateway to prometheus-values.yaml's onezox-stubs scrape list
+(applied via `helm upgrade` directly, the established operator-config
+exception) now that there's something real to scrape.
+
+N3 — SUCCESS-PATH LOG: one line, "request completed", added after
+Relay returns nil — request_id (already attached via log.With),
+worker_ref, provider, outcome (delta|fallback), finish_reason. No auth
+material anywhere near this code path. CRITICAL re-verification per
+explicit instruction: re-ran Step L1's exact methodology (positive
+control first — planted a fake secret-shaped value, confirmed grep
+finds it — THEN the real test) against all three now-running replicas'
+logs (all on the new image) for all three real key values. Zero
+matches, same as the original L1 result. Also confirmed the new log
+line itself reached Loki (durable store), not just kubectl logs'
+in-memory buffer.
+
+RESULT: EC4 (telemetry completeness) verified against all three
+backends — Tempo (span tree, parenting confirmed explicitly), Prometheus
+(metric values confirmed correct, not just present, target "up"), Loki
+(success log present, re-confirmed leak-free) — from a single real
+request, per instruction ("one real request, all three backends").
 ================================================================================
 END OF PHASE-02-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
