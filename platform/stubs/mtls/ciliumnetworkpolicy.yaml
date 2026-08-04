@@ -1,6 +1,8 @@
 # Cilium mTLS enforcement between edge-gateway (Phase-01), provider-gateway
-# (Phase-02), and dataplane-stub (still Phase-00/01, real replacement
-# arrives in Phase-03).
+# (Phase-02), and dataplane-stub (Phase-00/01, being replaced by data-plane
+# in Phase-03 — both coexist as allowed provider-gateway callers until Step
+# J's cutover removes dataplane-stub; data-plane has no ingress policy of
+# its own yet, that arrives at the same cutover).
 #
 # Completes the last Phase-00 acceptance item: SPIRE (Step 9) installed the
 # mTLS *capability* only, deliberately not enforced at the time, pending
@@ -109,14 +111,23 @@ spec:
 # comment above; Cilium enforces the two directions independently, so a
 # separate CiliumNetworkPolicy object per direction is fine.
 #
-# dataplane-stub -> provider-gateway (this rule) proves the SPIRE mTLS
-# mechanism genuinely works for provider-gateway specifically, the same
+# dataplane-stub -> provider-gateway (this rule) originally proved the
+# SPIRE mTLS mechanism genuinely works for provider-gateway, the same
 # "prove the capability, not necessarily a functionally-exercised call
-# path yet" role dataplane-stub <-> provider-stub played since Phase-00
-# (no stub-to-stub RPC logic actually exists; Phase-02.txt's own real
-# caller relationship, data plane -> provider gateway, doesn't arrive
-# until Phase-03). Port here is 50051 (provider-gateway's real gRPC
-# port), not 8080 like the old stub pair used.
+# path yet" role dataplane-stub <-> provider-stub played since Phase-00.
+# Port here is 50051 (provider-gateway's real gRPC port), not 8080 like
+# the old stub pair used.
+#
+# Phase-03 Step B: data-plane (the real service this comment used to say
+# "doesn't arrive until Phase-03") is now a SECOND allowed caller,
+# alongside dataplane-stub, not a replacement — dataplane-stub is not cut
+# over yet (Step J). This is the functionally-exercised call path the
+# capability-proof rule above was always standing in for: data-plane's
+# own boot sequence calls ProviderHealth (Step A7) as a real,
+# non-hypothetical connectivity proof, the same way it proves Cockroach
+# and Redis. Once Step J's cutover removes dataplane-stub, this narrows
+# back down to data-plane alone, matching how provider-stub-mtls's own
+# removal at K3 narrowed the equivalent rule on the other side.
 #
 # The REVERSE direction the old pair also had (provider-stub calling
 # INTO dataplane-stub on 8080, in dataplane-stub-mtls) was deliberately
@@ -155,8 +166,12 @@ spec:
             - port: "8080"
               protocol: TCP
     - fromEndpoints:
-        - matchLabels:
-            app: dataplane-stub
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - dataplane-stub
+                - data-plane
       toPorts:
         - ports:
             - port: "50051"
