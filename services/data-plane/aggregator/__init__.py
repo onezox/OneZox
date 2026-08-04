@@ -1,4 +1,5 @@
-"""aggregator — Phase-03 Step G: single-worker passthrough.
+"""aggregator — Phase-03 Step G: single-worker passthrough. Step H adds
+usage capture (still passthrough — no new aggregation behavior).
 
 Phase-03 only ever dispatches to ONE worker per request — provider.proto's
 own InvokeRequest already assumes this (a single worker_ref, not a list).
@@ -14,9 +15,21 @@ generator that only asks provider-gateway for the next delta once its
 own caller has consumed the previous yield — no manual buffering
 anywhere, same discipline every other streaming relay in this codebase
 already uses (provider-gateway's own Go relay, edge-gateway's SSE relay).
+
+Step H: relay() now yields (SubmitResponse, Usage | None) pairs instead
+of bare SubmitResponse. Usage is non-None exactly once, on the final
+delta (provider.proto's own convention: usage fields are "set ONLY on
+the final delta"), and its fields individually mirror that delta's own
+presence semantics — a field is None when the provider didn't report it
+(including the best-effort synthetic final delta provider-gateway sends
+on an upstream error, which deliberately leaves both fields unset), never
+coerced to 0. The caller (Submit's handler) is what decides what to do
+with "usage incomplete" — this module's only job is to not lose or
+fabricate the signal in translation.
 """
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import grpc
@@ -41,6 +54,17 @@ class _WorkerNodeLike(Protocol):
 
     @property
     def temperature(self) -> float | None: ...
+
+
+@dataclass(frozen=True)
+class Usage:
+    """Mirrors provider.proto Delta.input_tokens/output_tokens field-for-
+    field, including their presence semantics: None means "the provider
+    didn't report this," not zero. Step H's metering write path is what
+    turns this into usage_event's own NULL columns."""
+
+    input_tokens: int | None
+    output_tokens: int | None
 
 
 class ProviderFallback(Exception):
@@ -86,16 +110,24 @@ def _build_invoke_request(
     )
 
 
+def _usage_from_delta(delta: Any) -> Usage:
+    return Usage(
+        input_tokens=delta.input_tokens if delta.HasField("input_tokens") else None,
+        output_tokens=delta.output_tokens if delta.HasField("output_tokens") else None,
+    )
+
+
 async def relay(
     provider_stub: Any, request_id: str, worker_ref: str, worker: _WorkerNodeLike
-) -> AsyncIterator[Any]:
+) -> AsyncIterator[tuple[Any, Usage | None]]:
     """Dispatches `worker` (a template DAG's one WorkerNode) to
     provider-gateway as worker_ref, and relays each delta as a
-    dataplane SubmitResponse. Raises ProviderFallback if provider-gateway
-    signals one mid-dispatch, or ProviderStreamError if the gRPC call
-    itself fails — the caller (Submit's handler) turns either into a
-    clean typed error to the client, never lets a raw exception leak
-    through unexplained.
+    (dataplane SubmitResponse, Usage | None) pair — Usage is set exactly
+    once, on the final delta, else None. Raises ProviderFallback if
+    provider-gateway signals one mid-dispatch, or ProviderStreamError if
+    the gRPC call itself fails — the caller (Submit's handler) turns
+    either into a clean typed error to the client, never lets a raw
+    exception leak through unexplained.
     """
     from dataplane.v1 import dataplane_pb2
 
@@ -106,11 +138,13 @@ async def relay(
                 reason = provider_pb2.FallbackReason.Name(resp.fallback.reason)
                 raise ProviderFallback(resp.fallback.provider, reason)
             delta = resp.delta
-            yield dataplane_pb2.SubmitResponse(
+            submit_response = dataplane_pb2.SubmitResponse(
                 request_id=delta.request_id,
                 content=delta.content if delta.HasField("content") else None,
                 finish_reason=delta.finish_reason if delta.HasField("finish_reason") else None,
                 is_final=delta.is_final,
             )
+            usage = _usage_from_delta(delta) if delta.is_final else None
+            yield submit_response, usage
     except grpc.RpcError as e:
         raise ProviderStreamError(e) from e

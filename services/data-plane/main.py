@@ -1,17 +1,12 @@
-"""data-plane — Phase-03 Step G: the real Submit flow, assembled.
+"""data-plane — Phase-03 Step H: real metering, the EC2 gate.
 
-Composes every module built in Steps C-F into one real request path:
+Composes every module built in Steps C-G into one real request path:
 admission (scheduler.admit) -> complexity classification
 (planner.classifier) -> template instantiation (planner.templates) ->
 working-memory write (working_memory) -> role->model binding
 (scheduler.place, live provider health) -> single-worker dispatch and
-streaming fan-in (aggregator) -> working-memory cleanup. Each piece was
-already unit-tested and (where it touches a live signal) live-verified
-in isolation; this step is what proves they COMPOSE, tested end-to-end
-against provider-fake — and, because Step F's own pod-kill test caught
-the Dockerfile silently never shipping any of these modules, a
-successful Submit here is now also the proof that this image genuinely
-contains all of them (see verify_modules_present below).
+streaming fan-in (aggregator) -> working-memory cleanup -> metering
+(request_log + usage_event, on every path, success or failure).
 
 Structured logging on the SUCCESS path, not just errors, has been built
 in since Step B — this is the exact gap Phase-01's edge-gateway (Step
@@ -45,6 +40,8 @@ from redis.asyncio.cluster import RedisCluster
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "generated"))
 import aggregator  # noqa: E402
+import request_log  # noqa: E402
+import usage_event  # noqa: E402
 import working_memory  # noqa: E402
 from dataplane.v1 import dataplane_pb2, dataplane_pb2_grpc  # noqa: E402
 from planner import classifier, templates  # noqa: E402
@@ -80,6 +77,7 @@ _REQUIRED_MODULES = (
     "scheduler.place",
     "working_memory",
     "request_log",
+    "usage_event",
     "aggregator",
 )
 
@@ -133,6 +131,72 @@ provider_stub: provider_pb2_grpc.ProviderServiceStub | None = None
 grpc_server: grpc.aio.Server | None = None
 
 
+async def _finish_request(
+    span: trace.Span,
+    request_id: str,
+    org_id: str,
+    status: str,
+    start: float,
+    *,
+    usage: aggregator.Usage | None,
+    model_ref: str | None,
+) -> None:
+    """Metering, Step H: writes request_log on EVERY path (Phase-03.txt's
+    own words: "a request can fail before any provider usage exists at
+    all, and still needs a log row"). Writes usage_event too, but ONLY
+    when model_ref is not None — that's this function's signal that a
+    provider dispatch was actually attempted (bind_via_provider_health
+    succeeded and aggregator.relay was invoked). Admission/classifier/
+    pre-dispatch-health rejections never reach a provider at all, so
+    there is structurally nothing to bill; manufacturing an all-NULL
+    usage_event row for them would falsely imply "maybe tokens were
+    spent" about a call that provably never happened — the opposite
+    failure mode from the silent-zero this step exists to rule out.
+
+    tokens_in/tokens_out pass through exactly what `usage` reports
+    (None when the provider's final delta didn't set that field, most
+    notably provider-gateway's own best-effort synthetic delta on an
+    upstream error) — never coerced to zero. orch_tokens is written as a
+    real, known 0: the fast path structurally never invokes an LLM
+    planner (Steps C/D's own AST-based no-model-call proof), so this
+    isn't an estimate. usd_cost stays NULL — no pricing/rate source
+    exists anywhere yet; that belongs to the model registry (Phase-04,
+    Dependencies.txt F10), and fabricating a rate here would be the same
+    kind of "looks right, isn't" mistake this step exists to catch for
+    tokens.
+
+    The span attributes below are set from the SAME local variables in
+    the SAME call, right alongside the usage_event write — span and
+    usage_event cannot independently drift by construction, which is
+    what Phase-03.txt's "token/cost fields on the span match usage_event"
+    testing requirement is asking to prove. A field is OMITTED from the
+    span (not set to a sentinel) exactly when its usage_event column is
+    NULL — presence semantics applied to spans the same way Step A
+    applied them to the wire.
+    """
+    latency_ms = int((time.monotonic() - start) * 1000)
+    span.set_attribute("status", status)
+    await request_log.write(pg_pool, request_id, org_id, "Submit", status, latency_ms)
+
+    if model_ref is None:
+        return
+
+    tokens_in = usage.input_tokens if usage is not None else None
+    tokens_out = usage.output_tokens if usage is not None else None
+    orch_tokens = 0
+    usd_cost = None
+
+    await usage_event.write(
+        pg_pool, org_id, request_id, tokens_in, tokens_out, orch_tokens, usd_cost, model_ref
+    )
+    span.set_attribute("model_ref", model_ref)
+    span.set_attribute("orch_tokens", orch_tokens)
+    if tokens_in is not None:
+        span.set_attribute("tokens_in", tokens_in)
+    if tokens_out is not None:
+        span.set_attribute("tokens_out", tokens_out)
+
+
 class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
     async def Submit(self, request, context):
         request_id = request.request_id
@@ -155,6 +219,10 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                 log.info(
                     f"admission shed request_id={request_id} org_id={org_id} inflight={e.inflight}"
                 )
+                await _finish_request(
+                    span, request_id, org_id, "admission_shed", start,
+                    usage=None, model_ref=None,
+                )
                 await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(e))
                 return
 
@@ -171,6 +239,10 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                     log.info(
                         f"needs deliberate path request_id={request_id} org_id={org_id} "
                         f"reason={e.reason}"
+                    )
+                    await _finish_request(
+                        span, request_id, org_id, "unsupported", start,
+                        usage=None, model_ref=None,
                     )
                     await context.abort(grpc.StatusCode.UNIMPLEMENTED, str(e))
                     return
@@ -205,18 +277,37 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                         f"provider unavailable request_id={request_id} org_id={org_id} "
                         f"reason={e.reason}"
                     )
+                    await _finish_request(
+                        span, request_id, org_id, "provider_unavailable", start,
+                        usage=None, model_ref=None,
+                    )
                     await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
                     return
 
-                # Single-worker dispatch + streaming fan-in (Step G).
+                # Single-worker dispatch + streaming fan-in (Step G),
+                # capturing real usage off the final delta as it passes
+                # through (Step H) — never fabricated, never assumed.
+                captured_usage: aggregator.Usage | None = None
                 try:
                     stream = aggregator.relay(provider_stub, request_id, worker_ref, dag.worker)
-                    async for response in stream:
+                    async for response, usage in stream:
                         yield response
+                        if usage is not None:
+                            captured_usage = usage
                 except aggregator.ProviderFallback as e:
                     log.info(
                         f"provider fallback request_id={request_id} org_id={org_id} "
                         f"reason={e.reason}"
+                    )
+                    # provider-gateway declined before ever calling the
+                    # adapter (breaker/quota check, Step G's own relay.go
+                    # reading) — no dispatch happened, so unlike the
+                    # stream-error branch below, this one stays
+                    # model_ref=None too: nothing was attempted, nothing
+                    # to bill.
+                    await _finish_request(
+                        span, request_id, org_id, "provider_fallback", start,
+                        usage=None, model_ref=None,
                     )
                     await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
                     return
@@ -224,11 +315,28 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                     log.warning(
                         f"provider stream error request_id={request_id} org_id={org_id} error={e}"
                     )
+                    # Unlike every branch above, a real dispatch to the
+                    # provider was genuinely attempted here — real tokens
+                    # may have been spent before the connection broke.
+                    # This is the one failure path that still gets a
+                    # usage_event row: honestly incomplete (captured_usage
+                    # is whatever the best-effort final delta reported,
+                    # which is None/None unless the provider itself
+                    # managed to report something before dying), never a
+                    # silent zero pretending the call was free.
+                    await _finish_request(
+                        span, request_id, org_id, "provider_stream_error", start,
+                        usage=captured_usage, model_ref=worker_ref,
+                    )
                     await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
                     return
 
                 await working_memory.delete(redis_client, request_id)
                 submit_counter.inc()
+                await _finish_request(
+                    span, request_id, org_id, "ok", start,
+                    usage=captured_usage, model_ref=worker_ref,
+                )
             finally:
                 await admit.release(redis_client)
 
