@@ -309,13 +309,41 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                 # Single-worker dispatch + streaming fan-in (Step G),
                 # capturing real usage off the final delta as it passes
                 # through (Step H) — never fabricated, never assumed.
+                #
+                # Step J finding: the final response is held back and
+                # yielded LAST, only after working_memory cleanup and
+                # metering have already run — not yielded inline as each
+                # item arrives, the way every earlier item is. A real
+                # gRPC client (edge-gateway's own stream.rs: "stops at
+                # the first is_final chunk") legitimately stops polling
+                # the instant it receives the final application-level
+                # message; nothing requires it to poll once more just to
+                # observe the stream close. The old ordering (yield
+                # every item inline, run cleanup once the `async for`
+                # loop itself exits) silently depended on exactly that
+                # extra poll to resume this generator past its last
+                # yield — grpcurl happens to drain to the true stream
+                # end, which is exactly why this never surfaced in Steps
+                # G/H/I's own live verification, all done directly
+                # against grpcurl. The moment a real client (edge-
+                # gateway) was wired in at this step, it stopped polling
+                # right after the final chunk, the generator was
+                # effectively abandoned mid-cleanup: working_memory.
+                # delete() had already run by then, but usage_event/
+                # request_log never got written — a genuine,
+                # previously-undetected EC2-breaking bug, caught only
+                # because this step verifies against the real slice, not
+                # grpcurl.
                 captured_usage: aggregator.Usage | None = None
+                final_response = None
                 try:
                     stream = aggregator.relay(provider_stub, request_id, worker_ref, dag.worker)
                     async for response, usage in stream:
-                        yield response
                         if usage is not None:
                             captured_usage = usage
+                            final_response = response
+                            break
+                        yield response
                 except aggregator.ProviderFallback as e:
                     log.info(
                         f"provider fallback request_id={request_id} org_id={org_id} "
@@ -359,6 +387,8 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                     span, request_id, org_id, "ok", start,
                     usage=captured_usage, model_ref=worker_ref,
                 )
+                if final_response is not None:
+                    yield final_response
             finally:
                 await admit.release(redis_client)
 
