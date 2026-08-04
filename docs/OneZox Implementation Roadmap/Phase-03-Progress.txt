@@ -394,6 +394,106 @@ claims are now proven live, not just unit-tested; the Redis Cluster
 incident is the fourth time this exact failure class has surfaced this
 build (see A1-A8's entry) and reinforces that the session-start ritual
 is not optional even mid-phase.
+--------------------------------------------------------------------------------
+2026-08-04 — Step H: real metering (usage_event/request_log) — EC2 gate
+verified live: real tokens, three-way reconciliation, honest incomplete
+usage, and correct row presence across both dispatch and pre-dispatch
+failure paths
+--------------------------------------------------------------------------------
+Migrations were already applied (Step F pulled 0006/0007 forward for its
+own pod-kill proof) — reconfirmed both tables still exist with the right
+shape, no new migration needed. Step H's actual job, per that migration's
+own comment, was deciding exactly when usage_event gets written with
+fields NULL vs populated.
+
+SCOPE DECISION, stated plainly rather than assumed silently: usd_cost
+stays NULL this phase. No pricing/rate table exists anywhere in this
+codebase (grepped for cost_per_token/price_per/usd_cost — the only hits
+are the column itself and edge-gateway's own PLACEHOLDER_USD_COST=0.0
+from Phase-01, which data-plane's real numbers don't need to match since
+dataplane.proto's SubmitResponse never gained token/cost fields — Part
+L's metering lives on data-plane's own span + usage_event, not the wire
+contract edge relays to the client). Per-model pricing belongs to the
+signed model registry (Phase-04, Dependencies.txt F10); writing a
+fabricated rate now would be the same "looks right, isn't" mistake this
+step exists to rule out for tokens, just applied to cost instead.
+
+DESIGN: aggregator.relay() now yields (SubmitResponse, Usage | None)
+pairs — Usage captured exactly once, off the final delta only (provider.
+proto's own "set ONLY on the final delta" convention), fields
+individually None when the provider didn't report them. main.py's new
+_finish_request() helper writes request_log on EVERY exit path (six of
+them: admission_shed, unsupported, provider_unavailable,
+provider_fallback, provider_stream_error, ok) but usage_event only when
+model_ref is not None — the function's own signal that a provider
+dispatch was actually attempted. Four of the six failure/success paths
+never reach a provider at all (admission shed, classifier reject,
+ProviderUnavailable from the pre-dispatch health check, and
+provider-gateway's own pre-dispatch FallbackSignal, per relay.go: the
+breaker/quota check that raises FallbackError happens BEFORE the
+adapter's Invoke is ever called) — these get model_ref=None, no
+usage_event row at all, deliberately, not even an all-NULL one:
+manufacturing a billing row for a call that provably never touched a
+provider would falsely imply "maybe tokens were spent" about something
+that structurally could not have. Only provider_stream_error (a genuine
+mid-dispatch break) and ok get a usage_event row. Span attributes
+(tokens_in/tokens_out/orch_tokens/model_ref/status) are set from the
+exact same local variables as the usage_event write, in the same
+function call — cannot independently drift by construction, which is
+what the "span matches usage_event" proof below is actually checking.
+
+UNIT TESTS (the "math," against provider-fake's REAL canned numbers, not
+arbitrary stand-ins — 42/17, read directly from services/provider-fake/
+main.go's cannedInputTokens/cannedOutputTokens so a future drift there
+is caught): relay() captures Usage(42, 17) exactly on the final delta
+and None on every delta before it; relay() captures Usage(None, None) —
+verified != Usage(0, 0) — on provider-gateway's best-effort synthetic
+error delta; relay() never reads token fields off a non-final delta even
+if hypothetically present. usage_event.write() passes None through to
+the SQL parameter as None, not coerced to 0. 46 tests total, full suite
+and each file individually.
+
+LIVE VERIFICATION (in-cluster, via grpcurl against the deployed pod,
+plus a direct CockroachDB query and a Tempo trace query):
+
+1. REAL TOKENS, confirmed not estimated: a fake:normal Submit wrote
+   usage_event with tokens_in=42, tokens_out=17 — byte-identical to
+   provider-fake's own documented canned constants, not a char-count
+   estimate arrived at independently.
+
+2. THREE-WAY RECONCILIATION (the EC2 proof): for that same request,
+   queried Tempo directly (`GET /api/search?tags=request_id=...` ->
+   `GET /api/traces/{traceID}`) and read the data_plane.submit span's
+   own attributes: tokens_in=42, tokens_out=17, orch_tokens=0,
+   model_ref="fake:normal", status="ok" — identical, field for field, to
+   both the usage_event row and provider-fake's real reported numbers.
+   All three independent records of the one event agree.
+
+3. INCOMPLETE-USAGE PATH: switched STATIC_MODEL_REF to
+   fake:fail_mid_stream (genuinely mid-stream: two real content chunks
+   delivered, "Hello " / "from ", before the connection breaks — the
+   sharper proof than immediate-fail, which never streams any content at
+   all) via the same git-tracked-commit/Argo-sync/revert discipline Step
+   G established (kubectl set env gets reverted by Argo's self-heal, on
+   purpose). Result: usage_event wrote tokens_in=NULL, tokens_out=NULL,
+   orch_tokens=0 — NOT zero tokens_in/out pretending the call was free.
+   request_log recorded status="provider_stream_error". Client received
+   the two real chunks, then a clean UNAVAILABLE gRPC status — no hang,
+   no raw transport error leaking through.
+
+4. BOTH ROWS, BOTH PATHS — verified the full matrix, not just the two
+   headline cases: ok (both rows, real numbers), provider_stream_error
+   (both rows, honestly incomplete) — and, to prove the "no usage_event
+   for pre-dispatch failures" design decision is actually true and not
+   just asserted, sent a REQUEST_KIND_EMBEDDINGS request (classifier
+   rejection, no provider ever contacted): request_log got a row
+   (status="unsupported"), usage_event got ZERO rows for that
+   request_id, confirmed by direct count query. This is the sharper
+   proof of "honest, not manufactured" — a blanket "always write both"
+   rule would have hidden this distinction entirely.
+
+Restored STATIC_MODEL_REF to fake:normal (git-tracked, Argo-synced) as
+the lasting state after all three temporary routing changes.
 ================================================================================
 END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
