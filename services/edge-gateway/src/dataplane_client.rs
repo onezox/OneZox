@@ -9,8 +9,10 @@
 //! pattern is a fresh (cheap) client wrapper per call from a shared
 //! channel, not one client instance shared across concurrent requests.
 
+use opentelemetry::propagation::Injector;
 use tonic::Status;
 use tonic::transport::Channel;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::pb::dataplane::v1::dataplane_service_client::DataplaneServiceClient;
 use crate::pb::dataplane::v1::{SubmitRequest, SubmitResponse};
@@ -24,14 +26,48 @@ pub fn connect_lazy(endpoint: &str) -> Result<Channel, tonic::codegen::http::uri
     Ok(Channel::from_shared(endpoint.to_string())?.connect_lazy())
 }
 
+/// Adapts tonic's `MetadataMap` to `opentelemetry::propagation::Injector`
+/// so the W3C `traceparent` header can be written into outgoing gRPC
+/// metadata — gRPC metadata keys/values are ASCII-only and lowercase by
+/// HTTP/2 convention, which is exactly what MetadataKey/MetadataValue
+/// enforce; a key or value that somehow failed that (never true for a
+/// traceparent string) is silently dropped rather than panicking, since
+/// a missing trace parent should never take down a real request.
+struct MetadataInjector<'a>(&'a mut tonic::metadata::MetadataMap);
+
+impl Injector for MetadataInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes())
+            && let Ok(value) = tonic::metadata::MetadataValue::try_from(value)
+        {
+            self.0.insert(key, value);
+        }
+    }
+}
+
 /// Calls Submit and returns the response stream. Fresh `DataplaneServiceClient`
 /// per call (see module doc) — cheap, since `channel` itself is what's
 /// actually shared/reused.
+///
+/// Step L finding: injects the CURRENT tracing span's OTel context into
+/// the outgoing request's gRPC metadata as a `traceparent` header, so
+/// data-plane's own Submit span can be parented under this call instead
+/// of starting a disconnected second trace. `tracing::Span::current()`
+/// correctly resolves to the caller's `submit_span` here because
+/// `ingress.rs` calls this function via `.instrument(submit_span)` —
+/// `.instrument()` is what makes a span "current" for the duration of a
+/// future's polls, the same mechanism this module's own doc comment
+/// already relies on for logging/metrics correctness.
 pub async fn submit(
     channel: Channel,
     request: SubmitRequest,
 ) -> Result<tonic::Streaming<SubmitResponse>, Status> {
     let mut client = DataplaneServiceClient::new(channel);
+    let mut request = tonic::Request::new(request);
+    let otel_context = tracing::Span::current().context();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&otel_context, &mut MetadataInjector(request.metadata_mut()));
+    });
     let response = client.submit(request).await?;
     Ok(response.into_inner())
 }

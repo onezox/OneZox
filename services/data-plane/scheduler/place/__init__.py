@@ -21,6 +21,8 @@ live verification both focus on the unhealthy states, not the happy one.
 
 from dataclasses import dataclass
 
+from opentelemetry.propagate import inject
+
 # BreakerState enum values, mirroring proto/provider/v1/provider.proto's
 # numbering exactly (documented parity, verified by a test — same
 # approach Step C used for RequestKind). Kept as plain ints, not imported
@@ -112,8 +114,17 @@ async def bind_via_provider_health(stub: object, worker_ref: str) -> str:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "generated"))
     from provider.v1 import provider_pb2
 
+    # Step L finding: inject() reads the currently active OTel context
+    # (Submit's own span, since this call happens inside its `with`
+    # block) and writes it as a traceparent gRPC metadata entry —
+    # without this, provider-gateway's own ProviderHealth span starts a
+    # disconnected second trace instead of a child of Submit's.
+    carrier: dict[str, str] = {}
+    inject(carrier)
     provider = parse_provider(worker_ref)
-    resp = await stub.ProviderHealth(provider_pb2.ProviderHealthRequest(provider=provider))  # type: ignore[attr-defined]
+    resp = await stub.ProviderHealth(  # type: ignore[attr-defined]
+        provider_pb2.ProviderHealthRequest(provider=provider), metadata=list(carrier.items())
+    )
     if not resp.statuses:
         raise ProviderUnavailable(provider, "provider-gateway reported no status for this provider")
     s = resp.statuses[0]

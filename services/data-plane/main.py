@@ -32,6 +32,7 @@ from fastapi import FastAPI, Response
 from fastapi.responses import PlainTextResponse
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.propagate import extract
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -231,7 +232,21 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
             f"kind={dataplane_pb2.RequestKind.Name(request.kind)} model={request.model}"
         )
 
-        with tracer.start_as_current_span("data_plane.submit") as span:
+        # Step L finding: without extracting the incoming traceparent from
+        # the gRPC call's own metadata, this span starts as a fresh root
+        # every time — genuinely exported, genuinely correct-looking on
+        # its own, but disconnected from edge-gateway's trace. Three
+        # services each exporting their own well-formed spans LOOKED like
+        # tracing worked until someone actually counted trace IDs across
+        # the full slice and found three, not one. dict() over
+        # invocation_metadata()'s (key, value) tuples is the carrier
+        # shape opentelemetry.propagate.extract expects; gRPC metadata
+        # keys are already lowercase ASCII (HTTP/2 requirement), matching
+        # W3C traceparent's own casing.
+        parent_context = extract(dict(context.invocation_metadata()))
+        with tracer.start_as_current_span(
+            "data_plane.submit", context=parent_context
+        ) as span:
             span.set_attribute("request_id", request_id)
             span.set_attribute("org_id", org_id)
 

@@ -79,6 +79,18 @@ fn init_telemetry() -> opentelemetry_sdk::trace::SdkTracerProvider {
         .with_resource(resource)
         .build();
 
+    // Step L finding: without a global text-map propagator set, every
+    // OTel SDK (Rust, Python, Go alike) defaults to a no-op — trace
+    // context never crosses a gRPC hop even though each service exports
+    // spans correctly on its own. That produced three DISCONNECTED
+    // traces (one per service) that looked like tracing "worked" until
+    // someone actually counted trace IDs across the full slice. W3C
+    // TraceContext is the standard this project's own propagation (in
+    // dataplane_client::submit, below) is built against.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
     let tracer = provider.tracer(SERVICE_NAME);
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let fmt_layer = tracing_subscriber::fmt::layer().json();

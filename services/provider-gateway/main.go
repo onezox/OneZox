@@ -64,12 +64,14 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters"
@@ -153,6 +155,16 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 		sdktrace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
+
+	// Step L finding: without a global text-map propagator set, the Go
+	// SDK's default is a no-op — extracting a traceparent from incoming
+	// gRPC metadata (Invoke/ProviderHealth below) would silently do
+	// nothing even though the code calling Extract looks correct. Each
+	// of this project's three services (Rust, Python, Go) needed this
+	// exact same one-line fix; Python's SDK is the only one of the three
+	// that defaults to a real W3C TraceContext propagator already.
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
 	return tp, nil
 }
 
@@ -222,6 +234,28 @@ func toAdapterRequest(req *pb.InvokeRequest, model string) adapters.InvokeReques
 	return out
 }
 
+// extractTraceContext reads a W3C traceparent from the incoming gRPC
+// call's own metadata and returns a context carrying it as the parent —
+// Step L finding: without this, Invoke/ProviderHealth each started a
+// disconnected second (or third) trace instead of continuing the caller
+// (data-plane)'s own Submit span, even though every span involved
+// exported correctly on its own. Three services each exporting
+// well-formed spans looked like tracing worked until someone actually
+// counted trace IDs across the full slice and found three, not one.
+func extractTraceContext(ctx context.Context) context.Context {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ctx
+	}
+	carrier := propagation.MapCarrier{}
+	for k, v := range md {
+		if len(v) > 0 {
+			carrier[k] = v[0]
+		}
+	}
+	return otel.GetTextMapPropagator().Extract(ctx, carrier)
+}
+
 func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer[pb.InvokeResponse]) error {
 	log := s.log.With("request_id", req.GetRequestId(), "worker_ref", req.GetWorkerRef())
 
@@ -230,7 +264,7 @@ func (s *server) Invoke(req *pb.InvokeRequest, stream grpc.ServerStreamingServer
 	// breaker/adapter/stream are siblings under this one span, per
 	// Phase-02.txt's own module list (Part Q), not nested under each
 	// other.
-	ctx, rootSpan := tracer.Start(stream.Context(), "provider_gateway.invoke",
+	ctx, rootSpan := tracer.Start(extractTraceContext(stream.Context()), "provider_gateway.invoke",
 		trace.WithAttributes(
 			attribute.String("request_id", req.GetRequestId()),
 			attribute.String("worker_ref", req.GetWorkerRef()),
@@ -429,6 +463,13 @@ func breakerDecisionToStateValue(d breaker.Decision) float64 {
 // pure status READ, not a decision: it never increments quota (Peek, not
 // Increment) and never trips or resets the breaker.
 func (s *server) ProviderHealth(ctx context.Context, req *pb.ProviderHealthRequest) (*pb.ProviderHealthResponse, error) {
+	// Step L: ProviderHealth previously had no span of its own at all —
+	// scheduler.place's own bind_via_provider_health call (data-plane,
+	// Step E) was invisible in the trace tree regardless of propagation.
+	// Both fixed together: a real child span, correctly parented.
+	ctx, span := tracer.Start(extractTraceContext(ctx), "provider_gateway.provider_health")
+	defer span.End()
+
 	names := s.registry.Names()
 	if p := req.GetProvider(); p != "" {
 		names = []string{p}

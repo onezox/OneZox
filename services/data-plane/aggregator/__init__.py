@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import grpc
+from opentelemetry.propagate import inject
 from provider.v1 import provider_pb2
 
 
@@ -131,9 +132,18 @@ async def relay(
     """
     from dataplane.v1 import dataplane_pb2
 
+    # Step L finding: without this, provider-gateway's own
+    # provider_gateway.invoke span starts a disconnected second trace
+    # instead of a child of the currently active data_plane.submit span
+    # (relay() always runs inside that span's `with` block, so inject()
+    # picks it up automatically) — the real provider call, the one span
+    # this whole slice most needs visible in one tree, was exactly the
+    # one silently orphaned.
+    carrier: dict[str, str] = {}
+    inject(carrier)
     invoke_req = _build_invoke_request(request_id, worker_ref, worker)
     try:
-        async for resp in provider_stub.Invoke(invoke_req):
+        async for resp in provider_stub.Invoke(invoke_req, metadata=list(carrier.items())):
             if resp.HasField("fallback"):
                 reason = provider_pb2.FallbackReason.Name(resp.fallback.reason)
                 raise ProviderFallback(resp.fallback.provider, reason)

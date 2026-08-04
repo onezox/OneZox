@@ -99,7 +99,7 @@ class _FakeProviderStub:
     def __init__(self, responses: list[Any]) -> None:
         self._responses = responses
 
-    def Invoke(self, req: Any) -> AsyncIterator[Any]:
+    def Invoke(self, req: Any, metadata: Any = None) -> AsyncIterator[Any]:
         async def gen() -> AsyncIterator[Any]:
             for resp in self._responses:
                 yield resp
