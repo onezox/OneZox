@@ -53,7 +53,7 @@ spec:
     spec:
       containers:
         - name: provider-gateway
-          image: onezox/provider-gateway:6fc9c95f029e
+          image: onezox/provider-gateway:ccf83a5
           imagePullPolicy: IfNotPresent
           envFrom:
             - secretRef:
