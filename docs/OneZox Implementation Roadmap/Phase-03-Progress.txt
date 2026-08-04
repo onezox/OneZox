@@ -571,6 +571,108 @@ pricing/rate source exists anywhere in this codebase; that belongs to
 the model registry (Phase-04, Dependencies.txt F10). Carry this forward
 as an explicit, named deferral in Phase-03-Complete.txt, not a silent
 gap.
+--------------------------------------------------------------------------------
+2026-08-04 — Step J: mesh-identity-safe cutover from dataplane-stub —
+the real slice is now live end-to-end, a genuine EC2-breaking bug was
+caught and fixed by this step's own "verify against the real slice"
+requirement, and a process mistake (an uncommitted "commit") was caught
+by Argo CD's own refusal to drift
+--------------------------------------------------------------------------------
+SEQUENCE, same mesh-identity-safe ordering as P01 Step F2 / P02 Step K3:
+(1) data-plane-mtls added and confirmed VALID:true, both identities
+(edge-gateway=889, data-plane=32903) confirmed resolved via `cilium-dbg
+identity list` — BEFORE (2) the switch (edge-gateway's
+DATAPLANE_STUB_ENDPOINT default flipped from dataplane-stub to
+data-plane, both the code default AND the deployed image, so a fresh
+clone with no env override also reflects reality, not just a manifest
+override layered on a stale default) — BEFORE (3) dataplane-stub's own
+removal. No window where the real data plane was live without mesh
+identity.
+
+FINDING 1 (real, EC2-breaking bug, caught only because this step verifies
+against the real slice, not grpcurl): the first real request through
+edge-gateway's actual public endpoint got a complete, correct SSE
+response — but data-plane's own logs showed only "request received",
+never "request completed", and usage_event/request_log got ZERO rows.
+Root cause: main.py's Submit handler yielded every response inline,
+including the final one, then ran working_memory.delete()/
+_finish_request() only once the `async for` loop over aggregator.relay()
+exited — which only happens once the CLIENT polls the gRPC stream one
+more time past the final chunk. grpcurl happens to drain to the true
+stream end (which is exactly why Steps G/H/I's own live verification,
+all done directly via grpcurl, never surfaced this). edge-gateway's own
+stream.rs is explicit about its behavior: "stops at the first is_final
+chunk" — entirely reasonable client behavior — so every real request
+silently never got metered. Confirmed via Redis: admission counter was
+back to 0 and the workingmem: key was already gone (working_memory.
+delete() DID run), but no DB rows existed — meaning the generator ran
+past cleanup's first line and was cut off specifically inside
+_finish_request() itself, consistent with a client-driven stream
+cancellation landing mid-write. FIXED by holding the final response back
+and running working_memory cleanup + metering BEFORE yielding it, so the
+server's own bookkeeping never depends on the client polling again after
+it has everything it needs — re-verified with a second real request
+through edge-gateway: "request completed" logged, usage_event/
+request_log both correct (tokens_in=42, tokens_out=17, org_id correct).
+
+FINDING 2 (process mistake, self-caught): after the first cleanup commit
+("prune dataplane-stub..."), Argo CD kept reporting dataplane-stub-mtls
+as still Synced/tracked no matter how many times `argocd app sync
+--prune` and `--hard-refresh` were run. Root cause: `git rm -r
+services/dataplane-stub platform/stubs/dataplane-stub` auto-stages
+deletions, but the follow-up `git add <specific files>` for the actual
+EDITS (ciliumnetworkpolicy.yaml, ci.yml, prometheus-values.yaml,
+ingress.rs) silently failed to stage them — the commit that claimed to
+remove dataplane-stub-mtls only ever contained file deletions, no
+insertions, confirmed by `git show <commit> -- ciliumnetworkpolicy.yaml`
+returning an empty diff. Argo CD was correctly refusing to prune a
+resource still present in git — it caught a genuine gap between "commit
+message says X" and "commit actually contains X" that a less careful
+sync tool might have silently gone along with. Fixed with a follow-up
+commit that actually staged and committed the edits, then a fresh
+rebuild/retag of edge-gateway (same image digest as before — the source
+was already on disk when the earlier image was built, just not
+committed to git — but the tag now correctly traces to a commit that
+contains it, restoring the "image tag = git commit SHA" contract).
+
+CLEANUP, to the P02 completeness bar: services/dataplane-stub/ and
+platform/stubs/dataplane-stub/ deleted outright; dataplane-stub-mtls
+removed (confirmed `Pruned` by Argo, not just absent from the file);
+the dataplane-stub -> edge-gateway reverse rule removed from
+edge-gateway-mtls (a pure Phase-00 capability-proof pairing, never
+functionally used, matching the precedent provider-gateway-mtls's own
+header comment already set for the equivalent reverse rule at P02 K3);
+provider-gateway-mtls's port-50051 rule narrowed from the Step B
+coexistence matchExpressions [dataplane-stub, data-plane] back to a
+single data-plane matchLabels rule (confirmed via a fresh `kubectl get
+-o yaml`, not assumed from the diff); CI matrix and Prometheus scrape
+target both swapped to data-plane; edge-gateway's two user-facing
+"dataplane-stub" strings (a bad_gateway error message, a warn! log line)
+updated to "data-plane" for accuracy.
+
+FINAL LIVE VERIFICATION (after the real fix AND the real cleanup were
+both actually deployed — not the false-clean intermediate state):
+authenticated request through edge-gateway's real /v1/chat/completions
+(seeded a dedicated phase03-step-j-test-tenant via the established
+data/seed/seed-test-tenant.sh rather than touching Phase-01's shared
+test tenant/key) produced a complete SSE stream; data-plane's own logs
+showed "request completed"; usage_event/request_log both correct
+(tokens_in=42, tokens_out=17, correct org_id, status=ok); a fresh
+`cilium-dbg bpf auth list` (queried against the CORRECT node's Cilium
+agent — the first attempt queried the wrong node and found nothing,
+since edge-gateway and data-plane both schedule onto onezox-dev-worker,
+not the node the cilium pod picked by pod-list-order happened to be on)
+showed a freshly-timestamped spire-authenticated pairing between
+identity 889 (edge-gateway) and 32903 (data-plane). The slice is now
+edge-gateway -> data-plane -> provider-gateway -> provider-fake, for
+real, with dataplane-stub gone.
+
+TRACKER NOTE, carried forward again for the Phase-03 completion record:
+usd_cost stays NULL (Step H/I) — no pricing source exists yet, belongs
+to Phase-04's model registry. Redis working-memory isolation relies on
+unguessable server-generated request_ids and correct per-request
+scoping in code, not a per-tenant ACL (Step I) — both still true and
+unaffected by this step.
 ================================================================================
 END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
