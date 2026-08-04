@@ -494,6 +494,83 @@ plus a direct CockroachDB query and a Tempo trace query):
 
 Restored STATIC_MODEL_REF to fake:normal (git-tracked, Argo-synced) as
 the lasting state after all three temporary routing changes.
+--------------------------------------------------------------------------------
+2026-08-04 — Step I: tenant isolation (EC3), positive-controlled and
+adversarial — same discipline as P01's H2 and P02's L1/L2
+--------------------------------------------------------------------------------
+SCOPE DECISION, asked and confirmed rather than guessed: the
+identity-reject path validates ONLY org_id, not user_id/project_id, even
+though Phase-03.txt's Part O text reads "org_id/user_id/project_id...
+no call proceeds without it." Checked edge-gateway's own normalize.rs
+first: `org_id: identity.org_id.to_string()` (never Option) versus
+`user_id: identity.user_id.map(...).unwrap_or_default()` and the same
+for project_id — edge-gateway's own real design treats user_id/project_id
+as legitimately absent (e.g. API-key-only auth resolving no specific
+user/project), sent as "" on entirely normal traffic. Requiring them
+non-empty here would reject real, legitimate requests edge-gateway is
+designed to send; org_id is the only field every downstream FK
+(usage_event.org_id, request_log.org_id) actually depends on. Asked the
+user directly given the tension between the architecture text and the
+real code; confirmed org_id-only.
+
+THREE PROOFS, all live and in-cluster:
+
+1. IDENTITY-REJECT PATH: a Submit with identity.org_id="" got a clean
+   InvalidArgument ("request missing required org_id"), immediately, via
+   identity.validate() checked before admission or anything else runs.
+   Confirmed zero usage_event AND zero request_log rows for that
+   request_id — no row under a placeholder/default org_id either, which
+   would itself have been a cross-tenant leak by omission. A structured
+   WARNING log line is the only record (there is no real tenant to
+   attribute a durable audit row to).
+
+2. POSITIVE CONTROL, done BEFORE trusting the concurrent test (same
+   order P01's H1 and P02's L1 used — prove the detector can catch a
+   planted problem before trusting a clean result from it): manually
+   INSERTed a usage_event row for request_id='positive-control-leak-test'
+   tagged with Tenant B's org_id, then ran the exact comparison the real
+   test would use ("does this request's org_id match its expected
+   tenant?") — it correctly returned false. Deleted the planted row
+   before proceeding. This is what makes the concurrent test's "all
+   matched" result below trustworthy rather than a rubber stamp.
+
+3. BEHAVIORAL, UNDER REAL CONCURRENCY (not structural — different Redis
+   keys prove nothing on their own): two real tenants (org_ids
+   044122c4-.../16b33bc8-...) driven through genuine concurrent Submit
+   calls, both against fake:slow specifically so they overlap in actual
+   wall-clock time (6x700ms chunks each, ~4.2s), each carrying a unique
+   canary message ("CANARY-TENANT-A-f3a9c1" / "CANARY-TENANT-B-9d7e42").
+   Fired both in the background of one shell, slept 1.5s, then read
+   BOTH workingmem: Redis keys while BOTH requests were still genuinely
+   in flight simultaneously (confirmed by the sleep landing mid-stream,
+   well before either's ~4.2s completion) — each key held ONLY its own
+   tenant's canary, zero cross-contamination. Grepped both full response
+   streams for the other tenant's canary string: zero matches either
+   direction (moot for provider-fake's own canned content, which doesn't
+   echo the prompt, but confirmed anyway as the user-facing consequence
+   check). After both completed: usage_event/request_log rows for both
+   request_ids carried the correct, non-swapped org_id (re-using
+   Finding 2's exact comparison, now trusted) and both workingmem: keys
+   were gone (the Step F cleanup proof, now reconfirmed under genuine
+   concurrent load rather than a single sequential request).
+
+HONEST LIMITATION, worth stating plainly rather than leaving implicit:
+Redis working-memory isolation in this phase is NOT enforced by any
+per-tenant ACL (Redis Cluster has none configured, and building one is
+out of scope) — it holds because (a) request_id is a server-generated,
+unguessable UUIDv4 (edge-gateway's pipeline.rs: `Uuid::new_v4()`, never
+client-supplied) and (b) data-plane's own code always reads/writes
+workingmem: using the exact per-request local `request_id` variable,
+never a shared or global one. The concurrency proof above is what
+actually establishes (b) is true in the running code, not merely
+asserted from reading it.
+
+TRACKER NOTE for the Phase-03 completion record: usd_cost stays NULL for
+the whole phase (Step H's own decision, re-confirmed here) — no
+pricing/rate source exists anywhere in this codebase; that belongs to
+the model registry (Phase-04, Dependencies.txt F10). Carry this forward
+as an explicit, named deferral in Phase-03-Complete.txt, not a silent
+gap.
 ================================================================================
 END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
