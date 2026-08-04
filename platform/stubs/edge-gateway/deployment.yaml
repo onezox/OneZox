@@ -25,7 +25,7 @@ spec:
     spec:
       containers:
         - name: edge-gateway
-          image: onezox/edge-gateway:phase01
+          image: onezox/edge-gateway:6c08f25
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
