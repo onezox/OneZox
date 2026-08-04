@@ -36,7 +36,7 @@ spec:
     spec:
       containers:
         - name: data-plane
-          image: onezox/data-plane:39f1bccfc41b
+          image: onezox/data-plane:bed223a
           imagePullPolicy: IfNotPresent
           env:
             # Step G/H/I testing all runs against provider-fake, mind
