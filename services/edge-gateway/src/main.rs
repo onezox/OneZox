@@ -128,10 +128,14 @@ async fn main() {
     let admission_soft_limit = env_u64("ADMISSION_SOFT_LIMIT", 100);
     let admission_hard_limit = env_u64("ADMISSION_HARD_LIMIT", 200);
 
-    // Temporary downstream (Phase-01.txt) until Phase-03's real data plane.
+    // Phase-03 Step J: real downstream (data-plane), cut over from
+    // Phase-00/01's dataplane-stub. Env var name kept as
+    // DATAPLANE_STUB_ENDPOINT — only its default value changes here — so
+    // this stays a one-line diff rather than a rename that would touch
+    // every call site for no functional reason.
     let dataplane_endpoint = env(
         "DATAPLANE_STUB_ENDPOINT",
-        "http://dataplane-stub.default.svc.cluster.local:50051",
+        "http://data-plane.default.svc.cluster.local:50051",
     );
     let dataplane_channel = dataplane_client::connect_lazy(&dataplane_endpoint)
         .expect("invalid DATAPLANE_STUB_ENDPOINT");
