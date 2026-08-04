@@ -304,6 +304,96 @@ that was directly confirmed to be SET, not just intended — the
 immediate-after-kill check literally read the countdown), and durable
 state persists elsewhere, entirely independent of any specific
 data-plane pod's fate.
+--------------------------------------------------------------------------------
+2026-08-04 — Step G: assembled Submit flow verified live against
+provider-fake; caught a stale Redis Cluster (session-start ritual
+skipped) and confirmed model source is a deployment-level static ref,
+not a per-request override
+--------------------------------------------------------------------------------
+FINDING 1 (pre-existing, not introduced by Step G): after syncing the
+Step G image, both the new and the pre-existing data-plane pods hung
+forever right after "wrote health_probe row" and never opened port 8080,
+so the liveness probe killed them (exit 137) in an endless CrashLoop.
+`redis-cli cluster info` showed cluster_state:fail (5461/16384 slots ok,
+10923 pfail) — the WSL2 host-restart gossip-state-drift failure class
+CLAUDE.md's session-start ritual exists specifically to catch, and this
+session had not run scripts/recover-redis-cluster.sh before starting.
+The pod wasn't crashing on a bug; it was blocked inside its own Redis
+Cluster client setup, indefinitely, with no timeout — a silent hang, not
+a loud failure, which is worth remembering: a stuck-not-crashing pod
+with no further log output after a known I/O step is now a first-line
+Redis Cluster health suspect. Ran the recovery script (reset the 6
+redis-cluster pods, re-ran redis-cluster-init, confirmed 16384/16384
+slots ok); it also has a step 6 that nudges any stuck Redis-dependent
+stub pods, which threw "provider-stub: no pods found" — a stale
+reference to a pod pruned in Phase-02, not a new problem. Deleted the
+stuck data-plane pods to force a clean reschedule against the
+now-healthy cluster; the fresh pod booted cleanly through every stage,
+including the Step G smoke-test line ("boot: all required modules
+present: [...aggregator]").
+
+FINDING 2: the Step G task description asked to test fake:slow/fake:fail
+via a per-request `worker_ref`, but Phase-03's scheduler binds against
+STATIC_MODEL_REF (a Deployment-level env var), and Submit's request.model
+field is not consulted — this is the phase's own documented constraint
+("Model source is a STATIC ref this phase... do NOT build registry
+lookup now"), not an oversight. A grpcurl call with model:"fake:slow"
+therefore silently ran against whatever STATIC_MODEL_REF actually was
+(fake:normal), returning in 0.07s instead of the expected ~4.2s —
+caught by checking timing, not by an error, which is exactly the kind of
+false-positive Step C/D's "assert the negative" discipline warns about.
+First fix attempt was `kubectl set env deployment/data-plane
+STATIC_MODEL_REF=fake:slow` directly against the cluster; Argo CD's
+self-heal reverted it within the sync interval (confirmed via `kubectl
+get deployment ... -o jsonpath='{...env}'` flipping back to fake:normal
+on its own) — a correct enforcement of CLAUDE.md's "never kubectl apply
+directly, go through Argo CD" rule, not a bug, and a useful live
+confirmation that self-heal is actually wired up. Redone properly: three
+sequential git-tracked commits (fake:slow -> fake:fail -> fake:normal),
+each pushed and `argocd app sync onezox-stubs`'d before testing, ending
+on fake:normal as the lasting state.
+
+METHOD/RESULTS (live, in-cluster, via grpcurl against the pod's Service,
+port-forwarded — host-side gRPC works fine here, unlike Redis Cluster's
+client-side MOVED-redirect problem):
+  - fake:normal: full assembled chain (admit -> classify -> template ->
+    working_memory write -> scheduler bind -> aggregator relay ->
+    working_memory delete) produced the correct 6-chunk stream plus a
+    final is_final=true/finish_reason="stop" message, and both the
+    "request received" and "request completed
+    latency_ms=..." structured log lines appeared — the
+    integration proof AND, since this is the first Submit call to
+    actually execute classifier/templates/scheduler/working_memory/
+    aggregator inside the running pod, the image-completeness proof
+    Step F's Dockerfile bug motivated adding verify_modules_present()
+    for.
+  - fake:slow: 6 chunks at 700ms apiece streamed through the full chain
+    (provider-fake -> provider-gateway -> data-plane -> grpcurl client)
+    with measured wall-clock elapsed=4.28s, matching 6x700ms — confirms
+    no buffering/batching anywhere in the relay path collapses the
+    delay, i.e. backpressure genuinely holds end-to-end rather than the
+    provider-gateway or data-plane draining the upstream stream early
+    into memory.
+  - fake:fail: provider-fake returns HTTP 503 with no streaming at all;
+    provider-gateway's adapter (Step A2's "error-path best-effort
+    delta") surfaces one best-effort Delta with finish_reason="error"
+    before the stream terminates with a genuine grpc.RpcError
+    (UNAVAILABLE); aggregator.relay() yields that delta normally, then
+    the next iteration raises ProviderStreamError, which Submit converts
+    to a clean `context.abort(UNAVAILABLE, ...)` — the client-visible
+    result is one partial message followed by a single well-formed
+    UNAVAILABLE status (grpcurl's own "ERROR: Code: Unavailable" block),
+    not a raw transport failure or a hang. The pod's own "provider
+    stream error ..." WARNING log line appeared. Confirmed the `finally:
+    await admit.release(...)` held on this error path too: read
+    `admission:data-plane:inflight` from Redis directly after the call
+    and got 0, not a leaked count.
+
+Both of Step G's Dockerfile-completeness and backpressure/error-path
+claims are now proven live, not just unit-tested; the Redis Cluster
+incident is the fourth time this exact failure class has surfaced this
+build (see A1-A8's entry) and reinforces that the session-start ritual
+is not optional even mid-phase.
 ================================================================================
 END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
