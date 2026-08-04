@@ -1,0 +1,155 @@
+================================================================================
+PHASE-03 — DATA PLANE FAST PATH — PROGRESS / FINDINGS RECORD
+================================================================================
+This file is NOT a step-by-step changelog of Phase-03 code changes — git log
+and each commit message are the record for that (every Phase-03 commit is a
+verified, independently-testable checkpoint per CLAUDE.md). This file exists
+for things git history doesn't capture on its own: deviations from expected
+behavior, process gaps, and findings that future sessions (or a fresh
+engineer) need to know about before they re-discover them the hard way.
+Entries are dated and point-in-time. Matches the same convention
+Phase-01-Progress.txt and Phase-02-Progress.txt established.
+
+--------------------------------------------------------------------------------
+2026-08-04 — Steps A1-A8: real token-usage propagation + ProviderHealth,
+completing two Phase-02-declared-but-deferred obligations at their first
+real consumer
+--------------------------------------------------------------------------------
+CONTEXT: Phase-03's plan reached Step A (contracts) and found provider-gateway
+had no mechanism to carry real token usage at all — Delta had no usage field,
+and none of the three real adapters even parsed a usage payload out of their
+provider's response (OpenAI: stream_options.include_usage was never set;
+Anthropic: message_start was discarded entirely; Google: usageMetadata was
+never read). This lines up with Phase-01-Complete.txt and Phase-02-Complete.txt
+both already naming real metering as "Phase-03's job" — not a P02 defect, an
+expected gap closed at its first real consumer. Separately, ProviderHealth
+(declared in Phase-02.txt's own APIS CREATED section) was still Unimplemented
+for the same reason: no consumer existed before Phase-03's scheduler.
+
+BOUNDARY HELD (explicit user instruction, worth recording because it shaped
+every line of this work): provider-gateway CARRIES and REPORTS usage; it
+never ACTS on it. No token-based rate limiting (that's Dependencies.txt F2,
+P13), no cost-routing (P12-P14's learned router), no analytics (P13). Confirmed
+at the end of Steps A1-A7: no new code path reads InputTokens/OutputTokens for
+any decision — only reads and forwards.
+
+A1: provider.proto's Delta gains optional int32 input_tokens/output_tokens.
+Presence IS the signal (proto3 optional) — set means a real number, unset
+means "not reported," never coerced to zero anywhere downstream. buf lint and
+buf breaking both pass clean (purely additive).
+
+A2: internal adapters.Delta mirrors the same two fields; relay.go carries them
+through unconditionally when set. CRITICAL design point, per explicit
+instruction to check the unhappy path before building it: "final delta only
+on the happy path" would create a billing hole — a mid-stream provider
+failure after real tokens were already generated would otherwise report
+nothing, and a caller could easily (wrongly) read that as zero. Fixed by
+having main.go's Invoke handler send ONE best-effort final delta
+(finish_reason="error", usage left UNSET) on any relay.UpstreamError, right
+before returning the error status — gRPC server-streaming allows sending
+messages before the terminating status, so this doesn't require Relay's own
+loop to change. The one gap this can't close (there's no live channel left to
+send anything through): if the CALLER's own connection to provider-gateway
+drops before any final delta arrives at all, there's nothing provider-gateway
+can do — that case has to be handled symmetrically at the caller (data-plane's
+own Step H metering: "call ended with no final delta" = incomplete, not zero).
+
+A3 (OpenAI): real wire-format subtlety caught here, not assumed — with
+stream_options.include_usage, usage arrives in a DEDICATED final chunk (empty
+choices, populated usage) that comes AFTER the finish_reason chunk, not on
+it. The adapter previously returned IsFinal the instant it saw finish_reason
+(old design, per the file's own former header comment) — that would have
+skipped the usage chunk entirely. Restructured to defer finish_reason in
+stream.pendingFinishReason and keep reading one more chunk; falls back to
+returning the deferred finish_reason with usage left unset if [DONE] arrives
+without a usage chunk ever showing up (handles a misbehaving response
+gracefully rather than losing the finish signal).
+
+A4 (Anthropic): usage is split across TWO different events, not one dedicated
+chunk — message_start carries usage.input_tokens (the very first event,
+before any content), message_delta carries usage.output_tokens alongside
+stop_reason. message_start previously fell into the catch-all "no data
+needed" default branch and was silently discarded. Now captured into
+stream.inputTokens and reunited with message_delta's output_tokens on the one
+final delta. Confirmed input_tokens stays genuinely nil (not 0) if
+message_start is somehow never seen.
+
+A5 (Google): simplest of the three — Gemini's usageMetadata is a top-level
+chunk field present on every chunk as a running cumulative count, just read
+off the same chunk that carries finishReason. Not exercised against the real
+API this phase (Dependencies.txt F13 — quota=0 on the available key); verified
+against a canned real-shaped payload only, same interim measure F13 already
+documents for the rest of this adapter.
+
+A6 (provider-fake): normal/slow modes attach fixed InputTokens=42/
+OutputTokens=17 to the final chunk (deterministic, for Step H4's later
+metering-math tests). New fail_mid_stream mode: two real content chunks, then
+a deliberately truncated JSON fragment, connection closed — simulates a real
+provider breaking mid-stream, which is exactly the scenario A2's best-effort-
+delta design exists for.
+
+A7 (ProviderHealth): implemented as a pure status READ — quota.Counter gained
+Peek (alongside the existing Increment) specifically so checking headroom
+never itself consumes any quota; breaker.CurrentState (already built in P02
+for exactly this RPC) supplies breaker state. Both fail open on a store error
+at the call site (not baked into Headroom's own return value, mirroring how
+Enforce already separates its fail-open Decision from its untrustworthy-on-
+error current value). adapters.Registry gained Names() so "report on every
+known provider" (empty ProviderHealthRequest.provider) reflects whichever
+adapters actually registered, not a hardcoded list.
+
+A8 — LIVE VERIFICATION (both services rebuilt, redeployed via onezox-stubs,
+confirmed against the running cluster, not just unit tests):
+
+1. Real usage, happy path (fake:normal): final delta carried
+   inputTokens=42, outputTokens=17 — exactly matching provider-fake's fixed
+   constants, confirming the full chain (fake server -> fake adapter ->
+   internal Delta -> relay -> proto Delta -> grpcurl) end-to-end.
+
+2. Real usage, mid-stream failure (fake:fail_mid_stream): FIRST ATTEMPT
+   caught a real gap — the fake ADAPTER's own client-side parseMode
+   allowlist didn't know "fail_mid_stream" yet (only the fake SERVER, Step
+   A6, had been taught the mode), so the request was rejected client-side
+   before ever reaching provider-fake. Fixed (parseMode extended), rebuilt,
+   redeployed. Retried and got a SECOND, unrelated failure: DeadlineExceeded.
+   Root-caused via provider-gateway's own logs to Redis Cluster connection
+   timeouts ("dial tcp ... i/o timeout", "cluster has no nodes") — this
+   session's host had restarted (silently, without an obvious session
+   boundary) since the cluster was last known healthy, the exact
+   documented WSL2-restart gossip-state-loss failure mode CLAUDE.md's
+   session-start ritual exists for, hit mid-build because that ritual
+   wasn't re-run after the restart. Recovered via
+   scripts/recover-redis-cluster.sh (cluster_state:fail -> ok, 16384/16384
+   slots) plus a manual `kubectl rollout restart deployment/provider-gateway`
+   (the script only nudges dataplane-stub/provider-stub, not
+   provider-gateway/provider-fake — provider-gateway's own already-running
+   pods were holding a Redis client cached against pre-reset node IPs and
+   needed a fresh client, not just a healthy cluster to reconnect to).
+   THIRD attempt succeeded cleanly: two real content deltas delivered
+   ("Hello ", "from ") — confirming already-sent content survives a later
+   mid-stream failure — followed by the best-effort final delta
+   (finish_reason="error", is_final=true, usage fields genuinely ABSENT,
+   not zero), with the underlying RPC error correctly
+   Unavailable/"decode chunk: unexpected EOF" (a real error, not a clean
+   EOF that would have been misread as success).
+
+3. ProviderHealth: empty request correctly enumerated all 4 registered
+   providers (fake, openai, anthropic, google — all three real keys are
+   present in this deployment); fake showed breaker=CLOSED,
+   quota_headroom=0.983 (reflecting the one real request already made in
+   the current window, not a stale/cached value); openai/anthropic/google
+   all showed breaker=CLOSED, headroom=1.0 (correct defaults — never
+   called this session, fresh window). A provider-scoped request
+   correctly filtered to just that one provider's status.
+
+LESSON RECORDED for future sessions in this environment: a silent host
+restart (no explicit "new session" signal, just a date rollover noticed
+mid-task) can leave Redis Cluster gossip state stale WITHOUT the working
+directory or conversation otherwise looking any different — the failure
+only surfaced as a mid-build timeout on an otherwise-unrelated test. The
+session-start ritual (recover-redis-cluster.sh + confirm cluster_state:ok)
+needs to be treated as "run when in doubt," not only literally at the
+first message of a conversation.
+================================================================================
+END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
+================================================================================
