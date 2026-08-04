@@ -246,6 +246,64 @@ before each call.
 All test-induced state reset afterward (breaker forced back to
 {"state":"closed","failures":0,"opened_at":0}, the quota key deleted) so
 later steps start from a clean "fake" provider, not test debris.
+--------------------------------------------------------------------------------
+2026-08-04 — Step F: both statelessness halves proven under a real,
+hard mid-request pod kill; Dockerfile found to be silently stale
+--------------------------------------------------------------------------------
+FINDING (caught rebuilding for this test, before any live verification
+ran): data-plane's Dockerfile still only copied main.py and generated/ —
+written in Step B, before planner/, scheduler/, working_memory/, or
+request_log/ existed, and never updated as each was added across Steps
+C-F. The rebuilt image's manifest hash came back byte-identical to the
+Step B build, which is what surfaced it — none of these modules have
+been wired into main.py/Submit yet, so the running service never
+actually needed to import them, and this would otherwise have surfaced
+as a confusing failure the moment something finally did. Fixed by adding
+the four missing COPY lines; confirmed the rebuilt manifest hash actually
+changed this time.
+
+METHOD (both halves must pass, testing one is a false pass): from inside
+a live, already-deployed data-plane pod (not from the host — Redis
+Cluster's multi-shard topology makes host-side port-forward unreliable
+for a cluster-aware client, the same reason provider-gateway and
+data-plane both got preliminary in-cluster deployments), ran the REAL
+working_memory.write()/request_log.write() functions (not a hand-rolled
+simulation) to write: a working_memory key (ttl=30s, simulating
+"currently in-flight" state) and a request_log row (simulating "a prior,
+already-completed request's committed row"). Confirmed both readable.
+Then hard-killed that EXACT pod (`kubectl delete pod --grace-period=0
+--force` — no graceful shutdown window, matching the "unhappy path, not
+clean completion" discipline Phase-01's H3 established) and checked
+state at three points, not two, to make the causality unambiguous:
+
+1. Immediately after the write (before the kill): both present.
+2. ~1 SECOND after the hard kill (TTL showing 29 of 30 remaining):
+   working memory key STILL FULLY PRESENT — proves Redis has zero
+   awareness of or dependency on the pod's liveness; the kill itself
+   does not and cannot trigger deletion. request_log row also present,
+   unaffected (CockroachDB isn't running in the pod that died). A first
+   attempt at this exact check used an 8s TTL and the sequential tool
+   calls (write, then a separate kill command, then a separate check
+   command) took long enough in wall-clock time that the TTL had
+   already elapsed naturally by the time of the check — an ambiguous
+   result, redone with a 30s TTL specifically to leave an unambiguous
+   margin rather than trusting a result that could have been explained
+   two different ways.
+3. 32 SECONDS after the kill (past the 30s TTL): working memory key
+   GONE (TTL command returns -2, "key does not exist" — not 0, not an
+   error). request_log row STILL PRESENT, completely unaffected by the
+   TTL, which was never a property of that table at all.
+
+A fresh data-plane pod also came up on its own (Deployment's normal
+reconciliation) and reached 1/1 Ready without intervention — the service
+itself recovers cleanly from a hard kill, not just the data.
+
+Both halves of the boundary this phase's statelessness claim is actually
+about are now proven, not assumed: ephemeral state evaporates (via a TTL
+that was directly confirmed to be SET, not just intended — the
+immediate-after-kill check literally read the countdown), and durable
+state persists elsewhere, entirely independent of any specific
+data-plane pod's fate.
 ================================================================================
 END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
