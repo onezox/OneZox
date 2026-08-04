@@ -9,6 +9,7 @@ COPY scheduler/ scheduler/
 COPY working_memory/ working_memory/
 COPY request_log/ request_log/
 COPY usage_event/ usage_event/
+COPY identity/ identity/
 COPY aggregator/ aggregator/
 # Every new top-level module directory needs its own COPY line above —
 # Step F found this list silently stale (it hadn't been touched since

@@ -40,6 +40,7 @@ from redis.asyncio.cluster import RedisCluster
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "generated"))
 import aggregator  # noqa: E402
+import identity  # noqa: E402
 import request_log  # noqa: E402
 import usage_event  # noqa: E402
 import working_memory  # noqa: E402
@@ -78,6 +79,7 @@ _REQUIRED_MODULES = (
     "working_memory",
     "request_log",
     "usage_event",
+    "identity",
     "aggregator",
 )
 
@@ -202,6 +204,26 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
         request_id = request.request_id
         org_id = request.identity.org_id
         start = time.monotonic()
+
+        # Step I: Part O's "no call proceeds without it" gate, checked
+        # before anything else — including the success-path log line
+        # below, admission, and every other stage. No request_log/
+        # usage_event row is ever written for this path (not even under
+        # a placeholder org_id): with no real tenant identified, there is
+        # nothing to durably attribute a row to, and a default/fallback
+        # tenant would itself be the cross-tenant leak this step exists
+        # to rule out.
+        try:
+            identity.validate(org_id)
+        except identity.MissingIdentity:
+            log.warning(
+                f"rejected: missing identity request_id={request_id} "
+                f"kind={dataplane_pb2.RequestKind.Name(request.kind)}"
+            )
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "request missing required org_id"
+            )
+            return
 
         log.info(
             "request received "
