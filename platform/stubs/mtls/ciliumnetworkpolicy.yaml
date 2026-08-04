@@ -1,8 +1,8 @@
 # Cilium mTLS enforcement between edge-gateway (Phase-01), provider-gateway
-# (Phase-02), and dataplane-stub (Phase-00/01, being replaced by data-plane
-# in Phase-03 — both coexist as allowed provider-gateway callers until Step
-# J's cutover removes dataplane-stub; data-plane has no ingress policy of
-# its own yet, that arrives at the same cutover).
+# (Phase-02), and data-plane (Phase-03, cut over from dataplane-stub at
+# Step J — dataplane-stub-mtls stays in this file only until Step J's
+# later, separate cleanup commit removes it alongside dataplane-stub
+# itself, once data-plane-mtls below is confirmed healthy).
 #
 # Completes the last Phase-00 acceptance item: SPIRE (Step 9) installed the
 # mTLS *capability* only, deliberately not enforced at the time, pending
@@ -172,6 +172,49 @@ spec:
               values:
                 - dataplane-stub
                 - data-plane
+      toPorts:
+        - ports:
+            - port: "50051"
+              protocol: TCP
+      authentication:
+        mode: "required"
+---
+# Phase-03 Step J: data-plane's own mTLS ingress policy, added and
+# confirmed healthy (SPIRE identity established, VALID:true) BEFORE
+# dataplane-stub-mtls/dataplane-stub's Deployment are removed in a later,
+# separate commit — no window where the real data plane is live without
+# mesh identity, same mesh-identity-safe sequencing Phase-01 Step F2 and
+# Phase-02 Step K3 both used. Shape mirrors dataplane-stub-mtls above
+# exactly (host for kubelet probes + kubectl port-forward, prometheus for
+# /metrics, edge-gateway's real Submit() gRPC calls with mTLS required).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: data-plane-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: data-plane
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+            - port: "50051"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app: edge-gateway
       toPorts:
         - ports:
             - port: "50051"
