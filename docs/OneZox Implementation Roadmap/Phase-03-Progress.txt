@@ -150,6 +150,52 @@ only surfaced as a mid-build timeout on an otherwise-unrelated test. The
 session-start ritual (recover-redis-cluster.sh + confirm cluster_state:ok)
 needs to be treated as "run when in doubt," not only literally at the
 first message of a conversation.
+--------------------------------------------------------------------------------
+2026-08-04 — Step B: data-plane skeleton deployed; live verification found
+provider-gateway-mtls didn't recognize the new caller identity
+--------------------------------------------------------------------------------
+Skeleton built: DataplaneService.Submit as a stub (no classifier/DAG/
+scheduler — Steps C/D/E), completing the RPC with a clearly-marked
+placeholder response rather than a bare UNIMPLEMENTED status, matching
+dataplane-stub's own established "stub that completes successfully with
+canned content" idiom. Structured logging on the SUCCESS path built in
+from the start (both "request received" and "request completed" log
+lines) — the exact gap Phase-01 (edge-gateway Step J3) and Phase-02
+(provider-gateway Step N3) both had to retrofit.
+
+FINDING: first deploy crashlooped on startup. Boot sequence connects to
+CockroachDB (health_probe insert) and Redis (set/get) successfully, then
+crashed calling provider-gateway's ProviderHealth RPC — AioRpcError
+UNAVAILABLE, "failed to connect to all addresses". Root cause:
+provider-gateway-mtls's ingress rule for port 50051 only recognized
+app=dataplane-stub as an allowed caller — data-plane's own real Cilium
+identity wasn't in the allow-list, so the connection was correctly
+blocked by the mesh, not a code bug. This is exactly the relationship
+that policy's own comment already anticipated ("Phase-02.txt's own real
+caller relationship, data plane -> provider gateway, doesn't arrive
+until Phase-03") — Phase-03 had now arrived.
+
+FIX: widened provider-gateway-mtls's port-50051 ingress rule to allow
+EITHER dataplane-stub OR data-plane (matchExpressions, In) — a widening,
+not a replacement; dataplane-stub keeps its access until Step J's
+cutover removes it, same mesh-identity-safe sequencing used throughout
+this project (never remove the old identity's access before the new
+one is confirmed healthy). Updated the file's stale header/rule comments
+to match, rather than leaving them describing a "doesn't arrive until
+Phase-03" state that was no longer true.
+
+VERIFIED after the fix: data-plane reached 1/1 Running, full boot
+sequence completed (health_probe row written, Redis round-trip
+confirmed, provider-gateway ProviderHealth returned all 4 registered
+providers with real breaker/quota state). A live Submit call via grpcurl
+returned the placeholder response correctly, and BOTH the entry
+("request received") and completion ("request completed") structured
+log lines appeared — confirming the success-path logging discipline is
+genuinely built in, not just present in the code and never exercised.
+
+Preliminary deployment only — no CiliumNetworkPolicy of data-plane's own
+yet, no cutover, dataplane-stub still the active service edge-gateway
+forwards to. Both arrive at Step J.
 ================================================================================
 END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
