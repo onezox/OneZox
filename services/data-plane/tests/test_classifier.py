@@ -8,14 +8,8 @@ dataplane.proto's real RequestKind numbering — a regression guard, not a
 dependency the classifier module itself has.
 """
 
-import os
-import sys
-
 import pytest
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "generated"))
-
-from planner.classifier import (  # noqa: E402
+from planner.classifier import (
     KIND_CHAT_COMPLETION,
     KIND_RESPONSES,
     MAX_FAST_PATH_MESSAGES,

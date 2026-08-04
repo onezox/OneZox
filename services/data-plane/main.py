@@ -1,32 +1,33 @@
-"""data-plane — Phase-03 Step B: skeleton for the real data plane, replacing
-the Phase-00/01 dataplane-stub.
+"""data-plane — Phase-03 Step G: the real Submit flow, assembled.
 
-This is a skeleton ONLY: DataplaneService.Submit does not run the
-complexity classifier, execute a template DAG, or bind a role to a model
-via the scheduler — those are Steps C/D/E, each its own commit. What Submit
-does here is the same thing dataplane-stub's own "stub" has always done
-(Phase-00/01): complete the RPC successfully with a fixed, clearly-marked
-placeholder response, so the wire contract and the logging/telemetry
-surface around it are real and verified before any real logic sits behind
-them.
+Composes every module built in Steps C-F into one real request path:
+admission (scheduler.admit) -> complexity classification
+(planner.classifier) -> template instantiation (planner.templates) ->
+working-memory write (working_memory) -> role->model binding
+(scheduler.place, live provider health) -> single-worker dispatch and
+streaming fan-in (aggregator) -> working-memory cleanup. Each piece was
+already unit-tested and (where it touches a live signal) live-verified
+in isolation; this step is what proves they COMPOSE, tested end-to-end
+against provider-fake — and, because Step F's own pod-kill test caught
+the Dockerfile silently never shipping any of these modules, a
+successful Submit here is now also the proof that this image genuinely
+contains all of them (see verify_modules_present below).
 
-Structured logging on the SUCCESS path, not just errors, is built in from
-day one — this is the exact gap Phase-01's edge-gateway (Step J3) and
-Phase-02's provider-gateway (Step N3) both had to retrofit after the fact.
-Submit logs once on request receipt and once on successful completion;
-"successful" here means "the RPC completed and responded," not "produced a
-real answer" — that distinction matters because this skeleton's only
-answer IS the placeholder, and pretending otherwise would defeat the point
-of building the logging discipline honestly.
+Structured logging on the SUCCESS path, not just errors, has been built
+in since Step B — this is the exact gap Phase-01's edge-gateway (Step
+J3) and Phase-02's provider-gateway (Step N3) both had to retrofit after
+the fact.
 
-Preliminary deployment (Step B), alongside dataplane-stub — no cutover yet,
-that's Step J, same mesh-identity-safe sequencing Phase-01/02 both used.
+Preliminary deployment — alongside dataplane-stub, no cutover yet, that's
+Step J, same mesh-identity-safe sequencing Phase-01/02 both used.
 """
 
+import importlib
 import json
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
@@ -43,11 +44,49 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from redis.asyncio.cluster import RedisCluster
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "generated"))
+import aggregator  # noqa: E402
+import working_memory  # noqa: E402
 from dataplane.v1 import dataplane_pb2, dataplane_pb2_grpc  # noqa: E402
+from planner import classifier, templates  # noqa: E402
 from provider.v1 import provider_pb2, provider_pb2_grpc  # noqa: E402
+from scheduler import admit, place  # noqa: E402
 
 SERVICE = "data-plane"
 GRPC_PORT = int(os.environ.get("GRPC_PORT", "50051"))
+
+# Model source is STATIC this phase (Dependencies.txt F10: the signed
+# registry replaces this in Phase-04) — one worker_ref, read from env so
+# the same image can be pointed at provider-fake for every step's own
+# testing (this one included) and the real Anthropic model for Step K's
+# one real call, without a code change between the two.
+STATIC_MODEL_REF = os.environ.get("STATIC_MODEL_REF", "anthropic:claude-haiku-4-5-20251001")
+
+# Untuned placeholder fleet-wide in-flight cap — same "not tuned against
+# real data" framing already used for provider-gateway's quota/breaker
+# thresholds and this service's own classifier/template bounds.
+ADMISSION_LIMIT = int(os.environ.get("ADMISSION_LIMIT", "100"))
+
+# Boot-time smoke test (Step G): imports every module the real Submit
+# flow depends on and fails FAST and LOUD at startup if any is missing
+# from the image — turns exactly the class of bug Step F caught (the
+# Dockerfile silently never copying planner/scheduler/working_memory/
+# request_log, undetected until something finally tried to import them)
+# into an immediate, unmissable crash instead of a future confusing
+# runtime failure the first time a real request needed one of them.
+_REQUIRED_MODULES = (
+    "planner.classifier",
+    "planner.templates",
+    "scheduler.admit",
+    "scheduler.place",
+    "working_memory",
+    "request_log",
+    "aggregator",
+)
+
+
+def verify_modules_present() -> None:
+    for module_name in _REQUIRED_MODULES:
+        importlib.import_module(module_name)
 
 
 class JsonFormatter(logging.Formatter):
@@ -93,44 +132,112 @@ provider_channel: grpc.aio.Channel | None = None
 provider_stub: provider_pb2_grpc.ProviderServiceStub | None = None
 grpc_server: grpc.aio.Server | None = None
 
-# Clearly marked as a skeleton placeholder, not a real answer — Steps C/D/E
-# replace this with the actual classify -> template DAG -> scheduler bind
-# -> provider dispatch flow. Matches dataplane-stub's own established
-# "canned, self-identifying content" convention (Phase-00/01) rather than
-# returning a bare UNIMPLEMENTED status: the RPC itself, the logging around
-# it, and the wire contract all need to be real and verifiable now, even
-# though the business logic behind the answer isn't yet.
-_PLACEHOLDER_CONTENT = (
-    "data-plane skeleton (Phase-03 Step B) -- fast path not yet implemented, "
-    "classifier/template DAG/scheduler arrive in Steps C-E."
-)
-
 
 class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
     async def Submit(self, request, context):
+        request_id = request.request_id
+        org_id = request.identity.org_id
+        start = time.monotonic()
+
         log.info(
             "request received "
-            f"request_id={request.request_id} org_id={request.identity.org_id} "
+            f"request_id={request_id} org_id={org_id} "
             f"kind={dataplane_pb2.RequestKind.Name(request.kind)} model={request.model}"
         )
+
         with tracer.start_as_current_span("data_plane.submit") as span:
-            span.set_attribute("request_id", request.request_id)
-            span.set_attribute("org_id", request.identity.org_id)
+            span.set_attribute("request_id", request_id)
+            span.set_attribute("org_id", org_id)
 
-            yield dataplane_pb2.SubmitResponse(
-                request_id=request.request_id,
-                content=_PLACEHOLDER_CONTENT,
-                finish_reason="not_implemented",
-                is_final=True,
-            )
-            submit_counter.inc()
+            try:
+                await admit.admit(redis_client, ADMISSION_LIMIT)
+            except admit.Shed as e:
+                log.info(
+                    f"admission shed request_id={request_id} org_id={org_id} inflight={e.inflight}"
+                )
+                await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(e))
+                return
 
-        # The success-path completion log Phase-01/02 both had to retrofit
-        # — built in here from the start. "Completed" describes the RPC's
-        # own lifecycle (received, responded, done), not the quality of the
-        # answer, which is intentionally a placeholder at this step.
+            try:
+                # Complexity classifier (Step C) — rules-based, no model
+                # call. NeedsDeliberatePath marks the exact Phase-06 seam.
+                try:
+                    classifier.classify(
+                        classifier.ClassifierInput(
+                            kind=request.kind, message_count=len(request.messages)
+                        )
+                    )
+                except classifier.NeedsDeliberatePath as e:
+                    log.info(
+                        f"needs deliberate path request_id={request_id} org_id={org_id} "
+                        f"reason={e.reason}"
+                    )
+                    await context.abort(grpc.StatusCode.UNIMPLEMENTED, str(e))
+                    return
+
+                # Template DAG (Step D) — mechanical instantiation, no
+                # per-request reasoning about the shape.
+                template_req = templates.TemplateRequest(
+                    request_id=request_id,
+                    messages=tuple(
+                        templates.Message(role=m.role, content=m.content) for m in request.messages
+                    ),
+                    max_tokens=request.max_tokens if request.HasField("max_tokens") else None,
+                    temperature=request.temperature if request.HasField("temperature") else None,
+                )
+                dag = templates.instantiate(template_req)
+
+                # Working memory (Step F) — request-scoped, TTL'd; written
+                # before dispatch, explicitly deleted on the clean path
+                # below (the TTL is the safety net for every other path,
+                # not a substitute for this).
+                wm_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+                await working_memory.write(redis_client, request_id, {"messages": wm_messages})
+
+                # Scheduler bind (Step E) — the one static worker_ref,
+                # gated on live provider health.
+                try:
+                    worker_ref = await place.bind_via_provider_health(
+                        provider_stub, STATIC_MODEL_REF
+                    )
+                except place.ProviderUnavailable as e:
+                    log.info(
+                        f"provider unavailable request_id={request_id} org_id={org_id} "
+                        f"reason={e.reason}"
+                    )
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
+                    return
+
+                # Single-worker dispatch + streaming fan-in (Step G).
+                try:
+                    stream = aggregator.relay(provider_stub, request_id, worker_ref, dag.worker)
+                    async for response in stream:
+                        yield response
+                except aggregator.ProviderFallback as e:
+                    log.info(
+                        f"provider fallback request_id={request_id} org_id={org_id} "
+                        f"reason={e.reason}"
+                    )
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
+                    return
+                except aggregator.ProviderStreamError as e:
+                    log.warning(
+                        f"provider stream error request_id={request_id} org_id={org_id} error={e}"
+                    )
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
+                    return
+
+                await working_memory.delete(redis_client, request_id)
+                submit_counter.inc()
+            finally:
+                await admit.release(redis_client)
+
+        latency_ms = int((time.monotonic() - start) * 1000)
+        # The success-path completion log Phase-01/02 both had to
+        # retrofit — built in from the start (Step B) and now exercised
+        # by a real assembled request, not just a placeholder.
         log.info(
-            f"request completed request_id={request.request_id} org_id={request.identity.org_id}"
+            f"request completed request_id={request_id} org_id={org_id} latency_ms={latency_ms}"
         )
 
 
@@ -168,6 +275,9 @@ async def lifespan(app: FastAPI):
 
     with tracer.start_as_current_span("data_plane.boot"):
         log.info("starting boot sequence")
+
+        verify_modules_present()
+        log.info(f"boot: all required modules present: {list(_REQUIRED_MODULES)}")
 
         pg_host = os.environ.get("COCKROACH_HOST", "onezox-crdb-public.default.svc.cluster.local")
         pg_pool = await asyncpg.create_pool(
