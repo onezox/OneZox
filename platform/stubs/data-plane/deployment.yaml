@@ -44,7 +44,7 @@ spec:
             # this to the real static Anthropic ref for the one real
             # call, and only then.
             - name: STATIC_MODEL_REF
-              value: "anthropic:claude-haiku-4-5-20251001"
+              value: "fake:normal"
           ports:
             - containerPort: 8080
               name: http
