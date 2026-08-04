@@ -36,7 +36,7 @@ spec:
     spec:
       containers:
         - name: data-plane
-          image: onezox/data-plane:bed223a
+          image: onezox/data-plane:98e5e78
           imagePullPolicy: IfNotPresent
           env:
             # Step G/H/I testing all runs against provider-fake, mind
@@ -44,7 +44,7 @@ spec:
             # this to the real static Anthropic ref for the one real
             # call, and only then.
             - name: STATIC_MODEL_REF
-              value: "fake:normal"
+              value: "fake:slow"
           ports:
             - containerPort: 8080
               name: http
