@@ -673,6 +673,150 @@ to Phase-04's model registry. Redis working-memory isolation relies on
 unguessable server-generated request_ids and correct per-request
 scoping in code, not a per-tenant ACL (Step I) — both still true and
 unaffected by this step.
+--------------------------------------------------------------------------------
+2026-08-04 — Step K: the one real call (EC1) — clean success, no
+manufactured failure
+--------------------------------------------------------------------------------
+CORRECTION to this record's own process: the user's Step L instruction
+initially described Step K as already complete, with a specific
+"failed, diagnosed, fixed, succeeded" narrative — that description was
+the user's own error (retracted immediately when asked), not something
+that had actually happened. Checked first (grepped this file for any
+Step K entry, found none) rather than assuming or fabricating a result,
+then confirmed directly with the user before proceeding. Recorded here
+is what ACTUALLY happened, live, in this session.
+
+Prerequisites already in place from Phase-02: real ANTHROPIC_API_KEY
+mounted in provider-gateway (Step J3, envFrom secretRef), api.anthropic.com
+already egress-allowed (Steps J4-J6), model ID
+claude-haiku-4-5-20251001 (Anthropic's cheapest current tier) already
+data-plane's own STATIC_MODEL_REF fallback default. Flipped the
+deployed override from fake:normal to the real ref (git-tracked, Argo-
+synced, same discipline as every fake:slow/fake:fail test all phase).
+
+RESULT: the real call succeeded on the FIRST attempt — a clean result,
+recorded as clean, not manufactured into a failure to match a prior
+(incorrect) framing. Seeded a dedicated phase03-step-j-test-tenant
+(data/seed/seed-test-tenant.sh) rather than reusing Phase-01's shared
+test tenant or its unrecoverable raw key. Full streamed response through
+edge-gateway's real public endpoint; usage_event wrote tokens_in=25,
+tokens_out=15 — Anthropic's own REAL numbers, visibly different from the
+fake's canned 42/17, confirming this genuinely reached the real API, not
+an accidentally-still-fake path. request_log status=ok. Anthropic's own
+native finish_reason ("end_turn") passed through as-is, distinct from
+the fake's OpenAI-style "stop" — a genuine, expected difference in real
+provider behavior the fake never has occasion to exercise.
+
+EC1 is proven: a user with a valid API key receives a streamed
+frontier-model answer end-to-end (edge -> data plane -> provider-gateway
+-> real Anthropic -> SSE).
+
+--------------------------------------------------------------------------------
+2026-08-04 — Step L: telemetry + stability (EC4), the last exit
+criterion — a real, previously-undetected gap spanning all three
+services and every prior phase, caught only by this step's own
+requirement to count trace IDs, not just confirm spans export
+--------------------------------------------------------------------------------
+FINDING (the headline one): querying Tempo for Step K's own real-call
+trace returned THREE separate trace IDs — one rooted at edge-gateway,
+one at data-plane, one at provider-gateway — not one connected tree.
+Each service's spans were individually well-formed and genuinely
+exported; that is exactly why this was never caught before. P01's own
+J1 fixed edge-gateway's span tree WITHIN that one service; P02's N1-N3
+did the same for provider-gateway; nobody had ever verified a trace
+survives crossing a service boundary, because this is the first phase
+where three real services actually chain together end-to-end.
+
+ROOT CAUSE, identical in shape across all three languages: NONE of
+edge-gateway (Rust/opentelemetry), data-plane (Python/opentelemetry), or
+provider-gateway (Go/otel) had ever called set_text_map_propagator.
+Every OTel SDK except Python's defaults to a no-op propagator — so even
+if inject()/extract() call sites had existed (they didn't, anywhere),
+they would have silently done nothing. Confirmed this precisely before
+writing any fix: grepped each service's dependency manifest for a
+gRPC-context-propagation package (none), then confirmed Python's
+opentelemetry.propagate.get_global_textmap() genuinely returns a real
+CompositePropagator by default (verified interactively, not assumed) —
+the one asymmetry across the three SDKs that shaped where explicit
+propagator setup was actually needed.
+
+FIX, one hop at a time, all three services in one coordinated commit
+(the fix only works once every side of every hop has it):
+  - edge-gateway: opentelemetry::global::set_text_map_propagator(...)
+    added to init_telemetry(); dataplane_client::submit() now injects
+    the current span's context into the outgoing tonic Request's
+    metadata via a small MetadataMap Injector adapter.
+  - data-plane: Submit() now extracts incoming trace context from
+    context.invocation_metadata() BEFORE starting its own root span
+    (previously always parentless, even though edge-gateway's call
+    always carried the real parent by the time this ran); scheduler.
+    place.bind_via_provider_health and aggregator.relay both inject the
+    active span's context into their own outgoing calls to
+    provider-gateway.
+  - provider-gateway: otel.SetTextMapPropagator(propagation.TraceContext{})
+    added; both Invoke and ProviderHealth now extract incoming context
+    via a shared helper. ProviderHealth had NO span of its own at all
+    before this — scheduler.place's own health-check call was invisible
+    in the tree regardless of propagation; fixed alongside the
+    propagation fix, not left for later.
+
+LIVE VERIFICATION, all three points, against a SECOND real Anthropic
+call — deliberately not reused from Step K's own trace, because a
+BROKEN trace can't prove a FIX; verifying the fix genuinely required a
+new minimal real call, made and recorded honestly as a second real call,
+not folded silently into Step K's one-call framing:
+
+1. SPAN TREE: queried Tempo for the new request_id — ONE trace ID now,
+   not three. Fetched the full trace and parsed parent-child links
+   directly (not just trusting a shared trace ID, which the search API
+   could in principle group without genuine nesting): 15 spans across
+   edge-gateway/data-plane/provider-gateway. edge_gateway.request is the
+   true root; data_plane.submit's parent is an edge-gateway span
+   (edge_gateway.submit); provider_gateway.invoke AND
+   provider_gateway.provider_health both parent under data_plane.submit;
+   provider-gateway's own internal children (coalesce/quota/breaker/
+   adapter/stream) nest correctly under provider_gateway.invoke. One
+   connected tree, confirmed by actual parent span IDs, not inferred.
+
+2. DATA-PLANE SUCCESS-PATH LOG: present, structured, JSON, request_id/
+   org_id/latency_ms only. Leak check re-run with P01-H1/P02-L1's exact
+   positive-controlled discipline: first confirmed the grep/Loki query
+   COULD find something genuinely present (request_id — found via
+   kubectl logs immediately; via Loki, the FIRST attempt returned zero
+   results with a too-narrow time window, itself almost a false "clean"
+   pass — caught by not trusting an absent result until the same query
+   found something real with a wider window). Then searched
+   data-plane + provider-gateway (all 3 replicas) + edge-gateway, both
+   kubectl logs and durable Loki, for the raw Anthropic key (bare and
+   "Bearer <key>" form) and the real message content: zero matches,
+   everywhere, both stores.
+
+3. STABILITY, sustained load, local-kind framing: 20 concurrent workers
+   against data-plane directly, fake:slow (~4.2s/request, needed for
+   genuine sustained in-flight overlap, not requests completing before
+   the next sample), 60 real wall-clock seconds, sampling
+   workingmem:* key count every 5s across all 3 Redis Cluster master
+   shards (counting only masters, not their mirroring replicas, to
+   avoid double-counting). 280 total requests completed (20 workers x
+   14 each). Key count stayed BOUNDED at ~20 throughout the entire load
+   window (one sample briefly read 25 — consistent with request
+   overlap at a sampling instant, not accumulation: no upward drift
+   across 10 samples spanning 50s) — proving the drain rate keeps pace
+   with the creation rate at volume, not just for Step F's one request.
+   Within 5s of the workers stopping, the count dropped to 0 and stayed
+   at 0 for every remaining sample (30s+ of confirmed post-load
+   stability) — TTL/explicit-delete both hold under real concurrent
+   load, not just in isolation.
+
+Restored STATIC_MODEL_REF to fake:normal (git-tracked, Argo-synced) as
+the lasting state after both Step K's and Step L's real-call work.
+
+TRACKER NOTE, carried forward once more for the Phase-03 completion
+record: usd_cost stays NULL (Steps H/I) — belongs to Phase-04's model
+registry. Redis working-memory isolation relies on unguessable
+server-generated request_ids and correct per-request scoping, not a
+per-tenant ACL (Step I) — now also reconfirmed bounded/draining
+correctly under real concurrent load (Step L), not just isolated.
 ================================================================================
 END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
