@@ -196,6 +196,56 @@ genuinely built in, not just present in the code and never exercised.
 Preliminary deployment only — no CiliumNetworkPolicy of data-plane's own
 yet, no cutover, dataplane-stub still the active service edge-gateway
 forwards to. Both arrive at Step J.
+--------------------------------------------------------------------------------
+2026-08-04 — Step E: scheduler.place proven to genuinely react to live
+provider health, all four signal states
+--------------------------------------------------------------------------------
+The point of this step was never "call ProviderHealth" — it was proving
+bind_via_provider_health's decision actually CHANGES based on what that
+call returns. A binder that ignores the response looks identical to a
+working one exactly as long as the provider stays healthy; the 22 unit
+tests committed alongside this step prove the pure decision logic
+(bind()) is correct for every input combination, but only a live test
+against the real deployed provider-gateway proves the WIRING between the
+real RPC response and that decision logic is genuine, not just plausible
+in isolation.
+
+METHOD: a standalone script (not wired into Submit — Step E is logic +
+live proof only, matching Steps C/D's "no premature wiring" discipline)
+imported scheduler.place directly and called bind_via_provider_health
+against a port-forwarded, already-deployed provider-gateway, driving the
+real "fake" provider's breaker/quota Redis state into each condition
+before each call.
+
+1. HEALTHY (breaker closed, full headroom — the state already present):
+   BOUND worker_ref='fake:normal'.
+2. EXHAUSTED (breaker OPEN): tripped for real via 5 consecutive
+   worker_ref=fake:fail Invoke calls through provider-gateway (confirmed
+   via a live FALLBACK_REASON_BREAKER_OPEN on the 5th, then via a direct
+   Redis read of provider:fake:breaker showing state=open) ->
+   REFUSED provider='fake' reason='circuit breaker is open'.
+3. DEGRADED (breaker HALF_OPEN): backdated provider:fake:breaker's own
+   opened_at past BREAKER_OPEN_DURATION_SECONDS so provider-gateway's
+   own effectiveState logic derives half-open — confirmed via a live
+   ProviderHealth call showing BREAKER_STATE_HALF_OPEN BEFORE testing
+   the binder, so the test is known to be exercising what it claims to
+   -> BOUND worker_ref='fake:normal' (the case that actually proves the
+   reaction isn't a blunt "refuse anything imperfect": half-open must
+   still bind, letting the trial call through, or provider-gateway's own
+   breaker could never recover — no trial call would ever reach it).
+4. EXHAUSTED (quota): set provider:fake:quota:{current_window_bucket} to
+   60 (the default QUOTA_LIMIT_PER_MINUTE). First attempt landed in a
+   bucket that expired between the SET and the check (a genuine 60s
+   window-boundary race, caught by ProviderHealth's own reported
+   headroom, not assumed) — redone against the then-current bucket,
+   confirmed via ProviderHealth (quotaHeadroom absent from the JSON,
+   which for a proto3 scalar float at exactly 0.0 means zero, not a
+   missing/broken field — proto3 JSON omits default-valued fields) ->
+   REFUSED provider='fake' reason='fleet-wide quota exhausted'.
+
+All test-induced state reset afterward (breaker forced back to
+{"state":"closed","failures":0,"opened_at":0}, the quota key deleted) so
+later steps start from a clean "fake" provider, not test debris.
 ================================================================================
 END OF PHASE-03-PROGRESS.TXT (living document — append, do not rewrite)
 ================================================================================
