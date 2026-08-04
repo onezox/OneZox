@@ -1,0 +1,705 @@
+================================================================================
+PHASE-03 — DATA PLANE FAST PATH — COMPLETION RECORD  [SHIPPABLE MILESTONE M1]
+================================================================================
+This document records the work actually completed for Phase-03 on the local
+onezox-dev Kubernetes cluster (kind, WSL2 Ubuntu 24.04). It contains only
+work that was performed and verified. It does not contain Phase-04 work,
+future plans, recommendations, or opinions. Phase-03-Progress.txt remains
+the point-in-time findings record (drift, process gaps); this document is
+the completion summary, in the same style as Phase-00/01/02-Complete.txt.
+
+This phase carries heavier freight than its predecessors: it is the first
+phase where three independently-built real services (edge-gateway, data-plane,
+provider-gateway) actually chain together into one live request path, and the
+first phase to make one real, billed call to a frontier model. Both of those
+firsts surfaced a genuine, previously-undetected defect that had been present,
+unnoticed, since Phase-01 — see EC4 below, given its own full section rather
+than folded into a checklist line.
+
+--------------------------------------------------------------------------------
+PHASE-03 OBJECTIVE
+--------------------------------------------------------------------------------
+Replace the Phase-00/01 dataplane-stub with a real Python data plane: a
+complexity classifier that routes simple requests to a template-DAG fast path
+(zero LLM planning cost), a minimal scheduler that binds role->model using
+live provider health from provider-gateway, streaming fan-in relaying
+provider deltas up through the edge, and final metering (real tokens_in/out,
+orch_tokens, usd_cost) written to usage_event/request_log. After this phase
+the whole vertical slice is real, end to end: edge (P01) -> data plane (P03)
+-> provider-gateway (P02) -> a real frontier model -> streamed back to the
+user. This is M1 — the first thing a person could actually use.
+
+--------------------------------------------------------------------------------
+BUILD SEQUENCE (IN ORDER)
+--------------------------------------------------------------------------------
+A1-A8. Real token-usage propagation through provider-gateway, and its
+   ProviderHealth RPC — both Phase-02-declared obligations, closed at their
+   first real consumer rather than left as P02 defects. proto/provider's Delta
+   gains optional input_tokens/output_tokens (presence-is-the-signal, never
+   coerced to zero); all three real adapters (OpenAI, Anthropic, Google) parse
+   real usage out of genuinely different wire shapes (a dedicated trailing
+   chunk; two separate named events; a per-chunk cumulative field); a
+   best-effort final delta with usage left UNSET closes the "mid-stream
+   failure after real tokens were spent" billing hole. Live-verified against
+   the real deployed provider-gateway; caught and fixed a fake-adapter
+   allowlist gap and a Redis Cluster gossip-drift incident along the way (see
+   PROBLEMS ENCOUNTERED).
+B. data-plane service skeleton (Python, grpc.aio): Submit as a completing
+   stub, health/ready endpoints, structured logging built in on the SUCCESS
+   path from day one (the exact gap edge-gateway and provider-gateway both
+   had to retrofit). Preliminary in-cluster deployment, mirroring how P01/P02
+   handled Redis Cluster's host-port-forward limitation. Found and fixed a
+   real mesh-identity gap (provider-gateway-mtls didn't yet recognize
+   data-plane's own Cilium identity).
+C. Complexity classifier: rules-based, zero model calls, proven by AST
+   inspection of its own source (zero branching on any model/LLM code path),
+   not just by convention. Both fork directions unit-tested.
+D. Template DAG library: fixed, predetermined single-worker execution shape,
+   instantiated mechanically — proven, again by AST inspection, that no
+   planning/reasoning code path is reachable in producing it.
+E. Scheduler role->model binding: proven to genuinely REACT to live
+   ProviderHealth, all four real signal states driven live against the
+   deployed provider-gateway (healthy, breaker-open, breaker-half-open,
+   quota-exhausted) — not just called and ignored.
+F. Working memory (Redis, workingmem:{request_id}, TTL'd) + the statelessness
+   proof: a real, hard `kubectl delete --grace-period=0 --force` mid-request,
+   checked at three points to make causality unambiguous. Found the
+   Dockerfile had silently never shipped four of the service's own modules
+   since Step B (see PROBLEMS ENCOUNTERED) — fixed, and a boot-time
+   verify_modules_present() smoke test added as the ongoing safety net.
+G. Aggregator (single-worker passthrough) + streaming fan-in, assembled into
+   the real Submit flow and verified live against provider-fake: the full
+   chain composes, backpressure holds under fake:slow, a provider breaker
+   trip becomes a clean typed error under fake:fail.
+H. Real metering — EC2's own gate. usage_event/request_log wired to Step A's
+   real usage fields; usd_cost left NULL (no pricing source exists this
+   phase — see DEFERRALS); orch_tokens written as a real, known 0 (the fast
+   path structurally cannot invoke a planner, per Steps C/D's own proofs).
+   request_log written on every path; usage_event only when a provider
+   dispatch was actually attempted — proven, not just asserted, by checking
+   a pre-dispatch rejection gets zero usage_event rows.
+I. Tenant isolation — EC3's own gate. Positive-controlled (a planted
+   cross-tenant DB mismatch confirmed the detection query actually catches a
+   real problem before trusting a clean result), behavioral under genuine
+   concurrency (two real tenants, real overlapping Submit calls, canary
+   messages, mid-flight Redis inspection), and an identity-required reject
+   path (missing org_id -> clean InvalidArgument, zero DB rows, no
+   placeholder-tenant fallback).
+J. Mesh-identity-safe cutover from dataplane-stub: data-plane-mtls confirmed
+   healthy before the switch, the switch (edge-gateway's real downstream
+   flipped) before dataplane-stub's removal. The FIRST real request through
+   edge-gateway's own public endpoint surfaced a genuine EC2-breaking bug
+   (see PROBLEMS ENCOUNTERED) — found and fixed by this step's own
+   "verify against the real slice" requirement, not by any earlier
+   grpcurl-only testing. Full cleanup to the P02 completeness bar.
+K. EC1 — the one real call. Anthropic (claude-haiku-4-5-20251001), succeeded
+   on the FIRST attempt. See EXIT CRITERIA EVIDENCE and the note on an
+   earlier, incorrect description of this step below.
+L. EC4 — telemetry + stability, the last exit criterion. Found and fixed the
+   phase's most significant defect: trace context had never propagated
+   across any gRPC hop, in any of the three services, across every prior
+   phase. Full account in its own section below, not summarized away here.
+M. Close-out: this document, plus a fresh mTLS proof for both mesh hops,
+   captured after every other step above.
+
+--------------------------------------------------------------------------------
+DATA-PLANE SERVICE
+--------------------------------------------------------------------------------
+services/data-plane — Python 3.12, grpc.aio, FastAPI (health/ready/metrics),
+asyncpg, redis.asyncio.cluster, opentelemetry. 1,283 lines of non-test,
+non-generated Python across main.py plus seven modules: planner/{classifier,
+templates}, scheduler/{admit,place}, working_memory, request_log,
+usage_event, identity, aggregator. 49 unit tests passing across 9 test files,
+0 skipped — every module verified in true isolation (`pytest
+tests/test_X.py` alone) as well as the full suite together, after a real
+test-isolation bug (a hidden sys.path dependency between test files) was
+found and fixed with a conftest.py during Step G.
+
+Every module follows the pure-decision/IO-wrapper split established in P02's
+Go code (quota.Decide/quota.Enforce): classifier.classify, templates.
+instantiate, place.bind, admit.decide, and identity.validate are all pure,
+directly unit-testable functions; the IO wrappers around them (bind_via_
+provider_health, working_memory.write/read/delete, request_log.write,
+usage_event.write, aggregator.relay) are the only pieces that touch Redis,
+CockroachDB, or provider-gateway's gRPC.
+
+aggregator.relay() additionally carries this phase's usage-capture and
+trace-propagation logic: it yields (SubmitResponse, Usage | None) pairs
+(Usage set exactly once, on the final delta, mirroring Delta's own
+presence semantics field-for-field) and injects the active OTel span's
+context into every outgoing call to provider-gateway (Step L).
+
+Cross-service changes this phase (not new services, fixes to existing
+ones): edge-gateway's DATAPLANE_STUB_ENDPOINT default and dataplane_client
+module (Step J's cutover, Step L's trace injection); provider-gateway's
+Invoke/ProviderHealth handlers (Step L's trace extraction; ProviderHealth
+also gained its first span of its own, having had none before this phase).
+
+Database tables: usage_event, request_log (CockroachDB) — exactly as
+Phase-03.txt's own DATABASE TABLES REQUIRED section specifies. Redis keys
+(ephemeral): workingmem:{request_id}, admission:data-plane:inflight.
+
+--------------------------------------------------------------------------------
+DOCKER IMAGES AND DEPLOYMENT
+--------------------------------------------------------------------------------
+onezox/data-plane, onezox/edge-gateway, and onezox/provider-gateway all
+currently run tag ccf83a5 (Step L's coordinated trace-propagation fix — the
+one commit that touches all three services at once, since the fix only
+works once every side of every hop has it). Content-addressed tags
+(git commit short-SHA) throughout, the same convention P02 established;
+edge-gateway's own image moved off its stale Phase-01 static "phase01" tag
+onto this convention for the first time this phase (Step J), having never
+been rebuilt since P01. Built with `--provenance=false --sbom=false`
+throughout, loaded into all 3 onezox-dev kind nodes via `kind load
+docker-image` after every rebuild.
+
+Deployed via the existing "onezox-stubs" Argo CD Application
+(platform/stubs/{data-plane,edge-gateway,provider-gateway}/), never applied
+directly with kubectl. Confirmed Synced/Healthy after every deploy this
+phase, most recently at commit ce4e977. STATIC_MODEL_REF (data-plane's own
+env var, Dependencies.txt F10) rests at "fake:normal" as the lasting
+deployed state — flipped to the real Anthropic ref only for Step K/L's own
+live proofs, each time via a git-tracked commit + Argo sync, never a direct
+cluster mutation (one attempt at `kubectl set env` during Step G was
+correctly reverted by Argo's own self-heal, confirming that guarantee is
+real, not just configured).
+
+dataplane-stub — Deployment, Service, mTLS policy, source tree, CI matrix
+entry, Prometheus scrape target — is confirmed fully pruned (Step J),
+checked live at the time of writing: `kubectl get deployment,svc,pods -l
+app=dataplane-stub` returns nothing in the default namespace.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST (Phase-03.txt's own seven items, with evidence)
+--------------------------------------------------------------------------------
+[x] Complexity classifier routes to fast path.
+    Rules-based, zero model calls (Step C, AST-verified). Both fork
+    directions (simple->fast-path, complex->typed NeedsDeliberatePath error
+    marking the exact Phase-06 seam) unit-tested.
+
+[x] Template DAG executes with no LLM planning cost.
+    Fixed, predetermined single-worker shape (Step D). AST-verified: zero
+    planner/LLM code path reachable in producing it, the same negative-proof
+    discipline as the classifier.
+
+[x] Scheduler binds role->model using live provider health.
+    bind_via_provider_health proven to genuinely react, not just call and
+    ignore, across all four real ProviderHealth signal states, driven live
+    against the deployed provider-gateway (Step E).
+
+[x] Streaming fan-in edge<->data plane<->provider works.
+    Assembled and verified live (Step G) against provider-fake — full chain,
+    backpressure held under fake:slow, breaker trip -> clean client error
+    under fake:fail — then re-verified end-to-end through edge-gateway's
+    real public endpoint against a real frontier model (Step K).
+
+[x] usage_event + request_log written; metering span correct.
+    EC2's own gate — see EXIT CRITERIA EVIDENCE below for the full
+    reconciliation proof, now validated against both a fake and a real
+    provider's real numbers.
+
+[x] Engine remains stateless (working memory request-scoped only).
+    Proven twice, at two different scales: a single real hard pod-kill
+    mid-request (Step F — TTL confirmed genuinely SET, working memory
+    evaporates, committed state survives), then sustained 20-concurrent
+    real load for 60 real seconds (Step L — bounded during load, full drain
+    within 5s of load stopping, held at 0 for 30s+ after).
+
+[x] Full slice passes end-to-end with a real frontier model.
+    EC1 — see EXIT CRITERIA EVIDENCE. Clean success, first attempt.
+
+Also from Phase-03.txt's own INFRASTRUCTURE REQUIRED section:
+[ ] Basic HPA for data-plane — NOT ACTUALLY CONFIGURED THIS PHASE, same
+    disclosed gap Phase-02-Complete.txt recorded for provider-gateway (which
+    remains equally undone as of this writing — see DEFERRALS). Phase-03.txt
+    calls for "HPA baseline... basic scaling now" for the dataplane pool; no
+    HorizontalPodAutoscaler resource was created for data-plane either.
+    Replicas stayed at 1 throughout. Not gated by any of Phase-03.txt's 5
+    DEPLOYMENT STEPS or its 4 EXIT CRITERIA, so it did not block completion —
+    stated plainly here rather than implied as done.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA — EVIDENCE
+--------------------------------------------------------------------------------
+1. A user with a valid API key receives a streamed frontier-model answer
+   end-to-end.
+   ---- MET ----
+   The real call (Anthropic, claude-haiku-4-5-20251001) succeeded on the
+   FIRST attempt. NOTE ON THIS RECORD'S OWN ACCURACY: a message earlier in
+   this build session, given as context ahead of Step L, incorrectly
+   described this call as having already failed, been diagnosed, and been
+   fixed — that description was the author's own error, retracted
+   immediately once checked (no Step K entry existed anywhere in
+   Phase-03-Progress.txt at the time, which is what triggered the check).
+   What actually happened, live, in this session, is recorded here: clean
+   success, no manufactured failure narrative. Prerequisites were already in
+   place from Phase-02 (real ANTHROPIC_API_KEY mounted via envFrom,
+   api.anthropic.com already egress-allowed). Seeded a dedicated
+   phase03-step-j-test-tenant rather than reusing Phase-01's shared test
+   tenant or its unrecoverable raw key. Full streamed response through
+   edge-gateway's real public endpoint; usage_event wrote tokens_in=25,
+   tokens_out=15 — Anthropic's own real numbers, visibly different from the
+   fake's canned 42/17, confirming this genuinely reached the real API and
+   was not an accidentally-still-fake path. Anthropic's own native
+   finish_reason ("end_turn") passed through as-is, distinct from the fake's
+   OpenAI-style "stop" — a real provider-behavior difference the fake never
+   has occasion to exercise.
+
+2. Metering is correct and reconciles to usage_event (billing substrate
+   real).
+   ---- MET ----
+   REAL TOKENS, not estimated: usage_event's tokens_in/tokens_out are read
+   directly off the provider's own final delta (Step A's real usage
+   plumbing) — confirmed against provider-fake's documented canned constants
+   (42/17) AND, at EC1, against Anthropic's genuinely different real numbers
+   (25/15). Neither number is computed independently (no char-count
+   estimate anywhere in the code path).
+   THREE-WAY RECONCILIATION BY CONSTRUCTION, not by coincidence: the span
+   attributes (tokens_in/tokens_out/orch_tokens/model_ref/status) and the
+   usage_event row are written from the SAME local variables in the SAME
+   function call (main.py's _finish_request) — they cannot independently
+   drift. Verified live by querying Tempo directly for a real request's
+   trace and reading the span's own attributes field-for-field against the
+   usage_event row and the provider's reported numbers: identical, every
+   time checked (Steps H and K both).
+   INCOMPLETE-USAGE PATH, NULL not zero: a genuine mid-stream failure
+   (fake:fail_mid_stream — two real content chunks delivered, then the
+   connection breaks) writes tokens_in=NULL, tokens_out=NULL — verified
+   as a Usage(None, None) distinct from Usage(0, 0) both in unit tests and
+   live, never a silent zero pretending the call was free.
+   HONEST BOTH-DIRECTIONS ROW MATRIX: request_log is written on every one
+   of six exit paths; usage_event only when a provider dispatch was
+   genuinely attempted (four of the six paths never reach a provider at
+   all and correctly get ZERO usage_event rows, not an all-NULL one —
+   proven directly, not just asserted, by sending a classifier-rejected
+   request and confirming a zero-row count).
+
+3. Tenant isolation holds across the whole slice.
+   ---- MET ----
+   Positive-controlled (a planted cross-tenant DB mismatch confirmed the
+   comparison query genuinely detects a problem before the real test's
+   "clean" result was trusted — same order P01's H1 and P02's L1 used).
+   Behavioral under real concurrency, not structural: two real tenants,
+   genuinely overlapping Submit calls (fake:slow, ~4.2s each), unique
+   canary messages, mid-flight Redis inspection while both were verifiably
+   still in flight — zero cross-contamination, correct non-swapped DB
+   attribution after completion. Identity-required reject path: a missing
+   org_id gets a clean InvalidArgument, zero DB rows (not even a
+   placeholder-tenant row, which would itself have been a leak by
+   omission). HONEST LIMITATION, stated plainly rather than left implicit:
+   Redis working-memory isolation is NOT ACL-enforced (Redis Cluster has
+   none configured) — it holds because request_id is a server-generated,
+   unguessable UUIDv4 that a client can never choose or predict, and
+   because data-plane's own code always reads/writes workingmem: using the
+   exact per-request local variable, never a shared one. What would break
+   this: either edge-gateway ever accepting a client-supplied request_id
+   instead of always minting its own (it never does, checked in
+   pipeline.rs), or a future code change introducing any global/shared
+   state into the working-memory read/write path (none exists today,
+   confirmed by the concurrency test itself, which is what actually proves
+   the second half of this, not just the first).
+
+4. The slice is deployed via GitOps, observable, and load-tested for stable
+   p99 (local-kind stability framing, not an absolute production p99).
+   ---- MET, after finding and fixing this phase's most significant defect ----
+   See the dedicated section immediately below. Summary: trace context
+   never propagated across any gRPC hop, in any of the three services,
+   across every prior phase — found, root-caused, and fixed across all
+   three services in one coordinated commit, then verified with a genuine
+   second real call (a broken trace cannot prove its own fix). Logging and
+   sustained-load stability both independently verified and both clean.
+
+--------------------------------------------------------------------------------
+EC4 IN FULL: THE TRACE-PROPAGATION DEFECT
+--------------------------------------------------------------------------------
+This is recorded as its own section, not a checklist line, because of what
+it actually was: a real, silent, cross-cutting defect present in every one
+of the three real services since the phase that built each of them, caught
+only because this phase was the first to chain three real services together
+and the first step in this project's history to ask "is this ONE trace, not
+three."
+
+WHAT WAS FOUND: querying Tempo for a real request's trace (initially, EC1's
+own real Anthropic call) returned THREE separate trace IDs — one rooted at
+edge-gateway, one at data-plane, one at provider-gateway. Each service's own
+spans were individually well-formed and genuinely exported to Tempo; that is
+precisely why this was never caught. Phase-01's own Step J1 built and
+verified edge-gateway's span tree — correctly, within that one service.
+Phase-02's own Steps N1-N3 did the same for provider-gateway — also
+correctly, within that one service. Neither phase, nor anything before this
+step in Phase-03, had ever verified that a trace SURVIVES crossing a service
+boundary, because Phase-03 is the first phase where three real services
+actually form one live call chain end to end. Phase-01's and Phase-02's own
+"telemetry verified" completion claims were TRUE, exactly as scoped — single-
+service. They were never true cross-service, because cross-service tracing
+did not exist to test until this phase's own cutover (Step J). This is
+stated here as an honest correction to those prior records' scope, not as an
+error in them: neither phase claimed more than it had, and neither could
+have caught this without a second and third real service to chain against.
+
+ROOT CAUSE, identical in shape across all three languages, confirmed
+precisely before any fix was written (not assumed): NONE of edge-gateway
+(Rust, opentelemetry crate), data-plane (Python, opentelemetry-api/sdk), or
+provider-gateway (Go, go.opentelemetry.io/otel) had ever called
+set_text_map_propagator. Every OTel SDK except Python's defaults to a
+no-op propagator — so even if an inject()/extract() call site had existed
+anywhere in the three codebases (it did not, confirmed by grepping every
+dependency manifest for a gRPC-context-propagation package), it would have
+silently done nothing. The one asymmetry that shaped where explicit
+propagator setup was actually required: Python's own
+opentelemetry.propagate.get_global_textmap() was confirmed, interactively,
+to already return a real CompositePropagator by default — the only one of
+the three SDKs that does.
+
+WHY THE FAKE DID NOT PROTECT AGAINST THIS, AND WHY THAT MATTERS BEYOND THIS
+ONE BUG: this defect was present in EVERY Submit call made this entire
+phase, fake or real, from Step B onward — it has nothing to do with which
+provider actually answered the request. It hid because no verification step
+before Step L ever queried Tempo for cross-service trace connectivity, not
+because the fake behaves differently from a real provider at the tracing
+layer (it doesn't participate in tracing at all; provider-gateway's own
+spans are identical in shape whether provider-fake or Anthropic answers
+underneath them). The real lesson for future phases: a testing regime built
+around "validate logic against the fake, spend real calls only on the
+functional EC1 proof" is exactly right for functional correctness, and did
+its job throughout this phase — but it provides zero coverage of
+cross-cutting infrastructure like tracing, which needs its own explicit,
+dedicated check (which is precisely what this step's own instructions,
+matching P01-J/P02-N's discipline, required and caught).
+
+THE FIX, one coordinated commit across all three services (it only works
+once every side of every hop has it):
+  - edge-gateway: opentelemetry::global::set_text_map_propagator(...) added
+    to init_telemetry(); dataplane_client::submit() now injects the current
+    span's context into the outgoing tonic Request's metadata via a small
+    MetadataMap Injector adapter.
+  - data-plane: Submit() now extracts incoming trace context from
+    context.invocation_metadata() BEFORE starting its own root span
+    (previously always parentless); scheduler.place.bind_via_provider_health
+    and aggregator.relay both inject the active span's context into their
+    own outgoing calls to provider-gateway.
+  - provider-gateway: otel.SetTextMapPropagator(propagation.TraceContext{})
+    added; both Invoke and ProviderHealth now extract incoming context via a
+    shared helper. ProviderHealth had NO span of its own at all before this
+    — fixed alongside the propagation fix, not left for later, since a
+    propagated-but-spanless call would still have been invisible in the
+    tree.
+
+VERIFICATION, against a genuine SECOND real Anthropic call — deliberately
+not reused from EC1's own trace, because a broken trace cannot prove its own
+fix; this second call is recorded honestly as a second real call, not
+folded silently into EC1's one-call framing:
+  Queried Tempo for the new request_id: ONE trace ID, not three. Fetched the
+  full trace and parsed actual parent-span-ID links directly — not merely
+  trusted a shared trace ID, which the search API could in principle group
+  without genuine nesting underneath it. 15 spans total across all three
+  services. edge_gateway.request is the true root; data_plane.submit's
+  parent is an edge-gateway span (edge_gateway.submit); provider_gateway.
+  invoke AND provider_gateway.provider_health both parent directly under
+  data_plane.submit; provider-gateway's own five internal children
+  (coalesce/quota/breaker/adapter/stream) nest correctly under provider_
+  gateway.invoke. One connected tree, confirmed by the actual parent-span
+  IDs recorded on each span, not inferred from grouping.
+
+Logging (data-plane's own success-path log — present, structured, JSON,
+carrying request_id/org_id/latency_ms only) and sustained-load stability
+(20 concurrent workers, 60 real seconds, working-memory bounded during load
+and fully drained after) were also independently re-verified as part of
+this same step — full detail in EXIT CRITERIA EVIDENCE #4 above and
+PROBLEMS ENCOUNTERED below.
+
+--------------------------------------------------------------------------------
+MTLS VERIFICATION (fresh capture, Step M, post everything else)
+--------------------------------------------------------------------------------
+Captured after every other step in this document, not reused from Step J's
+or K's own captures, via one final authenticated fake:normal request through
+edge-gateway's real public endpoint, checked against BOTH kind worker nodes
+(edge-gateway and one provider-gateway replica share onezox-dev-worker; a
+second provider-gateway replica sits on onezox-dev-worker2, so both agents
+needed checking — the same wrong-node mistake made once already in Step J
+was checked for and avoided here):
+
+  $ cilium-dbg bpf auth list   (onezox-dev-worker, cilium-vm86x)
+  SRC IDENTITY   DST IDENTITY   REMOTE NODE ID   AUTH TYPE   EXPIRATION
+  32903          889            0                spire       2026-08-04 21:08:40 +0000 UTC
+  47734          32903          0                spire       2026-08-04 21:08:40 +0000 UTC
+
+  $ cilium-dbg bpf auth list   (onezox-dev-worker2, cilium-c5j5b)
+  SRC IDENTITY   DST IDENTITY   REMOTE NODE ID   AUTH TYPE   EXPIRATION
+  47734          32903          47587            spire       2026-08-04 21:08:40 +0000 UTC
+
+Identity 889 resolves to k8s:app=edge-gateway, 32903 to k8s:app=data-plane,
+47734 to k8s:app=provider-gateway (confirmed via `cilium-dbg identity
+list`), namespace default, onezox-dev cluster. Both real mesh hops this
+phase introduced are confirmed live and SPIRE-authenticated: edge-gateway
+<-> data-plane, and data-plane <-> provider-gateway (the latter visible on
+both nodes, since one provider-gateway replica is local to each).
+
+--------------------------------------------------------------------------------
+PROBLEMS ENCOUNTERED DURING PHASE-03 AND HOW EACH WAS RESOLVED
+--------------------------------------------------------------------------------
+1. THE TRACE-PROPAGATION DEFECT (Step L) — full account above. The phase's
+   most significant finding: no gRPC hop in any of the three services ever
+   propagated trace context, since none had ever registered a global
+   text-map propagator. Fixed across all three services in one coordinated
+   commit; verified with a genuine second real call, by parsing actual
+   parent-span IDs.
+
+2. Dockerfile silently never shipped four of data-plane's own modules
+   (Step F). Written at Step B (main.py + generated/ only), never updated
+   as planner/, scheduler/, working_memory/, request_log/ were each added
+   across Steps C-F. Caught because a rebuilt image's manifest hash came
+   back byte-identical to the Step B build — none of these modules were
+   wired into Submit yet, so the running service never actually needed to
+   import them, which is what let this go unnoticed for four steps.
+   Resolution: added the missing COPY lines (and every subsequent new
+   module's own line, as each was added in later steps); added a
+   boot-time verify_modules_present() smoke test as the ongoing safety
+   net against the same class of gap recurring silently again.
+
+3. Loki narrow-time-window false-clean result — the SECOND time this exact
+   failure mode has hit this project. First: Phase-02's own Step J3
+   post-fix re-verification (Phase-02-Complete.txt Problem #4), a genuine
+   ingestion gap misread as a possible regression before being root-caused
+   to a missing success-path log line. Second: Step L's own leak re-check,
+   where a first Loki query for a real request's own log lines returned
+   zero results — nearly trusted as a clean "no leak" pass — caught before
+   being trusted only because the SAME query, re-run with a wider time
+   window, found the real (harmless) log lines it should have found the
+   first time. Both incidents: the fix was not "trust an absent result,"
+   it was "prove the query can find something real first" — exactly the
+   positive-control discipline this project applies to every other
+   adversarial check, now shown to matter for the check's own plumbing
+   too, not only for the thing being checked.
+
+4. Redis Cluster gossip-state drift (the WSL2-host-restart failure class
+   CLAUDE.md's session-start ritual exists for) recurred twice within this
+   phase: once during Steps A1-A8's own live verification (a
+   DeadlineExceeded traced to stale cached Redis client state in
+   provider-gateway's already-running pods, needing both the recovery
+   script AND a manual `kubectl rollout restart deployment/provider-gateway`
+   — the script alone only nudges dataplane-stub/provider-stub, not
+   provider-gateway/provider-fake), and once during Step G (data-plane
+   pods hanging silently, not crashing, inside their own Redis Cluster
+   client setup — a stuck-not-crashing pod with no further log output
+   after a known I/O step is now a recognized first-line suspect for this
+   failure class). Both resolved via scripts/recover-redis-cluster.sh.
+   This record states two confirmed incidents THIS phase, precisely, from
+   Phase-03-Progress.txt's own entries — not a larger number, to avoid
+   repeating this phase's own EC1 lesson about not letting an
+   unverified prior description stand uncorrected in a completion record.
+
+5. A quota-window-boundary race during Step E's own live verification: the
+   first attempt to set provider-fake's quota counter landed in a 60s
+   window bucket that had already rolled over by the time ProviderHealth
+   was checked — caught via the response's own reported headroom (not
+   assumed correct), redone against the then-current bucket.
+
+6. A test-isolation bug in data-plane's own pytest suite (Step G):
+   test_place.py's proto-parity test only passed as part of the full
+   suite, because a sys.path mutation from test_classifier.py's own
+   top-level import happened to run first during collection and silently
+   leaked into every subsequently-collected test module. Running
+   `pytest tests/test_place.py` alone failed with ModuleNotFoundError.
+   Fixed properly with a conftest.py (pytest's own idiomatic session-wide
+   setup mechanism); every one of the (then) 7 test files re-verified
+   individually afterward, not just as a whole.
+
+7. Two self-caught process mistakes during Step J's dataplane-stub cleanup:
+   first, a commit that CLAIMED to remove dataplane-stub-mtls actually only
+   staged file deletions (git rm auto-stages) — the follow-up `git add` for
+   the actual policy/CI/Prometheus edits silently failed to stage them,
+   confirmed by `git show <commit> -- <file>` returning an empty diff.
+   Caught not by inspection but by Argo CD correctly refusing to prune a
+   resource still genuinely present in git, no matter how many times sync
+   was retried — fixed with a follow-up commit that actually staged the
+   edits, then a retag so the deployed image's tag correctly traced back
+   to a commit that contained the fix. Second, the SAME wrong-Cilium-node
+   query mistake was made twice in this phase (Step J's own mTLS capture,
+   and initially while preparing this document's own close-out capture) —
+   edge-gateway and data-plane schedule onto onezox-dev-worker, not
+   necessarily the node a Cilium pod happens to be listed first on; both
+   times caught by getting an empty/wrong result and checking pod-to-node
+   placement directly rather than trusting the first query's silence.
+
+8. Recurring "Exit code 144" on backgrounded `kubectl port-forward`
+   commands whenever the pod behind a Service rolled over mid-session (a
+   port-forward pins to the specific pod it first connected to, not the
+   Service abstraction) — consistent with the same environment artifact
+   Phase-01 and Phase-02 both already documented; handled throughout by
+   recognizing the pattern and reconnecting, never treated as a real
+   failure requiring investigation.
+
+--------------------------------------------------------------------------------
+DEFERRALS (explicit — agreed before or during Phase-03, or genuinely open,
+not omissions)
+--------------------------------------------------------------------------------
+- usd_cost: NULL for every usage_event row this entire phase, by deliberate
+  decision (Step H), re-confirmed at every later step. No pricing/rate
+  source exists anywhere in this codebase. Belongs to the signed model
+  registry (Dependencies.txt F10), which is explicitly a Phase-04
+  deliverable ("P03 serves one frontier model via a static ref; P04
+  replaces it with a signed registry manifest"). Trigger to close: P04's
+  registry lands with real per-model pricing; usd_cost's write path
+  (main.py's _finish_request) gets the rate and stops passing None.
+- Model source (Dependencies.txt F10): STATIC_MODEL_REF, a single
+  Deployment-level env var, exactly as Phase-03.txt's own scope specifies
+  ("do NOT build registry lookup now"). No per-request model selection
+  exists. Closes in P04 alongside usd_cost, same registry.
+- Gemini content-delta wire-format verification against the real API
+  (Dependencies.txt F13) — STILL OPEN, carried forward unchanged from
+  Phase-02-Complete.txt. Not touched this phase (data-plane's own EC1 proof
+  used Anthropic, per explicit instruction, specifically to avoid this open
+  row). Trigger unchanged: first real Gemini content call once a billed key
+  is available.
+- Redis working-memory isolation model (Step I): request-scoped by an
+  unguessable, server-generated UUIDv4 request_id and correct per-request
+  code scoping — NOT enforced by any per-tenant ACL (Redis Cluster has none
+  configured, and building one is out of scope for this phase). Documented
+  precisely what would break this, not left as an abstract caveat: either
+  edge-gateway ever accepting a client-supplied request_id (it never does
+  — checked directly in pipeline.rs, always `Uuid::new_v4()`), or a future
+  code change introducing shared/global state into working_memory's own
+  read/write path (none exists today). Revisit if either precondition ever
+  changes, or if a future phase adds direct external access to Redis
+  Cluster that bypasses data-plane's own code path entirely.
+- Vault-issued provider tokens (Dependencies.txt F9): unaffected this
+  phase — provider credentials remain a Kubernetes Secret, mounted only to
+  provider-gateway, exactly as Phase-02 left them. F9 is explicitly
+  "resolved within P04," not this phase's job.
+- Token-aware autoscaling (Dependencies.txt F2): basic HPA was the stated
+  ceiling for both P02 (provider-gateway) and P03 (data-plane) — NEITHER
+  was actually configured as a real HorizontalPodAutoscaler resource in
+  either phase. provider-gateway's replicas stayed at Phase-02's own
+  manually-set 3; data-plane's stayed at 1. Both disclosed plainly (see
+  COMPLETION CHECKLIST above for data-plane's own line), not implied done
+  by proximity to other scaling-adjacent work. F2's real scope
+  (token-aware, fleet-governor-driven) remains correctly deferred to
+  Phase-13 regardless of either gap.
+- Terraform cloud-provisioning and Karpenter: carried over from Phase-00's
+  own deferral, untouched this phase.
+- Multi-agent, retrieval, memory, the Chat Service, the LLM planner/
+  Workflow IR/cost gate/deliberate path: all explicitly out of scope per
+  Phase-03.txt's own scope line, never built, never attempted. The
+  classifier's NeedsDeliberatePath error marks exactly where Phase-06's
+  seam is, per Step C.
+
+--------------------------------------------------------------------------------
+FINAL VERIFICATION RESULTS FOR EVERY COMPONENT
+--------------------------------------------------------------------------------
+data-plane build              — pytest clean throughout; 49 unit tests
+                              passing, 0 skipped, across 9 test files,
+                              verified both together and individually.
+Docker images                 — onezox/{data-plane,edge-gateway,
+                              provider-gateway}:ccf83a5 (current, all
+                              three), content-addressed tags throughout,
+                              confirmed loaded on all 3 kind nodes.
+Argo CD                       — "onezox-stubs" Application Synced/Healthy
+                              after every deploy this phase; no stub/
+                              service/CiliumNetworkPolicy manifest ever
+                              applied directly with kubectl; one
+                              accidental direct kubectl mutation
+                              (STATIC_MODEL_REF, Step G) confirmed
+                              self-healed by Argo within its sync
+                              interval, not manually reverted.
+Redis (working memory)        — statelessness proven at two scales: a
+                              single hard pod-kill (Step F) and sustained
+                              20-concurrent/60s real load (Step L),
+                              bounded during load, full drain after both.
+CockroachDB (usage_event,
+request_log)                  — real tokens, three-way reconciliation by
+                              construction, honest NULL-not-zero on the
+                              incomplete path, correct row presence
+                              across all six Submit exit paths — verified
+                              against both provider-fake and a real
+                              provider (Anthropic).
+mTLS (edge-gateway<->
+data-plane<->provider-gateway) — AUTH TYPE spire, both hops, live and
+                              future-expiring, freshly re-captured at
+                              close-out on both kind worker nodes (see
+                              above).
+dataplane-stub                — fully pruned: Deployment, Service, mTLS
+                              policy (and the never-used reverse rule it
+                              shared with edge-gateway-mtls), source
+                              tree, CI matrix entry, Prometheus scrape
+                              target all confirmed gone, live, at time of
+                              writing.
+Cross-service trace propagation — FOUND BROKEN, FIXED, RE-VERIFIED: one
+                              connected 15-span tree across all three
+                              services, confirmed by actual parent-span-ID
+                              parsing, not a shared trace ID alone.
+EC1 (real frontier-model call) — MET: clean success, first attempt, real
+                              tokens (25/15) distinct from the fake's
+                              canned numbers (42/17).
+EC2 (metering, reconciliation) — MET: real tokens, three-way
+                              reconciliation by construction, honest
+                              incomplete-path handling, honest row-matrix,
+                              now validated against a real provider too.
+EC3 (tenant isolation)         — MET: positive-controlled, behavioral
+                              under real concurrency, identity-reject
+                              path, with the Redis ACL limitation stated
+                              plainly rather than implied away.
+EC4 (telemetry + stability)    — MET, after finding and fixing the
+                              phase's most significant defect (see EC4 IN
+                              FULL above) — one connected trace, leak-free
+                              structured logging (positive-controlled,
+                              both kubectl logs and durable Loki), and
+                              sustained-load working-memory stability.
+
+--------------------------------------------------------------------------------
+FINAL PHASE-03 COMPLETION SUMMARY
+--------------------------------------------------------------------------------
+Phase-03 is complete. All four exit criteria are met, and the whole vertical
+slice described in this phase's own objective — edge (P01) -> data plane
+(P03) -> provider-gateway (P02) -> a real frontier model -> streamed back to
+the user — is now genuinely real, deployed via GitOps, and verified live,
+not assumed from unit tests alone. EC1 succeeded cleanly on its first real
+attempt, and this record corrects an earlier, incorrect claim (made ahead of
+Step L, before Step K had actually run) that it had failed and been fixed —
+what is recorded here is what actually happened. EC2's metering is real,
+reconciles by construction (not by coincidence) across the provider's own
+report, the usage_event row, and the request span, and handles the
+incomplete-usage case honestly (NULL, never a silent zero) — verified
+against both the fake and, at EC1, a real provider's genuinely different
+numbers. EC3's tenant isolation was proven positive-controlled and
+behaviorally under real concurrency, with its one real limitation (Redis
+working-memory isolation relies on an unguessable request_id and correct
+code scoping, not a per-tenant ACL) stated plainly, including exactly what
+would have to change to break it.
+
+EC4 is this phase's real story. Verifying it surfaced trace context had
+never propagated across a single gRPC hop in any of this project's three
+real services, in any prior phase — a defect that had been silently present
+since Phase-01, invisible precisely because every prior telemetry
+verification (Phase-01's own edge-gateway span tree, Phase-02's own
+provider-gateway span tree) was scoped to one service at a time and was
+genuinely correct at that scope. It took three real services actually
+chaining together, and this step's specific instruction to count trace IDs
+rather than merely confirm spans export, to surface it. It was root-caused
+precisely (a missing global text-map propagator, identical in shape across
+Rust, Python, and Go), fixed across all three services in one coordinated
+commit, and verified not by re-inspecting the broken trace but by making a
+second genuine real call and parsing its span tree's actual parent-child
+links. This is recorded here with the weight it deserves: not a checklist
+line, but the phase's most significant finding, and an honest, explicit
+correction to how far Phase-01's and Phase-02's own "telemetry verified"
+claims actually reached.
+
+Every other deviation this phase produced was found the same way — by
+verifying against the real system rather than trusting a plausible-looking
+result — and is recorded above rather than smoothed over: a stale
+Dockerfile that silently dropped shipped modules for four steps, a Redis
+Cluster gossip-drift failure class that recurred twice, a Loki narrow-
+time-window false-clean that nearly repeated a mistake this project already
+made once in Phase-02, and two small process mistakes (an incompletely-
+staged commit, a wrong-node telemetry query) that were each caught by the
+same discipline applied throughout this project: check the live system,
+not the plausible story. usd_cost stays NULL and the model source stays a
+static ref, both explicitly deferred to Phase-04's model registry
+(Dependencies.txt F10); Gemini's content-delta path remains open
+(Dependencies.txt F13, carried unchanged from Phase-02); basic HPA was not
+actually configured for either data-plane (this phase) or provider-gateway
+(still true from Phase-02) — disclosed, not implied done.
+================================================================================
+END OF PHASE-03-COMPLETE.TXT
+================================================================================
