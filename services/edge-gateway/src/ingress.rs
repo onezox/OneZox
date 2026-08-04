@@ -130,7 +130,7 @@ fn bad_gateway(request_id: &str) -> Response {
         StatusCode::BAD_GATEWAY,
         Json(NotWiredError {
             error: NotWiredErrorDetail {
-                message: format!("request {request_id}: downstream (dataplane-stub) unavailable"),
+                message: format!("request {request_id}: downstream (data-plane) unavailable"),
                 kind: "bad_gateway".to_string(),
             },
         }),
@@ -176,7 +176,7 @@ async fn submit_and_relay(
             tracing::warn!(
                 error = %status,
                 request_id = %request_id,
-                "dataplane-stub Submit call failed"
+                "data-plane Submit call failed"
             );
             meter.finish("error");
             drop(admission_guard);

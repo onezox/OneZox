@@ -1,8 +1,10 @@
 # Cilium mTLS enforcement between edge-gateway (Phase-01), provider-gateway
 # (Phase-02), and data-plane (Phase-03, cut over from dataplane-stub at
-# Step J — dataplane-stub-mtls stays in this file only until Step J's
-# later, separate cleanup commit removes it alongside dataplane-stub
-# itself, once data-plane-mtls below is confirmed healthy).
+# Step J — dataplane-stub-mtls, the reverse dataplane-stub->edge-gateway
+# rule edge-gateway-mtls used to carry, and dataplane-stub's own identity
+# in provider-gateway-mtls's ingress rule were all removed together in
+# this same cleanup commit, once data-plane-mtls below was confirmed
+# healthy).
 #
 # Completes the last Phase-00 acceptance item: SPIRE (Step 9) installed the
 # mTLS *capability* only, deliberately not enforced at the time, pending
@@ -12,61 +14,19 @@
 # cutover, replaced by edge-gateway. provider-stub-mtls was removed the
 # same way in Phase-02 Step K3, once provider-gateway-mtls below was
 # confirmed healthy — provider-stub itself removed in that same cutover,
-# replaced by provider-gateway.
+# replaced by provider-gateway. dataplane-stub-mtls followed the same
+# pattern in Phase-03 Step J, replaced by data-plane-mtls below.
 #
 # Design constraint that shaped every rule below: adding ANY ingress rule
 # to a CiliumNetworkPolicy switches that endpoint's ingress to default-deny
 # for everything NOT explicitly matched — but only for ingress; egress is
-# untouched since no egress rules are defined here. Port 8080 on each stub
-# already serves two things besides sibling-stub traffic:
+# untouched since no egress rules are defined here. Port 8080 on each
+# service already serves two things besides sibling traffic:
 #   1. kubelet's own liveness/readiness probes (Cilium identity: `host`)
 #   2. Prometheus's /metrics scrape (Deployment Step 7 verification)
 # Both get an explicit no-auth allow rule below so this doesn't regress
 # either already-verified behavior. Nothing else is allowed in on 8080.
 
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: dataplane-stub-mtls
-  namespace: default
-spec:
-  endpointSelector:
-    matchLabels:
-      app: dataplane-stub
-  ingress:
-    - fromEntities:
-        - host
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-            # Still needed alongside the authenticated edge-gateway rule
-            # below: kubectl port-forward (used throughout Phase-01 Steps
-            # A6/D/E for host-based live verification) authenticates as
-            # "host", not as edge-gateway's own identity.
-            - port: "50051"
-              protocol: TCP
-    - fromEndpoints:
-        - matchLabels:
-            app.kubernetes.io/name: prometheus
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-    # Phase-01 Step F2: edge-gateway's real Submit() gRPC calls (Step E3).
-    # Added in the SAME commit/sync as edge-gateway's own Deployment and
-    # edge-gateway-mtls policy below, so edge-gateway never has a moment
-    # where it's deployed but can't reach its one real downstream.
-    - fromEndpoints:
-        - matchLabels:
-            app: edge-gateway
-      toPorts:
-        - ports:
-            - port: "50051"
-              protocol: TCP
-      authentication:
-        mode: "required"
----
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -90,15 +50,14 @@ spec:
         - ports:
             - port: "8080"
               protocol: TCP
-    - fromEndpoints:
-        - matchLabels:
-            app: dataplane-stub
-      toPorts:
-        - ports:
-            - port: "8080"
-              protocol: TCP
-      authentication:
-        mode: "required"
+    # The dataplane-stub -> edge-gateway reverse rule this policy used to
+    # carry (Phase-00's original stub-to-stub mTLS capability proof, never
+    # functionally used — nothing in the real architecture calls FROM the
+    # data plane INTO edge-gateway) was removed in Step J's cleanup,
+    # matching the same "one proven direction is sufficient" precedent
+    # provider-gateway-mtls's own header comment already established when
+    # Phase-02 Step K3 did not recreate the equivalent reverse rule for
+    # provider-gateway.
 ---
 # Phase-02 Step K3: provider-gateway's own mTLS ingress policy, added and
 # verified healthy BEFORE provider-stub-mtls/provider-stub's Deployment
@@ -111,31 +70,29 @@ spec:
 # comment above; Cilium enforces the two directions independently, so a
 # separate CiliumNetworkPolicy object per direction is fine.
 #
-# dataplane-stub -> provider-gateway (this rule) originally proved the
-# SPIRE mTLS mechanism genuinely works for provider-gateway, the same
-# "prove the capability, not necessarily a functionally-exercised call
-# path yet" role dataplane-stub <-> provider-stub played since Phase-00.
-# Port here is 50051 (provider-gateway's real gRPC port), not 8080 like
-# the old stub pair used.
+# data-plane -> provider-gateway (this rule): data-plane's own boot
+# sequence calls ProviderHealth (Step A7) as a real, non-hypothetical
+# connectivity proof, the same way it proves Cockroach and Redis, and its
+# real Submit flow dispatches to provider-gateway's Invoke on every
+# request. Port here is 50051 (provider-gateway's real gRPC port).
 #
-# Phase-03 Step B: data-plane (the real service this comment used to say
-# "doesn't arrive until Phase-03") is now a SECOND allowed caller,
-# alongside dataplane-stub, not a replacement — dataplane-stub is not cut
-# over yet (Step J). This is the functionally-exercised call path the
-# capability-proof rule above was always standing in for: data-plane's
-# own boot sequence calls ProviderHealth (Step A7) as a real,
-# non-hypothetical connectivity proof, the same way it proves Cockroach
-# and Redis. Once Step J's cutover removes dataplane-stub, this narrows
-# back down to data-plane alone, matching how provider-stub-mtls's own
-# removal at K3 narrowed the equivalent rule on the other side.
+# Phase-03 Step B widened this rule to allow BOTH dataplane-stub and
+# data-plane during the coexistence window (data-plane deployed
+# preliminarily, dataplane-stub not yet cut over). Step J's cutover
+# narrowed it back down to data-plane alone, once dataplane-stub itself
+# was removed — matching how provider-stub-mtls's own removal at K3
+# narrowed the equivalent rule on the other side, and how this same rule
+# used to allow dataplane-stub calling provider-gateway (a pure mTLS
+# capability proof, Phase-00's dataplane-stub<->provider-stub pairing)
+# before data-plane's real traffic replaced it.
 #
-# The REVERSE direction the old pair also had (provider-stub calling
-# INTO dataplane-stub on 8080, in dataplane-stub-mtls) was deliberately
-# NOT recreated for provider-gateway in the K3 cleanup: that direction
-# never had a functional purpose even for the stubs (pure capability
-# proof), and inventing a new reverse relationship here would be adding
-# scope Phase-02.txt doesn't call for. One proven direction is sufficient
-# to demonstrate the mTLS capability.
+# The REVERSE direction the old stub pair also had (provider-stub calling
+# INTO dataplane-stub on 8080) was deliberately NOT recreated for
+# provider-gateway/data-plane at either cutover: that direction never had
+# a functional purpose even for the stubs (pure capability proof), and
+# inventing a new reverse relationship here would be adding scope neither
+# Phase-02.txt nor Phase-03.txt calls for. One proven direction is
+# sufficient to demonstrate the mTLS capability.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -153,7 +110,7 @@ spec:
             - port: "8080"
               protocol: TCP
             # kubectl port-forward (used throughout Phase-02 for
-            # host-based live verification, same as dataplane-stub-mtls's
+            # host-based live verification, same as data-plane-mtls's
             # own justification) authenticates as "host", not as any
             # peer's own SPIRE identity.
             - port: "50051"
@@ -166,12 +123,8 @@ spec:
             - port: "8080"
               protocol: TCP
     - fromEndpoints:
-        - matchExpressions:
-            - key: app
-              operator: In
-              values:
-                - dataplane-stub
-                - data-plane
+        - matchLabels:
+            app: data-plane
       toPorts:
         - ports:
             - port: "50051"
@@ -181,10 +134,10 @@ spec:
 ---
 # Phase-03 Step J: data-plane's own mTLS ingress policy, added and
 # confirmed healthy (SPIRE identity established, VALID:true) BEFORE
-# dataplane-stub-mtls/dataplane-stub's Deployment are removed in a later,
-# separate commit — no window where the real data plane is live without
+# dataplane-stub-mtls/dataplane-stub's Deployment were removed in this
+# same cleanup — no window where the real data plane is live without
 # mesh identity, same mesh-identity-safe sequencing Phase-01 Step F2 and
-# Phase-02 Step K3 both used. Shape mirrors dataplane-stub-mtls above
+# Phase-02 Step K3 both used. Shape mirrors the old dataplane-stub-mtls
 # exactly (host for kubelet probes + kubectl port-forward, prometheus for
 # /metrics, edge-gateway's real Submit() gRPC calls with mTLS required).
 apiVersion: cilium.io/v2

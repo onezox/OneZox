@@ -35,12 +35,11 @@ server:
 # platform/operators/otel/values.yaml) — the pull side of the push/pull
 # handoff: Collector exposes /metrics, Prometheus scrapes it here.
 #
-# Also scrapes the remaining Phase-00 stub service directly (Deployment
-# Step 7) — exposes its own /metrics with a *_boot_total counter,
-# independent of whatever it emits via OTel — plus edge-gateway's own
-# /metrics (Phase-01 Step J2: request count, latency histogram, in-flight
-# gauge), added once it actually existed, matching how this same list
-# only grew to include each stub once it existed (Phase-00 Problem #17).
+# Also scrapes each real service directly, plus /metrics (Phase-01 Step
+# J2: request count, latency histogram, in-flight gauge for edge-gateway;
+# analogous series for the others), added once each actually existed,
+# matching how this same list only grew to include each service once it
+# existed (Phase-00 Problem #17).
 #
 # provider-stub's target was removed in Phase-02 Step K3 (cutover to
 # provider-gateway). provider-gateway's own /metrics HTTP handler existed
@@ -51,6 +50,10 @@ server:
 # "absent"; it existed, just with nothing meaningful to scrape. Added to
 # the target list below now that there's something worth scraping, same
 # timing precedent edge-gateway followed in Phase-01 (Step J2).
+#
+# dataplane-stub's target was removed in Phase-03 Step J (cutover to
+# data-plane), replaced by data-plane's own /metrics (main.py's
+# prometheus_client endpoint) below.
 extraScrapeConfigs: |
   - job_name: 'otel-collector'
     scrape_interval: 15s
@@ -60,6 +63,6 @@ extraScrapeConfigs: |
     scrape_interval: 15s
     static_configs:
       - targets:
-          - 'dataplane-stub.default.svc.cluster.local:8080'
+          - 'data-plane.default.svc.cluster.local:8080'
           - 'edge-gateway.default.svc.cluster.local:8080'
           - 'provider-gateway.default.svc.cluster.local:8080'
