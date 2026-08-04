@@ -1,0 +1,82 @@
+# Phase-03 Step B: the real data plane (Python), replacing the Phase-00/01
+# dataplane-stub. PRELIMINARY deployment — no cutover yet (that's Step J,
+# same mesh-identity-safe sequencing Phase-01 Step F2 and Phase-02 Step K3
+# both used: the new service's own mTLS policy goes in and is confirmed
+# healthy BEFORE the old one's policy/Deployment are removed). Deployed
+# alongside dataplane-stub, different Service names, no conflict — same
+# "brought forward early because host-only testing can't reliably reach
+# Redis Cluster's multi-shard topology" reasoning provider-gateway's own
+# preliminary deployment used in Phase-02 (Step E2 prep).
+#
+# No CiliumNetworkPolicy yet, deliberately — egress allow-list and mTLS
+# both arrive as their own later, dedicated steps, matching exactly how
+# provider-gateway's preliminary deployment (Phase-02) had neither until
+# Steps J1/K3.
+#
+# Image tag is the git commit short-SHA this image was built from
+# (content-addressed, not a static "phase03" string) — the convention
+# established in Phase-02 specifically to avoid Phase-01's same-tag-no-diff
+# manual-rollout-restart gap.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-plane
+  namespace: default
+  labels:
+    app: data-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-plane
+  template:
+    metadata:
+      labels:
+        app: data-plane
+    spec:
+      containers:
+        - name: data-plane
+          image: onezox/data-plane:9bcbf850eedc
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50051
+              name: grpc
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 250m
+              memory: 192Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-plane
+  namespace: default
+  labels:
+    app: data-plane
+spec:
+  selector:
+    app: data-plane
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 50051
+      targetPort: 50051
