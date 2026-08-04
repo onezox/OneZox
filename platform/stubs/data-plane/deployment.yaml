@@ -36,7 +36,7 @@ spec:
     spec:
       containers:
         - name: data-plane
-          image: onezox/data-plane:9bcbf850eedc
+          image: onezox/data-plane:a0cbca1e9bf7
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
