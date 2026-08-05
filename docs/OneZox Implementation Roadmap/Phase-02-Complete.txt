@@ -563,6 +563,17 @@ EC4 (telemetry completeness)   — 6/6 spans correctly parented in Tempo
                              1 structured success-path log line in Loki,
                              re-confirmed leak-free after being added.
 
+FORWARD NOTE (added during Phase-03, not known at the time this record was
+written): the above was, and remains, true exactly as scoped — a correctly-
+built, correctly-verified span tree for provider-gateway alone. Phase-03
+Step L found that trace context was never propagated across the gRPC hop
+into provider-gateway from any caller, in any phase, because no global
+text-map propagator had ever been registered — invisible here because this
+verification never had an upstream service to chain against. Root-caused
+and fixed across all three real services in Phase-03; see
+Phase-03-Complete.txt's "EC4 IN FULL: THE TRACE-PROPAGATION DEFECT" section
+for the full account.
+
 --------------------------------------------------------------------------------
 FINAL PHASE-02 COMPLETION SUMMARY
 --------------------------------------------------------------------------------

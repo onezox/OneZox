@@ -499,6 +499,16 @@ EC4 (telemetry completeness)      — 7/7 spans correctly parented in Tempo;
                             Prometheus; 1 structured log line per real
                             request in Loki.
 
+FORWARD NOTE (added during Phase-03, not known at the time this record was
+written): the above was, and remains, true exactly as scoped — a correctly-
+built, correctly-verified span tree for edge-gateway alone. Phase-03 Step L
+found that trace context was never propagated across the gRPC hop out of
+edge-gateway to any downstream service, in any phase, because no global
+text-map propagator had ever been registered — invisible here because this
+verification never had a second service to chain against. Root-caused and
+fixed across all three real services in Phase-03; see Phase-03-Complete.txt's
+"EC4 IN FULL: THE TRACE-PROPAGATION DEFECT" section for the full account.
+
 --------------------------------------------------------------------------------
 FINAL PHASE-01 COMPLETION SUMMARY
 --------------------------------------------------------------------------------

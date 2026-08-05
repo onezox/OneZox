@@ -488,6 +488,14 @@ PROBLEMS ENCOUNTERED DURING PHASE-03 AND HOW EACH WAS RESOLVED
    Phase-03-Progress.txt's own entries — not a larger number, to avoid
    repeating this phase's own EC1 lesson about not letting an
    unverified prior description stand uncorrected in a completion record.
+   A cumulative project-wide count was drafted at one point during this
+   record's own writing (reconciled against a CLAUDE.md line, arriving at
+   "six") and then removed before this final version: that CLAUDE.md line
+   was never independently re-verified against the actual prior-phase
+   records the way Step K's own retracted claim was, so asserting a
+   cumulative total here would have repeated the exact mistake this
+   section otherwise warns against, not avoided it. Two, substantiated,
+   is what this record claims for Phase-03.
 
 5. A quota-window-boundary race during Step E's own live verification: the
    first attempt to set provider-fake's quota counter landed in a 60s
@@ -583,6 +591,21 @@ not omissions)
   Phase-03.txt's own scope line, never built, never attempted. The
   classifier's NeedsDeliberatePath error marks exactly where Phase-06's
   seam is, per Step C.
+- Testing-regime gap that let the trace-propagation defect (EC4 IN FULL,
+  above) go unnoticed through two prior phases: no phase before this one's
+  Step L ever queried the trace backend for cross-service connectivity —
+  each phase's own telemetry check (P01's Step J1, P02's Steps N1-N3) was
+  correctly scoped to verifying its own single service's span tree, and
+  neither claimed more than that. The provider-fake gave zero protection
+  either way: it does not participate in tracing at all, and
+  provider-gateway's own spans are identical in shape whether the fake or
+  a real provider answers underneath them, so this was never a
+  fake-vs-real coverage gap. Not yet closed by any standing process change
+  — recorded here as an open methodology gap rather than assumed fixed by
+  this phase's one-time discovery: a future phase should decide whether
+  "confirm one connected trace across every service in the chain" becomes
+  a standing item in every phase's own completion-verification discipline,
+  not just something this phase happened to think to check.
 
 --------------------------------------------------------------------------------
 FINAL VERIFICATION RESULTS FOR EVERY COMPONENT
@@ -647,6 +670,59 @@ EC4 (telemetry + stability)    — MET, after finding and fixing the
                               sustained-load working-memory stability.
 
 --------------------------------------------------------------------------------
+SINCE THIS PHASE CLOSED — the between-phase provider-set change
+(not Phase-03 work; recorded in its own document, cross-referenced here
+because it materially changes what "the registry" now means)
+--------------------------------------------------------------------------------
+This document otherwise records only Phase-03 work itself, as scoped in
+its own opening paragraph. One necessary exception: between this phase's
+own close and Phase-04's start, a separate, fully-completed task changed
+the provider registry this phase was built and verified against. Full
+account in Between-Phase-Provider-Set-Grok-GLM-Kimi.txt; summarized here
+only so a reader of THIS record isn't left believing the registry is
+still {openai, anthropic, google} when it verifiably is not:
+
+- Gemini (google) is DEACTIVATED — GOOGLE_API_KEY removed from
+  provider-gateway-credentials, main.go's own existing conditional-
+  registration logic (unchanged) is what makes this the deactivation
+  mechanism. google.go, its tests, and Dependencies.txt F13 are all
+  otherwise untouched; F13 itself now carries a dated addendum moving it
+  from "open, blocked on billing" to "suspended pending Gemini re-add."
+  Not deleted, not rewritten — one Secret key away from reactivation.
+- Grok (xAI), GLM (Zhipu/z.ai), and Kimi (Moonshot) are live, added by
+  reusing the SAME openai adapter package against each provider's own
+  OpenAI-compatible endpoint (two real code fixes were needed first — a
+  Name() collision, and a completions-path assumption GLM's real API
+  didn't fit — both regression-tested against the real OpenAI adapter
+  before anything new was registered). Live registry, confirmed via
+  ProviderHealth: {fake, openai, anthropic, grok, glm, kimi}.
+- EC2's own metering mechanism (Step H, unchanged by the provider task)
+  has since been exercised for real against three MORE providers, each
+  proven for both content and real usage — not assumed from Anthropic's
+  single real call alone. Project-wide, real usage now reconciles
+  correctly across five real providers (OpenAI and Anthropic from
+  Phase-02's own EC1; Anthropic again at this phase's own EC1; Grok, GLM,
+  and Kimi from the between-phase task), not one. One of the three new
+  providers (GLM) needed a real, small adapter fix — it sends usage
+  INLINE on the finish_reason chunk rather than OpenAI's own separate
+  trailing chunk — found by capturing its actual raw response, fixed, and
+  re-verified live; not tracked as a deferral, since it was genuinely
+  fixable. This is independent evidence that EC2's reconciliation design
+  (real tokens, three-way match by construction, NULL-not-zero on
+  incomplete paths) generalizes beyond the one provider this phase itself
+  proved it against — it held immediately for two more (Grok, Kimi) and,
+  once one real parsing gap was fixed, for the third (GLM) too.
+- A real credential exposure happened during that task (a kubectl query
+  returned base64-decodable — not encrypted — key values into that
+  session's own transcript) and was resolved by rotating all three
+  pre-existing keys at the user's direction, plus adding the three new
+  providers' keys in the same pass, all via the same terminal-only
+  script this project has used since Phase-02. Noted here as a one-line
+  pointer, not detailed — full account, including the corrected
+  verification boundary now documented in the script itself, is in the
+  between-phase document.
+
+--------------------------------------------------------------------------------
 FINAL PHASE-03 COMPLETION SUMMARY
 --------------------------------------------------------------------------------
 Phase-03 is complete. All four exit criteria are met, and the whole vertical
@@ -697,9 +773,11 @@ same discipline applied throughout this project: check the live system,
 not the plausible story. usd_cost stays NULL and the model source stays a
 static ref, both explicitly deferred to Phase-04's model registry
 (Dependencies.txt F10); Gemini's content-delta path remains open
-(Dependencies.txt F13, carried unchanged from Phase-02); basic HPA was not
-actually configured for either data-plane (this phase) or provider-gateway
-(still true from Phase-02) — disclosed, not implied done.
+(Dependencies.txt F13, carried unchanged from Phase-02 as of this phase's
+own close — see "SINCE THIS PHASE CLOSED" above for its status since);
+basic HPA was not actually configured for either data-plane (this phase)
+or provider-gateway (still true from Phase-02) — disclosed, not implied
+done.
 ================================================================================
 END OF PHASE-03-COMPLETE.TXT
 ================================================================================
