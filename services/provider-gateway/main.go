@@ -547,7 +547,45 @@ func main() {
 	if os.Getenv("GOOGLE_API_KEY") != "" {
 		registeredAdapters = append(registeredAdapters, google.New(os.Getenv("GOOGLE_API_KEY"), ""))
 	} else {
+		// Between-Phase provider task: Gemini deactivated, not removed —
+		// GOOGLE_API_KEY is absent from provider-gateway-credentials on
+		// purpose (F13, Dependencies.txt, is still open: real content-
+		// delta verification against a billed key). The google adapter
+		// package, its tests, and this conditional registration are all
+		// untouched; re-activation is refilling this one Secret key plus
+		// closing F13, not a rebuild. This branch firing (rather than
+		// google.New above) IS the deactivation — confirmed live via
+		// ProviderHealth reporting the registry without "google".
 		log.Warn("GOOGLE_API_KEY not set, google adapter not registered")
+	}
+	// Between-Phase provider task: Grok (xAI), GLM (Zhipu/z.ai), and Kimi
+	// (Moonshot) added via the SAME openai adapter package, not new native
+	// adapters — all three speak a genuine approximation of OpenAI's own
+	// streaming wire format (confirmed live per provider, not assumed
+	// from the "OpenAI-compatible" label alone; see the task's own
+	// findings doc for what each one actually needed).
+	//
+	// Grok and Kimi both match OpenAI's own host+"/v1/chat/completions"
+	// path shape (openai.NewNamed, default path). GLM's z.ai endpoint
+	// does not (openai.NewNamedWithPath, explicit override) — see
+	// openai.go's own doc comments for why.
+	if os.Getenv("GROK_API_KEY") != "" {
+		registeredAdapters = append(registeredAdapters,
+			openai.NewNamed("grok", os.Getenv("GROK_API_KEY"), "https://api.x.ai"))
+	} else {
+		log.Warn("GROK_API_KEY not set, grok adapter not registered")
+	}
+	if os.Getenv("GLM_API_KEY") != "" {
+		registeredAdapters = append(registeredAdapters,
+			openai.NewNamedWithPath("glm", os.Getenv("GLM_API_KEY"), "https://api.z.ai", "/api/paas/v4/chat/completions"))
+	} else {
+		log.Warn("GLM_API_KEY not set, glm adapter not registered")
+	}
+	if os.Getenv("KIMI_API_KEY") != "" {
+		registeredAdapters = append(registeredAdapters,
+			openai.NewNamed("kimi", os.Getenv("KIMI_API_KEY"), "https://api.moonshot.ai"))
+	} else {
+		log.Warn("KIMI_API_KEY not set, kimi adapter not registered")
 	}
 
 	registry := adapters.NewRegistry(registeredAdapters...)
