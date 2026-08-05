@@ -31,6 +31,16 @@ const cannedStreamNoUsage = "" +
 	"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
 	"data: [DONE]\n\n"
 
+// GLM's (z.ai) real shape, captured live via the Between-Phase provider
+// task: usage arrives INLINE on the SAME chunk as finish_reason, not as
+// a separate trailing chunk the way OpenAI itself sends it. No dedicated
+// usage-only chunk ever follows.
+const cannedStreamInlineUsage = "" +
+	"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{\"content\":\" there\"},\"finish_reason\":null}]}\n\n" +
+	"data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9}}\n\n" +
+	"data: [DONE]\n\n"
+
 func TestInvokeParsesCannedStreamCorrectly(t *testing.T) {
 	var gotAuth, gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -131,6 +141,59 @@ func TestInvokeReturnsFinishReasonWithUnsetUsageWhenNoUsageChunkArrives(t *testi
 			}
 			if d.InputTokens != nil || d.OutputTokens != nil {
 				t.Errorf("usage = input:%v output:%v, want both unset (never coerced to zero)", d.InputTokens, d.OutputTokens)
+			}
+			break
+		}
+	}
+	if !gotFinal {
+		t.Error("stream never produced a final delta")
+	}
+}
+
+// GLM's (z.ai) real shape, found live via the Between-Phase provider
+// task: this is the regression test proving the fix. Before it, this
+// exact canned stream produced FinishReason="stop" with BOTH usage
+// fields nil — a silent billing hole, not an error, indistinguishable
+// from a genuinely un-meterable provider until someone checked
+// usage_event specifically. usage must now be read off the finish_reason
+// chunk itself, not deferred waiting for a separate chunk that GLM never
+// sends.
+func TestInvokeReadsUsageInlineOnTheFinishReasonChunk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(cannedStreamInlineUsage))
+	}))
+	defer srv.Close()
+
+	a := NewNamedWithPath("glm", "test-key", srv.URL, "/api/paas/v4/chat/completions")
+	s, err := a.Invoke(context.Background(), adapters.InvokeRequest{
+		Model:    "glm-4.5-flash",
+		Messages: []adapters.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	var gotFinal bool
+	for {
+		d, err := s.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if d.IsFinal {
+			gotFinal = true
+			if d.FinishReason == nil || *d.FinishReason != "stop" {
+				t.Errorf("finish reason = %v, want \"stop\"", d.FinishReason)
+			}
+			if d.InputTokens == nil || *d.InputTokens != 13 {
+				t.Errorf("InputTokens = %v, want 13", d.InputTokens)
+			}
+			if d.OutputTokens == nil || *d.OutputTokens != 9 {
+				t.Errorf("OutputTokens = %v, want 9", d.OutputTokens)
 			}
 			break
 		}

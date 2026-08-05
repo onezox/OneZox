@@ -265,8 +265,26 @@ func (s *stream) Recv() (adapters.Delta, error) {
 
 		choice := chunk.Choices[0]
 		if choice.FinishReason != nil {
-			// Defer: don't return final yet, wait for the usage chunk
-			// that follows.
+			if chunk.Usage != nil {
+				// GLM (z.ai), found live via the Between-Phase provider
+				// task: usage arrives INLINE on the same chunk as
+				// finish_reason, not as OpenAI's own separate trailing
+				// chunk. Deferring here (the OpenAI-shaped branch below)
+				// would wait forever for a dedicated usage chunk that
+				// never comes, silently landing on unset usage — the
+				// exact "looks like it works, bills nothing" failure
+				// this whole adapter's usage handling exists to avoid.
+				// Return the true final delta immediately instead.
+				_ = s.body.Close()
+				return adapters.Delta{
+					FinishReason: choice.FinishReason,
+					IsFinal:      true,
+					InputTokens:  &chunk.Usage.PromptTokens,
+					OutputTokens: &chunk.Usage.CompletionTokens,
+				}, nil
+			}
+			// OpenAI's own shape: defer, wait for the dedicated usage
+			// chunk that follows.
 			s.pendingFinishReason = choice.FinishReason
 			continue
 		}
