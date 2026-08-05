@@ -44,7 +44,7 @@ spec:
             # this to the real static Anthropic ref for the one real
             # call, and only then.
             - name: STATIC_MODEL_REF
-              value: "grok:grok-build-0.1"
+              value: "glm:glm-4.5-flash"
           ports:
             - containerPort: 8080
               name: http
