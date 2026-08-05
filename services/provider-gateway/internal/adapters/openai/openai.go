@@ -34,27 +34,74 @@ const ProviderName = "openai"
 
 const defaultBaseURL = "https://api.openai.com"
 
+// defaultCompletionsPath matches OpenAI's own API shape and, it turns
+// out, Grok's and Kimi's real OpenAI-compatible APIs too (both document
+// their own "base_url" as host+"/v1", meaning this exact suffix lands on
+// their real endpoint). It does NOT match every OpenAI-"compatible"
+// provider: Zhipu's GLM (z.ai) uses /api/paas/v4/chat/completions, no
+// /v1 segment at all — found by checking each provider's real documented
+// path before wiring anything, not discovered as a live 404.
+const defaultCompletionsPath = "/v1/chat/completions"
+
 type Adapter struct {
-	apiKey     string
-	baseURL    string
-	httpClient *http.Client
+	name            string
+	apiKey          string
+	baseURL         string
+	completionsPath string
+	httpClient      *http.Client
 }
 
 // New builds an OpenAI adapter. baseURL defaults to the real API if empty
 // — a param, not hardcoded, purely so tests can point it at an
-// httptest.Server without touching the real endpoint.
+// httptest.Server without touching the real endpoint. Thin wrapper around
+// NewNamedWithPath so the real OpenAI path's behavior is provably
+// unchanged by this package's later additions (Between-Phase provider
+// task) — same defaulting logic, same struct fields, just registered
+// under this package's own fixed ProviderName with the default path.
 func New(apiKey, baseURL string) *Adapter {
+	return NewNamedWithPath(ProviderName, apiKey, baseURL, "")
+}
+
+// NewNamed builds an adapter for an OpenAI-COMPATIBLE provider registered
+// under a DIFFERENT provider name (worker_ref's "<provider>:<model>"
+// prefix, and the Registry's own lookup key, adapter.go: "r.adapters[a.
+// Name()] = a") — e.g. Grok/Kimi, which speak a close approximation of
+// OpenAI's own streaming wire format AND share its exact
+// host+"/v1/chat/completions" path shape. Reusing this package's parsing
+// this way, instead of a new native adapter per provider, only works
+// because Name() became instance-specific here: three more
+// openai.New(...) instances would otherwise all report Name()=="openai"
+// and silently collide in the Registry's map (last one registered wins,
+// the rest unreachable, no error) — caught before it could happen, not
+// discovered live. For a provider whose real path shape differs (GLM),
+// use NewNamedWithPath instead.
+func NewNamed(name, apiKey, baseURL string) *Adapter {
+	return NewNamedWithPath(name, apiKey, baseURL, "")
+}
+
+// NewNamedWithPath is NewNamed with an explicit completions-path
+// override (empty string keeps the default /v1/chat/completions).
+// Needed because "OpenAI-compatible" describes the REQUEST/RESPONSE
+// shape, not the URL shape — GLM's z.ai endpoint is
+// https://api.z.ai/api/paas/v4/chat/completions, which baseURL +
+// defaultCompletionsPath cannot express no matter how baseURL is split.
+func NewNamedWithPath(name, apiKey, baseURL, completionsPath string) *Adapter {
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
+	if completionsPath == "" {
+		completionsPath = defaultCompletionsPath
+	}
 	return &Adapter{
-		apiKey:     apiKey,
-		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		name:            name,
+		apiKey:          apiKey,
+		baseURL:         baseURL,
+		completionsPath: completionsPath,
+		httpClient:      &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
-func (a *Adapter) Name() string { return ProviderName }
+func (a *Adapter) Name() string { return a.name }
 
 type wireReqMessage struct {
 	Role    string `json:"role"`
@@ -131,7 +178,7 @@ func (a *Adapter) Invoke(ctx context.Context, req adapters.InvokeRequest) (adapt
 		return nil, fmt.Errorf("openai adapter: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+a.completionsPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("openai adapter: build request: %w", err)
 	}

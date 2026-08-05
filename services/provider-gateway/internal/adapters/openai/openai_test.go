@@ -161,3 +161,76 @@ func TestInvokeReturnsUpstreamErrorOnNon200(t *testing.T) {
 		t.Errorf("err = %v, want *UpstreamError with status 401", err)
 	}
 }
+
+// Between-Phase provider task: New() must keep reporting "openai" exactly
+// as before — this is the regression check proving NewNamed's addition
+// didn't change the real OpenAI adapter's own identity in the Registry.
+func TestNewReportsTheFixedOpenAIProviderName(t *testing.T) {
+	a := New("test-key", "")
+	if got := a.Name(); got != "openai" {
+		t.Errorf("New(...).Name() = %q, want %q", got, "openai")
+	}
+}
+
+// NewNamed is what lets an OpenAI-compatible provider (Grok/GLM/Kimi)
+// register under its own name instead of colliding with "openai" (or
+// each other) in the Registry's Name()-keyed map.
+func TestNewNamedReportsItsOwnProviderName(t *testing.T) {
+	a := NewNamed("grok", "test-key", "")
+	if got := a.Name(); got != "grok" {
+		t.Errorf("NewNamed(\"grok\", ...).Name() = %q, want %q", got, "grok")
+	}
+}
+
+// Two NewNamed instances (or one NewNamed + one New) must report distinct
+// names — the exact collision this change exists to prevent.
+func TestDistinctNewNamedInstancesDoNotCollide(t *testing.T) {
+	openaiAdapter := New("k1", "")
+	grokAdapter := NewNamed("grok", "k2", "")
+	glmAdapter := NewNamed("glm", "k3", "")
+
+	names := map[string]bool{
+		openaiAdapter.Name(): true,
+		grokAdapter.Name():   true,
+		glmAdapter.Name():    true,
+	}
+	if len(names) != 3 {
+		t.Errorf("expected 3 distinct provider names, got %d: %v", len(names), names)
+	}
+}
+
+// GLM's real path (https://api.z.ai/api/paas/v4/chat/completions) has no
+// /v1 segment at all — NewNamedWithPath's whole reason to exist. Proves
+// the constructed request URL is exactly what a real z.ai account would
+// need, not baseURL+the OpenAI-shaped default suffix.
+func TestNewNamedWithPathBuildsTheOverriddenURL(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	a := NewNamedWithPath("glm", "test-key", srv.URL, "/api/paas/v4/chat/completions")
+	s, err := a.Invoke(context.Background(), adapters.InvokeRequest{Model: "glm-4.6"})
+	if err != nil {
+		t.Fatalf("Invoke() error = %v", err)
+	}
+	_, _ = s.Recv()
+
+	if gotPath != "/api/paas/v4/chat/completions" {
+		t.Errorf("request path = %q, want %q", gotPath, "/api/paas/v4/chat/completions")
+	}
+}
+
+// An empty path override must fall back to the default, exactly like an
+// empty baseURL falls back to defaultBaseURL — same "explicit empty
+// means use the default" convention this package already established.
+func TestNewNamedWithPathDefaultsWhenPathIsEmpty(t *testing.T) {
+	a := NewNamedWithPath("kimi", "test-key", "", "")
+	if a.completionsPath != defaultCompletionsPath {
+		t.Errorf("completionsPath = %q, want default %q", a.completionsPath, defaultCompletionsPath)
+	}
+}
