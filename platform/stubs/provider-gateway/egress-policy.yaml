@@ -24,7 +24,15 @@
 #     generativelanguage.googleapis.com (Gemini Developer API, chosen over
 #     Vertex AI specifically because it uses a plain API key, matching
 #     Phase-02.txt's K8s-Secret credential model instead of GCP
-#     IAM/service-account auth).
+#     IAM/service-account auth). Gemini's own adapter is deactivated as of
+#     the Between-Phase provider task (GOOGLE_API_KEY absent from the
+#     Secret) but this FQDN entry is left in place, harmlessly unused —
+#     matches "dormant, not removed" at every layer, not just main.go's.
+#   - Three more real provider hosts, added for the Between-Phase provider
+#     task, each verified reachable (positive control) before any real
+#     key existed and re-verified not to have widened the negative case:
+#     api.x.ai (Grok/xAI), api.z.ai (GLM/Zhipu, the international
+#     account), api.moonshot.ai (Kimi/Moonshot).
 #
 # Everything else is denied by the endpointSelector's own default-deny
 # egress posture once this policy applies — verified both directions in
@@ -91,6 +99,9 @@ spec:
         - matchName: "api.openai.com"
         - matchName: "api.anthropic.com"
         - matchName: "generativelanguage.googleapis.com"
+        - matchName: "api.x.ai"
+        - matchName: "api.z.ai"
+        - matchName: "api.moonshot.ai"
       toPorts:
         - ports:
             - port: "443"
