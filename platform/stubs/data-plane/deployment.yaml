@@ -44,7 +44,7 @@ spec:
             # this to the real static Anthropic ref for the one real
             # call, and only then.
             - name: STATIC_MODEL_REF
-              value: "glm:glm-4.5-flash"
+              value: "kimi:kimi-k2.5"
           ports:
             - containerPort: 8080
               name: http
