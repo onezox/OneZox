@@ -2,19 +2,34 @@
 # Creates (or replaces) the provider-gateway-credentials K8s Secret from
 # interactively-entered, hidden API key input — Phase-02 Step J3, run
 # BEFORE any real adapter call (Step J4-J6) and only after the egress
-# allow-list (Step J1-J2) is already verified in both directions.
+# allow-list (Step J1-J2) is already verified in both directions. Extended
+# for the Between-Phase provider task (Grok/GLM/Kimi) — now prompts for
+# six fields, not three.
 #
 # Never echoes a key: `read -s` suppresses terminal echo, and nothing
 # below ever `echo`/`printf`s a key value to stdout/stderr or passes one
 # as a literal command-line argument (which would land in shell history
 # and process listings) — every key reaches kubectl only via a
-# --from-file path, per the explicit ask to avoid --from-literal.
+# --from-file path, per the explicit ask to avoid --from-literal. This is
+# the ONLY sanctioned way real key material enters this Secret — never via
+# `kubectl get secret ... -o jsonpath`/`-o yaml` in an agent session, which
+# returns full base64-encoded (trivially decodable, not encrypted) values;
+# an agent verifying this Secret's state must ONLY ever ask for
+# `-o json | jq '.data | keys'`-style field NAMES, the same shape this
+# script's own verification step below already uses.
 #
 # Usage: scripts/create-provider-secret.sh
-# Leave any prompt blank to skip that provider — proceeds with whichever
-# keys are actually provided rather than requiring all three, same
+# Leave any prompt blank to skip/deactivate that provider — proceeds with
+# whichever keys are actually provided rather than requiring all six, same
 # "proceed with what's available, don't block" pattern used earlier in
-# Phase-02 for the real-provider verification steps.
+# Phase-02 for the real-provider verification steps. This blank-means-skip
+# behavior IS how a provider gets deactivated after already being active
+# (e.g. Gemini, Between-Phase provider task): `kubectl apply`'s own 3-way
+# merge (comparing this run's manifest against the Secret's own
+# last-applied-configuration) deletes a data key that was present in the
+# previous apply but is absent from this one — confirmed against this
+# exact Secret's own annotation before relying on it, not assumed from
+# general kubectl behavior.
 
 set -euo pipefail
 
@@ -69,7 +84,10 @@ prompt_for_key() {
 
 prompt_for_key "OPENAI_API_KEY" "OpenAI API key"
 prompt_for_key "ANTHROPIC_API_KEY" "Anthropic API key"
-prompt_for_key "GOOGLE_API_KEY" "Google (Gemini) API key"
+prompt_for_key "GOOGLE_API_KEY" "Google (Gemini) API key — leave blank to keep Gemini deactivated (Between-Phase provider task; main.go's registration for it is unaffected either way, only this key's presence decides it)"
+prompt_for_key "GROK_API_KEY" "Grok (xAI) API key"
+prompt_for_key "GLM_API_KEY" "GLM (Zhipu / z.ai international account) API key"
+prompt_for_key "KIMI_API_KEY" "Kimi (Moonshot) API key"
 
 if [[ "${#FROM_FILE_ARGS[@]}" -eq 0 ]]; then
   echo "No keys entered — nothing to do." >&2
