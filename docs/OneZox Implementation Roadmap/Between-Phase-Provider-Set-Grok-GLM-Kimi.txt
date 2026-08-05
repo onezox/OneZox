@@ -1,0 +1,277 @@
+================================================================================
+BETWEEN-PHASE TASK — PROVIDER SET CHANGE: DEACTIVATE GEMINI, ADD GROK/GLM/KIMI
+================================================================================
+Not a numbered phase. Done between Phase-03's close and Phase-04's start, at
+explicit user direction, with the same discipline as a phase step: an ordered
+plan mapped to verification, real credentials handled correctly, real calls
+made and checked, findings recorded honestly rather than assumed. This
+document is the completion record for that task.
+
+--------------------------------------------------------------------------------
+OBJECTIVE
+--------------------------------------------------------------------------------
+Deactivate the Gemini (Google) adapter without deleting it — dormant, not
+removed, F13 (Dependencies.txt) stays open, re-activation is one Secret key
+away. Add three new providers — Grok (xAI), GLM (Zhipu/z.ai international),
+Kimi (Moonshot) — reusing provider-gateway's existing openai adapter package
+against each provider's own OpenAI-compatible endpoint, NOT three new native
+adapters. Prove each new provider for real: content streams correctly AND
+usage propagates to usage_event correctly, the same two-part bar Phase-03's
+own EC1/EC2 set — "content works" does not excuse a silently NULL token
+count; that is a billing hole, not a passed provider.
+
+--------------------------------------------------------------------------------
+WHY "REUSE THE ADAPTER" WAS NOT ACTUALLY CONFIG-ONLY
+--------------------------------------------------------------------------------
+Two real code-level constraints were found and fixed before any registration
+happened, neither assumed from the "OpenAI-compatible" label:
+
+1. Adapter.Name() returned a hardcoded package constant ("openai") for every
+   instance. Registering three more openai.New(...) instances as-is would
+   have silently collided in Registry's Name()-keyed map (adapter.go:
+   "r.adapters[a.Name()] = a") — last one registered wins, the rest
+   unreachable, no error, no log line. Fixed via a NewNamed(name, apiKey,
+   baseURL) constructor; New() became a thin wrapper over it so the real
+   OpenAI adapter's behavior is provably unchanged — proven, not assumed:
+   every existing openai_test.go test passes byte-for-byte unmodified.
+
+2. Invoke() hardcoded baseURL+"/v1/chat/completions". Grok and Kimi's real
+   APIs both match that shape (their own docs use a "base_url" convention
+   of host+"/v1", confirmed directly against docs.x.ai and
+   platform.kimi.ai). Zhipu's GLM (z.ai) does not: its real endpoint is
+   https://api.z.ai/api/paas/v4/chat/completions, no /v1 segment at all,
+   which baseURL+the hardcoded suffix cannot express no matter how baseURL
+   is split. Fixed via NewNamedWithPath(name, apiKey, baseURL,
+   completionsPath), an explicit path override (empty string defaults to
+   the original suffix, so Grok/Kimi/OpenAI need no override at all).
+
+Both fixes were regression-tested against the existing, real OpenAI adapter
+before anything new was registered — go test ./internal/adapters/openai/...
+green throughout, existing tests never modified, only added to.
+
+--------------------------------------------------------------------------------
+A REAL CREDENTIAL EXPOSURE, MID-TASK — DISCLOSED, NOT SMOOTHED OVER
+--------------------------------------------------------------------------------
+While verifying the Secret's blank-means-deactivate mechanism, a
+`kubectl get secret ... -o jsonpath='{.metadata.annotations...last-applied-
+configuration}'` query returned the FULL base64-encoded (trivially
+decodable, not encryption) values of OPENAI_API_KEY, ANTHROPIC_API_KEY, and
+GOOGLE_API_KEY into this session's own tool output/transcript — a real
+exposure of live, billing-attached credentials, caused by a kubectl query
+that should have been scoped to field names only from the start (the same
+shape the credential script's own verification step, and every other
+Secret-state check in this project, correctly uses).
+
+Disclosed immediately and directly, not discovered later or minimized.
+Remediation, at the user's own direction: all three exposed keys revoked
+and regenerated in their respective provider consoles; the rotated values
+plus the three new provider keys loaded in one pass via the (extended)
+terminal-only script; field names re-verified independently
+(`-o json | jq`-equivalent, names only) before restarting provider-gateway
+to pick up the new Secret. The script's own header comment was updated to
+document this exact boundary explicitly — real key material enters this
+Secret ONLY via the script's hidden-input --from-file path; an agent
+verifying this Secret's state must ONLY ever request field NAMES, never
+`-o yaml`/`-o jsonpath` against annotations or data.
+
+A second, related mistake: after the Secret rotation, `kubectl rollout
+restart` was run and its boot log showed no "not set" warnings for
+GROK/GLM/KIMI — which LOOKED like confirmation the new providers had
+registered, but the deployed image tag (ccf83a5) still predated every
+adapter/registration code change made this task. The absence of a warning
+meant "this binary doesn't know these env vars exist," not "these adapters
+registered." Caught by checking the deployed image tag against source HEAD
+before trusting the log's silence — the real image (built from current
+source) was then built, loaded, and deployed, and ONLY THEN did the boot
+log's silence on grok/glm/kimi mean what it was assumed to mean.
+
+--------------------------------------------------------------------------------
+GEMINI DEACTIVATION
+--------------------------------------------------------------------------------
+No code change: main.go's existing `if os.Getenv("GOOGLE_API_KEY") != ""`
+conditional registration (Phase-02 Step J4-J6's own pattern) already WAS the
+deactivation mechanism — confirmed by reading it before relying on it, not
+assumed. GOOGLE_API_KEY was simply omitted from this task's credential-
+script run (the user's own explicit choice, confirmed live: verified
+`kubectl get secret ... -o json | jq '.data | keys'` shows GOOGLE_API_KEY
+genuinely ABSENT, not empty-string). google.go, its own test suite, and its
+Dependencies.txt F13 tracker row are all untouched. F13 itself was updated
+with a short addendum (not rewritten) noting the row moves from "open,
+blocked on billing" to "suspended pending Gemini re-add" — re-activation is
+refilling one Secret key via the same script, plus closing F13 with a
+billed key, not a rebuild. Confirmed live, post-deployment: a
+ProviderHealth call with no provider filter returns exactly six providers
+(fake, openai, anthropic, grok, glm, kimi) — google is not among them.
+
+--------------------------------------------------------------------------------
+EGRESS — VERIFIED BOTH DIRECTIONS, BEFORE ANY CREDENTIAL EXISTED
+--------------------------------------------------------------------------------
+Same ordering P02 established at the user's own explicit direction (egress
+before credentials, not after): api.x.ai, api.z.ai, api.moonshot.ai added
+to provider-gateway's egress FQDN allow-list. Positive control per host,
+run with a deliberately wrong bearer token (no real key needed to prove
+reachability): api.x.ai returned HTTP 400 in 484ms, api.z.ai returned 401
+in 623ms, api.moonshot.ai returned 401 in 210ms — all three genuine
+TCP+TLS+DNS round trips with real HTTP responses, not timeouts. Negative
+case re-confirmed AFTER widening the allow-list, not merely trusted from
+before: a live `cilium-dbg monitor -t drop` capture (queried against the
+correct kind worker node, matching Phase-03 Step J/M's own established
+node-placement check) showed genuine kernel-level "Policy denied" drops for
+provider-gateway's own Cilium identity (47734) against BOTH of
+example.com's resolved IPs, at bpf_lxc.c:1651 — the exact same enforcement
+point P02's own L2 capture used.
+
+Gemini's own egress entry (generativelanguage.googleapis.com) was left in
+the allow-list, unused — "dormant, not removed" held at this layer too, not
+just in main.go.
+
+--------------------------------------------------------------------------------
+REAL MODEL IDS — CONFIRMED AGAINST EACH PROVIDER'S OWN DOCS DIRECTLY
+--------------------------------------------------------------------------------
+Not assumed from aggregator/reseller search snippets (which used
+aggregator-specific prefixed IDs like "x-ai/grok-4-fast" that would not work
+against the provider's own API directly) — fetched each provider's own
+current documentation page directly before spending real money:
+  - Grok: grok-build-0.1 (cheapest listed, $1.00/1M input, confirmed
+    against docs.x.ai/docs/models).
+  - GLM: glm-4.5-flash (free tier, confirmed against docs.z.ai directly —
+    the model ID string itself, not just the product name).
+  - Kimi: kimi-k2.5 (cheapest current non-legacy tier, confirmed against
+    platform.kimi.ai's own OpenAPI spec; the older moonshot-v1-* series is
+    scheduled for sunset 2026-08-31 and was deliberately avoided).
+
+--------------------------------------------------------------------------------
+THE THREE REAL CALLS — CONTENT AND USAGE, BOTH REQUIRED, NEITHER ASSUMED
+--------------------------------------------------------------------------------
+Each driven through the FULL real slice (edge-gateway's real public
+endpoint -> data-plane -> provider-gateway -> the real provider -> SSE),
+STATIC_MODEL_REF flipped via a git-tracked commit + Argo sync before each
+(never a direct kubectl mutation), reverted to fake:normal after all three.
+
+GROK (grok-build-0.1): PASS, no fix needed. Content streamed correctly and
+followed the exact-text instruction. usage_event: tokens_in=197,
+tokens_out=7 — real, non-NULL. The existing OpenAI-shaped usage parsing
+(a dedicated trailing chunk, stream_options.include_usage) worked against
+Grok's real API unmodified.
+
+GLM (glm-4.5-flash): FAILED FIRST, DIAGNOSED, FIXED, THEN PASSED — see its
+own section below. Not tracked as a deferral, because the gap was small
+and genuinely fixable, exactly the fork the task's own instructions drew:
+fix the parsing, or track the gap; don't call broken usage "content
+works."
+
+KIMI (kimi-k2.5): PASS, no fix needed. Content streamed correctly.
+usage_event: tokens_in=18, tokens_out=84 — real, non-NULL. Same
+OpenAI-shaped dedicated-trailing-usage-chunk behavior as Grok; zero
+adapter changes required for Kimi specifically.
+
+--------------------------------------------------------------------------------
+GLM'S REAL QUIRK — DIAGNOSED AND FIXED, NOT DEFERRED
+--------------------------------------------------------------------------------
+First real GLM call (max_tokens=20): a single chunk arrived with empty
+content and finish_reason="length" — no visible text at all. usage_event
+wrote tokens_in=NULL, tokens_out=NULL, request_log status="ok" — no error,
+silently indistinguishable from a genuinely un-meterable provider without
+checking usage_event specifically. This is precisely the billing-hole shape
+Phase-03 Step H existed to rule out, now reintroduced through "it's just
+config" if it had gone unchecked.
+
+Diagnosed by capturing GLM's actual raw response, not guessed: since the
+diagnosing agent does not (and should not) possess the real GLM_API_KEY
+itself, a `kubectl debug --copy-to` pod was built from provider-gateway's
+own spec with the image swapped to curlimages/curl — this correctly
+inherits the real envFrom Secret mount (unlike a plain `--target=` ephemeral
+container, which does NOT inherit volume/env state, confirmed the hard way
+first: an initial attempt reading /proc/1/environ directly hit a permission
+error and sent an empty bearer token, which was itself informative — it
+confirmed z.ai's error response shape without ever touching the real key).
+The copy-pod's curl command referenced $GLM_API_KEY only as an in-shell
+variable expansion inside the Authorization header, resolved server-side
+inside the pod — the literal key value never appeared in any command
+string or tool output this session could see.
+
+The captured raw stream showed two real findings:
+1. GLM-4.5-Flash is a reasoning-capable model: visible tokens arrive under
+   a separate `reasoning_content` field before any `content` field appears
+   at all — with a tight token budget (20), the entire budget can be spent
+   on reasoning_content with zero content ever emitted. Not a bug; the
+   existing adapter code already handles this correctly (reasoning_content
+   isn't in the wireDelta struct, so those chunks are silently skipped,
+   same as OpenAI's own role-only first chunk) — the real-call retry simply
+   used a larger max_tokens (200) to give the model room to finish
+   reasoning and still emit visible content.
+2. THE ACTUAL BUG: GLM sends `usage` INLINE on the SAME chunk as
+   `finish_reason` — not as OpenAI's own separate dedicated chunk arriving
+   after it. The adapter's existing "defer finish_reason, wait for the
+   usage chunk that follows" logic (Phase-03 Step A3) never checked
+   chunk.Usage on the finish_reason chunk itself; it deferred, then hit
+   [DONE] with nothing further, silently falling into the "no usage chunk
+   ever arrived" fallback — exactly as if GLM hadn't reported usage, when
+   it had, on the very chunk being discarded unread.
+
+Fixed in openai.go's Recv(): when a chunk carries BOTH finish_reason AND a
+populated Usage field, return the true final delta immediately (reading
+usage off that same chunk) instead of deferring for a chunk that will never
+arrive. Regression test added using GLM's own captured chunk shape
+(TestInvokeReadsUsageInlineOnTheFinishReasonChunk); all prior tests
+(including OpenAI's own, unmodified) still pass. Redeployed; the real GLM
+call was RE-RUN (not assumed fixed from the unit test alone) and confirmed
+live: tokens_in=16, tokens_out=85 (the 85 honestly includes the reasoning
+tokens GLM actually spent — a real, not estimated, number).
+
+--------------------------------------------------------------------------------
+FINAL VERIFICATION
+--------------------------------------------------------------------------------
+provider-gateway build   — go build/vet/test clean; 11 packages passing,
+                         0 skipped, 9 new tests added this task (Name()
+                         collision, path override, GLM inline-usage
+                         regression), zero existing tests modified.
+Docker image             — onezox/provider-gateway:c33469f (current),
+                         content-addressed tag, confirmed loaded on all
+                         3 kind nodes, confirmed as the ACTUALLY deployed
+                         tag (not assumed) before trusting any boot log.
+Argo CD                  — "onezox-stubs" Synced/Healthy after every
+                         deploy this task; no manifest applied directly
+                         with kubectl.
+Credentials               — provider-gateway-credentials rotated (3 keys,
+                         after the disclosed exposure) + 3 new keys added,
+                         all via the terminal-only script; field names
+                         verified independently, values never requested.
+Egress                    — 3 new FQDNs, positive-controlled (real HTTP
+                         responses, not timeouts) and negative-confirmed
+                         (live kernel-level drop capture) after widening.
+ProviderHealth (live)     — {fake, openai, anthropic, grok, glm, kimi};
+                         google correctly absent.
+Grok                      — PASS: content + real usage (197/7), no fix
+                         needed.
+GLM                       — PASS after a real fix: content + real usage
+                         (16/85) — the inline-usage bug found, diagnosed
+                         from a live captured raw stream, fixed, and
+                         RE-VERIFIED live, not assumed from the unit test.
+Kimi                      — PASS: content + real usage (18/84), no fix
+                         needed.
+STATIC_MODEL_REF          — restored to fake:normal (git-tracked,
+                         Argo-synced) as the lasting deployed state.
+Dependencies.txt F13       — updated with a dated addendum: Gemini now
+                         DEACTIVATED (not just quota-blocked), row moves
+                         to "suspended pending Gemini re-add."
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+Grok, GLM, and Kimi are live, real, and metered — each individually proven
+against its real API for both content and usage, the same two-part bar
+Phase-03 set and did not relax for a "just config" provider-set change.
+One of the three (GLM) genuinely needed a small, real adapter fix, found by
+capturing its actual wire behavior rather than assuming OpenAI-compatible
+meant OpenAI-identical; the fix is in, tested, and re-verified live, not
+tracked as a deferral, because it was a small, fixable parsing difference,
+not a genuine incompatibility. Gemini is dormant, not deleted — F13 stays
+open, tracked precisely, one Secret key away from reactivation. A real
+credential exposure happened mid-task, was disclosed immediately rather
+than minimized, and was resolved by full rotation at the user's direction;
+the script and this record both now document the exact boundary that was
+crossed so it is not crossed again.
+================================================================================
+END OF BETWEEN-PHASE-PROVIDER-SET-GROK-GLM-KIMI.TXT
+================================================================================

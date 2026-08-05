@@ -114,6 +114,17 @@ F13  Gemini content-delta wire-format P02        cloud phase    P02 verified the
                                                                 a billed/paid-tier key is available (expected cloud
                                                                 phase); re-run EC1 for google specifically and update
                                                                 this row to closed.
+                                                                UPDATE (Between-Phase provider task, adding Grok/GLM/
+                                                                Kimi): Gemini's own adapter is now DEACTIVATED, not
+                                                                just quota-blocked — GOOGLE_API_KEY was removed from
+                                                                provider-gateway-credentials, so the google adapter
+                                                                no longer registers at all (main.go's own conditional-
+                                                                registration pattern, unchanged code). google.go, its
+                                                                unit tests, and this row are all otherwise untouched.
+                                                                This row moves from "open, blocked on billing" to
+                                                                "suspended pending Gemini re-add" — re-activation is
+                                                                one Secret key (via the same terminal-only script) plus
+                                                                closing this row with a billed key, not a rebuild.
 
 RULE FOR ALL FORWARD REFERENCES:
 - The interim measure must never leak into a public contract. Callers see the
