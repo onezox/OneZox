@@ -97,6 +97,21 @@ func TestListModels(t *testing.T) {
 	}
 }
 
+// TestRegisterModelManifestInvalidJSONRejected: spec_json is a plain
+// STRING column (data/migrations/0013, fixed from JSONB after a live
+// signature-verification bug), which no longer has the database's own
+// "this is valid JSON" enforcement — must be validated in application
+// code instead.
+func TestRegisterModelManifestInvalidJSONRejected(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService()
+
+	_, err := svc.RegisterModelManifest(ctx, "openai", `{not valid json`, "test-runner")
+	if err == nil {
+		t.Fatal("expected an error for invalid spec_json, got nil")
+	}
+}
+
 func TestGetModelManifestNotFound(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := testService()

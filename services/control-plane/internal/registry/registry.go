@@ -6,6 +6,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -82,6 +83,17 @@ func signedPayload(versionID, modelRef, specJSON string) []byte {
 // has no staged/canary "publish but don't activate" concept — that's
 // Phase-05's rollout UX, out of this phase's scope.
 func (s *Service) RegisterModelManifest(ctx context.Context, modelRef, specJSON, createdBy string) (string, error) {
+	// spec_json is a plain STRING column (data/migrations/0013), not JSONB
+	// — CockroachDB's JSONB type reformats input text on storage (e.g.
+	// adds a space after ":"), which would silently break byte-for-byte
+	// signature verification on read. STRING preserves exactly what's
+	// signed, but that means the database no longer enforces "this is
+	// valid JSON" the way JSONB did — validated here instead, at the
+	// boundary, to make up for it.
+	if !json.Valid([]byte(specJSON)) {
+		return "", fmt.Errorf("spec_json is not valid JSON")
+	}
+
 	versionID := uuid.NewString()
 
 	signature, err := s.signer.Sign(ctx, SigningKeyName, signedPayload(versionID, modelRef, specJSON))
