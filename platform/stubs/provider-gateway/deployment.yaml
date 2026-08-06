@@ -35,11 +35,14 @@
 # used during that test has been reverted below — it was a test-only
 # convenience value with no real-world basis, not a tuned setting.
 #
-# Phase-04 Step M (F9 cutover, in progress): provider-gateway-credentials
-# (envFrom above) is UNCHANGED here on purpose — this is the dual-path
-# deploy, Vault-first with this same Secret as fallback. Removing envFrom
-# is Step O, only after Step N positively confirms every pod is genuinely
-# reading from Vault, not silently riding the fallback.
+# Phase-04 F9 cutover: provider-gateway-credentials (envFrom above) is
+# still mounted here even though Step O made the code Vault-only (no
+# fallback reads it anymore) — deliberately kept through Step P's
+# adversarial poisoned-Secret test. Proving corrupted Secret VALUES
+# sitting right there in the pod's own environment have zero effect is a
+# much stronger proof than proving an already-unmounted Secret is
+# irrelevant. envFrom and the Secret itself both go away together, only
+# after that test succeeds.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -59,7 +62,7 @@ spec:
     spec:
       containers:
         - name: provider-gateway
-          image: onezox/provider-gateway:097b4b1
+          image: onezox/provider-gateway:58a401a
           imagePullPolicy: IfNotPresent
           envFrom:
             - secretRef:
