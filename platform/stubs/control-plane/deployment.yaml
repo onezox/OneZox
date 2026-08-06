@@ -1,8 +1,7 @@
-# Phase-04 Step D — control-plane skeleton. Registers ControlService
-# (registry/rollout/quota/policy/pricing) but every RPC is still
-# Unimplemented (see services/control-plane/main.go's own header comment)
-# — registry/'s real handlers land in Step E, IssueProviderToken in Step
-# J, both their own separate commits and deploys.
+# Phase-04 Step D built control-plane's skeleton (every RPC Unimplemented).
+# Step E wires real RegisterModelManifest/GetModelManifest/ListModels
+# handlers (registry/, Vault-Transit-signed) — IssueProviderToken stays
+# Unimplemented until Step J, its own separate commit and deploy.
 #
 # 2 replicas, not provider-gateway's 3: this is Phase-04.txt's own "off
 # the hot path" service, a plain config/registry gRPC+HTTP server with no
@@ -11,6 +10,22 @@
 # Image tag is the git commit short-SHA this Deployment was built at
 # (content-addressed, the same convention established since Phase-02) —
 # not a static phase-name tag.
+#
+# Step E: dedicated ServiceAccount, not the implicit "default" SA every
+# other service in this repo currently runs under (confirmed live — no
+# existing platform/stubs/*/deployment.yaml sets serviceAccountName).
+# Vault's Kubernetes auth method's entire security property is "the
+# cluster vouches for this pod's identity" — binding a Vault role to the
+# shared "default" SA would mean any pod in this namespace without its own
+# override could authenticate as control-plane's Vault role, which
+# defeats the point. scripts/vault-setup-control-plane.sh's own Vault role
+# binds specifically to this ServiceAccount + namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-plane
+  namespace: default
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,9 +43,10 @@ spec:
       labels:
         app: control-plane
     spec:
+      serviceAccountName: control-plane
       containers:
         - name: control-plane
-          image: onezox/control-plane:b4e57e6
+          image: onezox/control-plane:6861241
           imagePullPolicy: IfNotPresent
           env:
             - name: COCKROACH_HOST
@@ -39,6 +55,15 @@ spec:
               value: "26257"
             - name: COCKROACH_USER
               value: control_plane
+            - name: VAULT_ADDR
+              # vault-active, not the plain "vault" Service: routes
+              # specifically to the current Raft leader rather than
+              # load-balancing across all 3 pods (2 of which are standbys
+              # that transparently forward anyway, but pinning to the
+              # leader keeps this deterministic).
+              value: http://vault-active.default.svc.cluster.local:8200
+            - name: VAULT_K8S_ROLE
+              value: control-plane
           ports:
             - containerPort: 8080
               name: http
