@@ -34,6 +34,12 @@
 # result in Phase-02-Progress.txt. The QUOTA_LIMIT_PER_MINUTE=30 override
 # used during that test has been reverted below — it was a test-only
 # convenience value with no real-world basis, not a tuned setting.
+#
+# Phase-04 Step M (F9 cutover, in progress): provider-gateway-credentials
+# (envFrom above) is UNCHANGED here on purpose — this is the dual-path
+# deploy, Vault-first with this same Secret as fallback. Removing envFrom
+# is Step O, only after Step N positively confirms every pod is genuinely
+# reading from Vault, not silently riding the fallback.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -53,7 +59,7 @@ spec:
     spec:
       containers:
         - name: provider-gateway
-          image: onezox/provider-gateway:c33469f
+          image: onezox/provider-gateway:2d31917
           imagePullPolicy: IfNotPresent
           envFrom:
             - secretRef:
