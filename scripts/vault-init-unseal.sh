@@ -70,8 +70,23 @@ echo >&2
 echo "=== Step 4: join vault-1 and vault-2 to the Raft cluster, then unseal ===" >&2
 for pod in vault-1 vault-2; do
   echo "Joining ${pod}..." >&2
-  vexec "$pod" vault operator raft join "http://vault-0.vault-internal:8200" >/dev/null || \
-    echo "(${pod} may already be joined — continuing to unseal)" >&2
+  # Deliberately NOT swallowing a failed join with '|| echo ...continuing':
+  # an earlier version of this script did exactly that, which silently
+  # walked straight into the unseal loop below on a node that was never
+  # actually joined (unseal then fails with "not initialized", but by then
+  # the real join error is already gone). If join fails, check first
+  # whether it's already joined (a real "already joined" error is fine to
+  # skip past); anything else must stop the script, not be papered over.
+  join_output="$(vexec "$pod" vault operator raft join "http://vault-0.vault-internal:8200" 2>&1)" || {
+    if echo "$join_output" | grep -qi "already"; then
+      echo "${pod}: $join_output" >&2
+      echo "(already joined — continuing to unseal)" >&2
+    else
+      echo "${pod}: raft join failed:" >&2
+      echo "$join_output" >&2
+      exit 1
+    fi
+  }
 
   echo "Enter 3 of the 5 unseal keys for ${pod} (same keys as vault-0)." >&2
   for i in 1 2 3; do
