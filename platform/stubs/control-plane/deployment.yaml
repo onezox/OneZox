@@ -1,7 +1,6 @@
-# Phase-04 Step D built control-plane's skeleton (every RPC Unimplemented).
-# Step E wires real RegisterModelManifest/GetModelManifest/ListModels
-# handlers (registry/, Vault-Transit-signed) — IssueProviderToken stays
-# Unimplemented until Step J, its own separate commit and deploy.
+# Phase-04 Steps D-J: skeleton (D) -> registry RPCs (E) ->
+# IssueProviderToken (J, Vault-backed, short-lived scoped tokens). All
+# four ControlService RPCs now have real handlers.
 #
 # 2 replicas, not provider-gateway's 3: this is Phase-04.txt's own "off
 # the hot path" service, a plain config/registry gRPC+HTTP server with no
@@ -46,7 +45,7 @@ spec:
       serviceAccountName: control-plane
       containers:
         - name: control-plane
-          image: onezox/control-plane:457e4c1
+          image: onezox/control-plane:f1bee59
           imagePullPolicy: IfNotPresent
           env:
             - name: COCKROACH_HOST
