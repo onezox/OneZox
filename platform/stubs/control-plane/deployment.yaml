@@ -45,7 +45,7 @@ spec:
       serviceAccountName: control-plane
       containers:
         - name: control-plane
-          image: onezox/control-plane:f1bee59
+          image: onezox/control-plane:68bda0b
           imagePullPolicy: IfNotPresent
           env:
             - name: COCKROACH_HOST
@@ -63,6 +63,8 @@ spec:
               value: http://vault-active.default.svc.cluster.local:8200
             - name: VAULT_K8S_ROLE
               value: control-plane
+            - name: ETCD_ENDPOINTS
+              value: http://etcd.default.svc.cluster.local:2379
           ports:
             - containerPort: 8080
               name: http
