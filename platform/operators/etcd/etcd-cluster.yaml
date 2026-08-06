@@ -1,0 +1,173 @@
+# Phase-04 Step A — etcd (Part I): the manifest distribution store.
+#
+# Hand-written, not a Helm chart — bitnami/etcd hit the exact same paywall
+# gap Redis Cluster's own manifest already documented for itself
+# (docker.io/bitnami/etcd has zero public tags as of this writing; Bitnami
+# moved images behind their paid "Secure Images" catalog). Confirmed live,
+# not assumed: `helm install` succeeded, but every pod sat in
+# ImagePullBackOff — "not found" on docker.io/bitnami/etcd:3.6.4-debian-12-r3.
+# Rather than depend on an unmaintained/paywalled third-party chart, this
+# uses the plain official etcd image directly with the standard StatefulSet
+# + headless-Service static-bootstrap pattern etcd's own documentation
+# recommends — the same reasoning and shape Redis Cluster's own manifest
+# already used here for an identical Bitnami-paywall reason.
+#
+# Insecure mode (no peer/client TLS, no auth) — protection is Cilium mTLS
+# CiliumNetworkPolicy restricting which Cilium identities can reach etcd's
+# ports at all (control-plane only; this etcd is control-plane's own
+# private store), matching CockroachDB's own "insecure mode, single cell"
+# local-dev posture, not an oversight.
+#
+# PersistentVolumeClaims (not emptyDir like Redis Cluster): unlike Redis's
+# "strictly ephemeral, no persistent schema" role (Part I), etcd here holds
+# the distributed manifest/active-pointer state consumers watch — losing
+# it on every pod reschedule would mean a full re-publish from CockroachDB
+# (the actual source of truth) just to recover, which is avoidable.
+#
+# replicaCount 3: genuine quorum/cluster semantics (Phase-04.txt's own
+# "etcd cluster" wording), matching CockroachDB's own 3-node local cluster
+# framing.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-headless
+  namespace: default
+  labels:
+    app: etcd
+spec:
+  clusterIP: None
+  # Confirmed live, not assumed: without this, the headless Service's
+  # endpoint list stayed EMPTY (checked directly — `kubectl get endpoints
+  # etcd-headless` showed zero) because a Service only publishes a pod's
+  # address once that pod is "ready" by default, and no etcd pod can ever
+  # BECOME ready without first resolving its peers' DNS names through
+  # this exact Service — the peer-discovery chicken-and-egg this setting
+  # exists to break for StatefulSet governing services.
+  publishNotReadyAddresses: true
+  selector:
+    app: etcd
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+    - name: peer
+      port: 2380
+      targetPort: 2380
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: default
+  labels:
+    app: etcd
+spec:
+  selector:
+    app: etcd
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: etcd
+  namespace: default
+spec:
+  serviceName: etcd-headless
+  replicas: 3
+  # Parallel, not the K8s default OrderedReady: confirmed live, not
+  # assumed — OrderedReady deadlocks etcd's own static-bootstrap model.
+  # etcd-0 waits to become Ready (readiness = healthy raft member) before
+  # the StatefulSet will even create etcd-1/etcd-2, but etcd-0 can never
+  # reach quorum, and therefore never becomes Ready, without peers that
+  # don't exist yet — unlike Redis Cluster (each node passes its own
+  # readiness probe standalone; a separate one-shot Job joins them into a
+  # cluster afterward), etcd's --initial-cluster static bootstrap needs
+  # every named member reachable from the start, so all 3 pods must be
+  # scheduled simultaneously, not one-at-a-time.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      labels:
+        app: etcd
+    spec:
+      containers:
+        - name: etcd
+          image: gcr.io/etcd-development/etcd:v3.5.17
+          # No command/args override, deliberately: this image is minimal
+          # (confirmed live — no /bin/sh at all, so a shell-wrapper command
+          # to interpolate the pod's own name into each flag, the usual
+          # StatefulSet etcd pattern, doesn't work here). Instead, this
+          # relies on two native mechanisms together, neither needing a
+          # shell: etcd's own binary reads ETCD_* environment variables
+          # directly (one-to-one with its --flag names) as its default
+          # ENTRYPOINT already expects; Kubernetes' own $(VAR_NAME)
+          # substitution (resolved by the kubelet when building the
+          # container's env, entirely outside the container) fills each
+          # pod-specific URL from POD_NAME, which the Downward API sets
+          # from the pod's own metadata.name — no runtime shell involved
+          # anywhere in this chain.
+          env:
+            - name: ETCDCTL_API
+              value: "3"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ETCD_NAME
+              value: "$(POD_NAME)"
+            - name: ETCD_DATA_DIR
+              value: "/data"
+            - name: ETCD_LISTEN_CLIENT_URLS
+              value: "http://0.0.0.0:2379"
+            - name: ETCD_ADVERTISE_CLIENT_URLS
+              value: "http://$(POD_NAME).etcd-headless.default.svc.cluster.local:2379"
+            - name: ETCD_LISTEN_PEER_URLS
+              value: "http://0.0.0.0:2380"
+            - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
+              value: "http://$(POD_NAME).etcd-headless.default.svc.cluster.local:2380"
+            - name: ETCD_INITIAL_CLUSTER
+              value: "etcd-0=http://etcd-0.etcd-headless.default.svc.cluster.local:2380,etcd-1=http://etcd-1.etcd-headless.default.svc.cluster.local:2380,etcd-2=http://etcd-2.etcd-headless.default.svc.cluster.local:2380"
+            - name: ETCD_INITIAL_CLUSTER_STATE
+              value: "new"
+            - name: ETCD_INITIAL_CLUSTER_TOKEN
+              value: "onezox-etcd-cluster"
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
