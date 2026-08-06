@@ -556,6 +556,13 @@ func main() {
 	defer func() { _ = controlPlaneConn.Close() }()
 	tokenFetcher := credentials.NewGRPCFetcher(controlv1.NewControlServiceClient(controlPlaneConn))
 
+	// resolverWithWait carries the interval the initial synchronous
+	// Refresh already returned, so the background Run loop (below) waits
+	// it out instead of refreshing again immediately as its first action.
+	type resolverWithWait struct {
+		r    *credentials.Resolver
+		wait time.Duration
+	}
 	// setupCredential resolves providerName's credential once, synchronously,
 	// before this provider's adapter is ever registered — "proceed with
 	// what's available" (Step J3's own scaffolding discipline): a
@@ -564,27 +571,27 @@ func main() {
 	// resolution path now. Only credential_source is ever logged, never
 	// the key value itself (Phase-02.txt SECURITY IMPLEMENTATION: "never
 	// logged") — Resolver.Refresh already enforces this.
-	var resolvers []*credentials.Resolver
+	var resolvers []resolverWithWait
 	setupCredential := func(providerName, envVarName string, adapter credentials.KeySetter) *credentials.Resolver {
 		r := credentials.NewResolver(providerName, envVarName, tokenFetcher, adapter, log)
-		if _, err := r.Refresh(ctx); err != nil {
+		wait, err := r.Refresh(ctx)
+		if err != nil {
 			log.Warn("provider credential unavailable, adapter not registered",
 				"provider", providerName, "error", err)
 			return nil
 		}
+		resolvers = append(resolvers, resolverWithWait{r: r, wait: wait})
 		return r
 	}
 
 	openaiAdapter := openai.New("", "")
 	if r := setupCredential("openai", "OPENAI_API_KEY", openaiAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, openaiAdapter)
-		resolvers = append(resolvers, r)
 	}
 
 	anthropicAdapter := anthropic.New("", "")
 	if r := setupCredential("anthropic", "ANTHROPIC_API_KEY", anthropicAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, anthropicAdapter)
-		resolvers = append(resolvers, r)
 	}
 
 	// Google/Gemini: UNCHANGED, no dual-path — F13 stays deactivated
@@ -605,19 +612,16 @@ func main() {
 	grokAdapter := openai.NewNamed("grok", "", "https://api.x.ai")
 	if r := setupCredential("grok", "GROK_API_KEY", grokAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, grokAdapter)
-		resolvers = append(resolvers, r)
 	}
 
 	glmAdapter := openai.NewNamedWithPath("glm", "", "https://api.z.ai", "/api/paas/v4/chat/completions")
 	if r := setupCredential("glm", "GLM_API_KEY", glmAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, glmAdapter)
-		resolvers = append(resolvers, r)
 	}
 
 	kimiAdapter := openai.NewNamed("kimi", "", "https://api.moonshot.ai")
 	if r := setupCredential("kimi", "KIMI_API_KEY", kimiAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, kimiAdapter)
-		resolvers = append(resolvers, r)
 	}
 
 	// Background periodic refresh, well before each resolver's Vault TTL
@@ -627,8 +631,8 @@ func main() {
 	// anything: a credential fetched once at startup and never revisited
 	// would make both checks blind to what's actually happening on a live
 	// pod.
-	for _, r := range resolvers {
-		go r.Run(ctx)
+	for _, rw := range resolvers {
+		go rw.r.Run(ctx, rw.wait)
 	}
 
 	registry := adapters.NewRegistry(registeredAdapters...)
@@ -698,9 +702,9 @@ func main() {
 		// still exists), but becomes a real, meaningful gate once Step P
 		// deletes the Secret: at that point a Vault outage on a later
 		// refresh genuinely could leave a resolver with nothing.
-		for _, cred := range resolvers {
-			if cred.CurrentSource() == "" {
-				log.Error("readiness check failed: provider credential not resolved", "provider", cred.Provider())
+		for _, rw := range resolvers {
+			if rw.r.CurrentSource() == "" {
+				log.Error("readiness check failed: provider credential not resolved", "provider", rw.r.Provider())
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = w.Write([]byte("not ready"))
 				return

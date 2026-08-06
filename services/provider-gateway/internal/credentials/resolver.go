@@ -147,18 +147,25 @@ func (r *Resolver) Refresh(ctx context.Context) (time.Duration, error) {
 
 // Run refreshes in a loop until ctx is done — call as a background
 // goroutine after the initial synchronous Refresh (in main) has already
-// succeeded once.
-func (r *Resolver) Run(ctx context.Context) {
+// succeeded once. initialWait is the interval that first Refresh call
+// already returned — Run's own loop waits it out BEFORE refreshing again,
+// rather than immediately re-refreshing as its first action (which would
+// otherwise double the Vault calls made at pod startup: one from the
+// caller's synchronous Refresh, a second almost instantly from here).
+func (r *Resolver) Run(ctx context.Context, initialWait time.Duration) {
+	wait := initialWait
 	for {
-		wait, err := r.Refresh(ctx)
-		if err != nil {
-			r.log.Error("provider credential refresh failed, no usable credential", "provider", r.provider, "error", err)
-			wait = fallbackRetryInterval
-		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(wait):
+		}
+
+		var err error
+		wait, err = r.Refresh(ctx)
+		if err != nil {
+			r.log.Error("provider credential refresh failed, no usable credential", "provider", r.provider, "error", err)
+			wait = fallbackRetryInterval
 		}
 	}
 }
