@@ -1,0 +1,71 @@
+# Phase-04 Step D — control-plane skeleton. Registers ControlService
+# (registry/rollout/quota/policy/pricing) but every RPC is still
+# Unimplemented (see services/control-plane/main.go's own header comment)
+# — registry/'s real handlers land in Step E, IssueProviderToken in Step
+# J, both their own separate commits and deploys.
+#
+# 2 replicas, not provider-gateway's 3: this is Phase-04.txt's own "off
+# the hot path" service, a plain config/registry gRPC+HTTP server with no
+# streaming/backpressure/coalescing to size for.
+#
+# Image tag is the git commit short-SHA this Deployment was built at
+# (content-addressed, the same convention established since Phase-02) —
+# not a static phase-name tag.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: default
+  labels:
+    app: control-plane
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: control-plane
+  template:
+    metadata:
+      labels:
+        app: control-plane
+    spec:
+      containers:
+        - name: control-plane
+          image: onezox/control-plane:b4e57e6
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: COCKROACH_HOST
+              value: onezox-crdb-public.default.svc.cluster.local
+            - name: COCKROACH_PORT
+              value: "26257"
+            - name: COCKROACH_USER
+              value: control_plane
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50051
+              name: grpc
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 192Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: default
+  labels:
+    app: control-plane
+spec:
+  selector:
+    app: control-plane
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
+    - { name: grpc, port: 50051, targetPort: 50051 }

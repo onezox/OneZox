@@ -9,7 +9,11 @@ go 1.26.5
 // stand-in for a real provider, test-only infrastructure (not one of
 // Phase-02.txt's own components) that every EC2 resilience test stands
 // on — a real provider can't be made to fail or exhaust quota on demand.
+// services/control-plane joined at Phase-04 Step D: control plane
+// skeleton (registry, rollout scaffold-only, quota scaffold-only, policy,
+// pricing modules; gRPC ControlService + health/ready HTTP).
 // Still to come (Part Q):
 //   - services/chat-service (later: single owner of chat history)
 use ./services/provider-gateway
 use ./services/provider-fake
+use ./services/control-plane

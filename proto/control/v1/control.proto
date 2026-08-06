@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package control.v1;
+
+option go_package = "github.com/onezox/OneZox/services/control-plane/internal/pb/control/v1;controlv1";
+
+// Phase-04's control-plane contract (Architecture Part B, Part G.2).
+// Four RPCs, matching Phase-04.txt's own APIS CREATED section exactly:
+// RegisterModelManifest/GetModelManifest/ListModels are registry/-owned
+// (Step E); IssueProviderToken is Vault-backed and gateway-only (Step J).
+// This proto is defined in full now (Step D, control-plane's skeleton) so
+// the gRPC service can register — each RPC's actual handler logic lands in
+// its own later, separately-committed step; until then the server embeds
+// UnimplementedControlServiceServer and every method here returns
+// codes.Unimplemented, the same "defined here, wired when consumed"
+// pattern provider-gateway's own ProviderHealth used in Phase-02.
+
+service ControlService {
+  rpc RegisterModelManifest(RegisterModelManifestRequest) returns (RegisterModelManifestResponse);
+  rpc GetModelManifest(GetModelManifestRequest) returns (GetModelManifestResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc IssueProviderToken(IssueProviderTokenRequest) returns (IssueProviderTokenResponse);
+}
+
+// spec_json carries the manifest body as a JSON-encoded string (mirrors
+// model_manifest.spec_json's JSONB column, 0008_create_model_manifest.sql)
+// rather than a typed message — Phase-04.txt doesn't pin down the model
+// spec's own shape, and a typed proto message would force a guess at that
+// shape this phase isn't chartered to make.
+message RegisterModelManifestRequest {
+  string model_ref = 1;
+  string spec_json = 2;
+  string created_by = 3;
+}
+
+message RegisterModelManifestResponse {
+  string version_id = 1;
+}
+
+// version_id empty means "the currently active version" (resolved via
+// model_active, 0009_create_model_active.sql) rather than a specific one.
+message GetModelManifestRequest {
+  string model_ref = 1;
+  string version_id = 2;
+}
+
+message GetModelManifestResponse {
+  string version_id = 1;
+  string model_ref = 2;
+  string spec_json = 3;
+  string signature = 4;
+  string created_by = 5;
+  string created_at = 6;
+  string status = 7;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  message Entry {
+    string model_ref = 1;
+    string active_version_id = 2;
+  }
+  repeated Entry models = 1;
+}
+
+// provider/scope select which Vault-issued credential is returned — the
+// exact scoping shape (per-provider policy path, TTL) is Step J's own
+// design, not fixed here beyond the request/response envelope.
+message IssueProviderTokenRequest {
+  string provider = 1;
+  string scope = 2;
+}
+
+message IssueProviderTokenResponse {
+  string token = 1;
+  int64 ttl_seconds = 2;
+}

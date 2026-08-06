@@ -174,3 +174,41 @@ spec:
               protocol: TCP
       authentication:
         mode: "required"
+---
+# Phase-04 Step D: control-plane's own mTLS ingress policy, added at the
+# same step its Deployment first ships — same mesh-identity-safe sequencing
+# every prior service used (edge-gateway Step F2, provider-gateway Step
+# K3, data-plane Step J): no window where a real service is live without
+# mesh identity. Only host (kubelet probes + kubectl port-forward) and
+# prometheus (metrics scrape) rules exist yet — no peer-to-peer rule,
+# because no consuming service actually calls control-plane's gRPC API
+# yet. provider-gateway's own call to IssueProviderToken (Step K) and
+# edge-gateway's own call to ListModels (Step S) each add their own
+# fromEndpoints rule here when THAT step reaches live traffic, matching
+# how every other -mtls block in this file grew its peer rules
+# incrementally rather than all at once.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: control-plane-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: control-plane
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+            - port: "50051"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
