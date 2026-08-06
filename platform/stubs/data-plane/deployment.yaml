@@ -53,7 +53,7 @@ spec:
       serviceAccountName: data-plane
       containers:
         - name: data-plane
-          image: onezox/data-plane:50d8c7b
+          image: onezox/data-plane:94c6ab1
           imagePullPolicy: IfNotPresent
           env:
             # DEFAULT_MODEL_REF: what request.model falls back to when a
