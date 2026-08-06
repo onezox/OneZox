@@ -1,10 +1,8 @@
-// control-plane — Phase-04 Step D: service skeleton only. Registers the
-// full ControlService gRPC surface (control.proto) with
-// UnimplementedControlServiceServer embedded, so every RPC returns
-// codes.Unimplemented for now — RegisterModelManifest/GetModelManifest/
+// control-plane — Phase-04. Registers the full ControlService gRPC
+// surface (control.proto): RegisterModelManifest/GetModelManifest/
 // ListModels (registry/, Step E) and IssueProviderToken (Vault-backed,
-// Step J) each get their own real handler in a later, separately-
-// committed step, the same "defined here, wired when consumed" pattern
+// Step J) — all four RPCs have real handlers as of Step J, added in
+// separate commits, the same "defined here, wired when consumed" pattern
 // provider-gateway's own ProviderHealth used in Phase-02.
 //
 // Off the hot path (Phase-04.txt's own INFRASTRUCTURE REQUIRED section:
@@ -33,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -42,6 +41,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/onezox/OneZox/services/control-plane/internal/pb/control/v1"
+	"github.com/onezox/OneZox/services/control-plane/internal/providertoken"
 	"github.com/onezox/OneZox/services/control-plane/internal/registry"
 	"github.com/onezox/OneZox/services/control-plane/internal/vaultclient"
 )
@@ -55,15 +55,28 @@ func envOr(key, def string) string {
 	return def
 }
 
-// server implements pb.ControlServiceServer. Embedding
-// UnimplementedControlServiceServer means IssueProviderToken (Step J)
-// still returns codes.Unimplemented — RegisterModelManifest/
-// GetModelManifest/ListModels are overridden below (Step E).
+func envInt64Or(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// server implements pb.ControlServiceServer. All four RPCs are now
+// overridden — UnimplementedControlServiceServer stays embedded as a
+// forward-compat guard against a future proto RPC this struct hasn't
+// been updated for yet, not because anything here is still unimplemented.
 type server struct {
 	pb.UnimplementedControlServiceServer
-	db       *sql.DB
-	registry *registry.Service
-	log      *slog.Logger
+	db            *sql.DB
+	registry      *registry.Service
+	providerToken *providertoken.Service
+	log           *slog.Logger
 }
 
 func (s *server) RegisterModelManifest(ctx context.Context, req *pb.RegisterModelManifestRequest) (*pb.RegisterModelManifestResponse, error) {
@@ -117,6 +130,31 @@ func (s *server) ListModels(ctx context.Context, req *pb.ListModelsRequest) (*pb
 	return &pb.ListModelsResponse{Models: pbEntries}, nil
 }
 
+// IssueProviderToken — Step J. "(Vault-backed; gateway only)" per
+// Phase-04.txt: enforced at the network layer (Step K's own
+// CiliumNetworkPolicy ingress rule, added once provider-gateway is the
+// only service granted a peer rule on control-plane's gRPC port for this
+// purpose), not by an in-RPC caller-identity check — this repo has no
+// established per-RPC-method (L7) authorization precedent to build on,
+// only the L3/L4-plus-mTLS-required shape every other -mtls policy here
+// already uses.
+func (s *server) IssueProviderToken(ctx context.Context, req *pb.IssueProviderTokenRequest) (*pb.IssueProviderTokenResponse, error) {
+	if req.GetProvider() == "" {
+		return nil, status.Error(codes.InvalidArgument, "provider is required")
+	}
+	token, ttlSeconds, err := s.providerToken.IssueToken(ctx, req.GetProvider(), req.GetScope())
+	if err != nil {
+		// Deliberately no "error" field with err's own text here (unlike
+		// every other handler in this file) — the underlying error from
+		// vaultclient.ReadProviderSecret could, in principle, echo back
+		// path/field details close enough to secret material that this
+		// is treated as a boundary, not just a style choice.
+		s.log.Error("IssueProviderToken failed", "provider", req.GetProvider())
+		return nil, status.Error(codes.Internal, "failed to issue provider token")
+	}
+	return &pb.IssueProviderTokenResponse{Token: token, TtlSeconds: ttlSeconds}, nil
+}
+
 func main() {
 	handler := slog.NewJSONHandler(os.Stdout, nil)
 	log := slog.New(handler).With("service", serviceName)
@@ -143,8 +181,17 @@ func main() {
 
 	vaultAddr := envOr("VAULT_ADDR", "http://vault-active.default.svc.cluster.local:8200")
 	vaultK8sRole := envOr("VAULT_K8S_ROLE", "control-plane")
-	signer := vaultclient.New(vaultAddr, vaultK8sRole)
-	registrySvc := registry.NewService(registry.NewCockroachStore(db), signer, log)
+	vaultClient := vaultclient.New(vaultAddr, vaultK8sRole)
+	registrySvc := registry.NewService(registry.NewCockroachStore(db), vaultClient, log)
+
+	// Genuinely short — separate from and much shorter than Vault's own
+	// K8s-auth login TTL (15m, scripts/vault-setup-control-plane.sh).
+	// Bounds how long provider-gateway may hold a fetched key in memory
+	// before re-fetching (Step M), not a literal per-call Vault lease —
+	// see providertoken's own package doc for why that distinction is
+	// real for static third-party API keys.
+	providerTokenTTL := time.Duration(envInt64Or("PROVIDER_TOKEN_TTL_SECONDS", 300)) * time.Second
+	providerTokenSvc := providertoken.NewService(vaultClient, providerTokenTTL, log)
 
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
@@ -153,7 +200,12 @@ func main() {
 		os.Exit(1)
 	}
 	grpcServer := grpc.NewServer()
-	pb.RegisterControlServiceServer(grpcServer, &server{db: db, registry: registrySvc, log: log})
+	pb.RegisterControlServiceServer(grpcServer, &server{
+		db:            db,
+		registry:      registrySvc,
+		providerToken: providerTokenSvc,
+		log:           log,
+	})
 
 	go func() {
 		log.Info("control-plane gRPC listening", "port", grpcPort)

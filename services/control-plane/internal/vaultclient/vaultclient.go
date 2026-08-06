@@ -254,3 +254,58 @@ func (c *Client) Verify(ctx context.Context, keyName string, input []byte, signa
 	}
 	return verifyResp.Data.Valid, nil
 }
+
+type kvReadResponse struct {
+	Data struct {
+		Data map[string]any `json:"data"`
+	} `json:"data"`
+	Errors []string `json:"errors"`
+}
+
+// ReadProviderSecret reads secret/provider/{provider} (KV v2 — Step I's
+// own scripts/vault-load-provider-keys.sh writes to this exact path) and
+// returns its api_key field. Used by Step J's IssueProviderToken — never
+// logs the returned value, only that a read happened.
+func (c *Client) ReadProviderSecret(ctx context.Context, provider string) (string, error) {
+	token, err := c.ensureToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("vault auth: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.addr+"/v1/secret/data/provider/"+provider, nil)
+	if err != nil {
+		return "", fmt.Errorf("building secret read request: %w", err)
+	}
+	req.Header.Set("X-Vault-Token", token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("calling secret read: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading secret read response: %w", err)
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("no secret stored at secret/provider/%s", provider)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var errResp kvReadResponse
+		_ = json.Unmarshal(respBody, &errResp)
+		return "", fmt.Errorf("secret read failed (status %d): %v", resp.StatusCode, errResp.Errors)
+	}
+
+	var kvResp kvReadResponse
+	if err := json.Unmarshal(respBody, &kvResp); err != nil {
+		return "", fmt.Errorf("decoding secret read response: %w", err)
+	}
+
+	apiKey, ok := kvResp.Data.Data["api_key"].(string)
+	if !ok || apiKey == "" {
+		return "", fmt.Errorf("secret/provider/%s has no non-empty api_key field", provider)
+	}
+	return apiKey, nil
+}
