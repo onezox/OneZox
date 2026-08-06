@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"os"
 	"testing"
 )
 
@@ -17,7 +16,7 @@ func TestRefreshVaultSucceedsSourceIsVault(t *testing.T) {
 	fetcher := NewFakeFetcher()
 	fetcher.Tokens["openai"] = "sk-from-vault"
 	adapter := &FakeAdapter{}
-	r := NewResolver("openai", "OPENAI_API_KEY", fetcher, adapter, testLogger())
+	r := NewResolver("openai", fetcher, adapter, testLogger())
 
 	if _, err := r.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
@@ -30,74 +29,44 @@ func TestRefreshVaultSucceedsSourceIsVault(t *testing.T) {
 	}
 }
 
-// TestRefreshVaultUnavailableFallsBackToEnv: the core dual-path property
-// — when control-plane/Vault is unreachable, the resolver must fall back
-// to the K8s Secret env var, not fail outright, and must record the
-// fallback as the source (not silently claim vault).
-func TestRefreshVaultUnavailableFallsBackToEnv(t *testing.T) {
-	t.Setenv("OPENAI_API_KEY", "sk-from-k8s-secret")
-
-	fetcher := NewFakeFetcher()
-	fetcher.Err = errors.New("control-plane unreachable")
-	adapter := &FakeAdapter{}
-	r := NewResolver("openai", "OPENAI_API_KEY", fetcher, adapter, testLogger())
-
-	if _, err := r.Refresh(context.Background()); err != nil {
-		t.Fatalf("Refresh: %v", err)
-	}
-	if adapter.Key != "sk-from-k8s-secret" {
-		t.Errorf("adapter key = %q, want sk-from-k8s-secret", adapter.Key)
-	}
-	if r.CurrentSource() != SourceK8sSecretFallback {
-		t.Errorf("source = %q, want %q", r.CurrentSource(), SourceK8sSecretFallback)
-	}
-}
-
-// TestRefreshBothPathsFailReturnsError: neither Vault nor the env var
-// available must be a hard error, not a silently-empty credential pushed
-// into the adapter — matches "proceed with what's available": the caller
-// (main.go) must not register this provider's adapter at all in this
-// case.
-func TestRefreshBothPathsFailReturnsError(t *testing.T) {
-	os.Unsetenv("ANTHROPIC_API_KEY_TEST_UNSET")
+// TestRefreshVaultUnavailableReturnsError: Step O removed the K8s-Secret
+// fallback entirely — Vault unreachable must now be a hard error, not a
+// silent degrade to anything else, and must never mutate the adapter's
+// existing key.
+func TestRefreshVaultUnavailableReturnsError(t *testing.T) {
 	fetcher := NewFakeFetcher()
 	fetcher.Err = errors.New("control-plane unreachable")
 	adapter := &FakeAdapter{Key: "should-not-change"}
-	r := NewResolver("anthropic", "ANTHROPIC_API_KEY_TEST_UNSET", fetcher, adapter, testLogger())
+	r := NewResolver("openai", fetcher, adapter, testLogger())
 
 	if _, err := r.Refresh(context.Background()); err == nil {
-		t.Fatal("expected an error when both vault and fallback fail, got nil")
+		t.Fatal("expected an error when vault is unreachable, got nil")
 	}
 	if adapter.Key != "should-not-change" {
-		t.Errorf("adapter key was mutated on total failure: %q", adapter.Key)
+		t.Errorf("adapter key was mutated on vault failure: %q", adapter.Key)
 	}
 	if r.CurrentSource() != sourceNone {
 		t.Errorf("source = %q, want empty (no credential resolved)", r.CurrentSource())
 	}
 }
 
-// TestRefreshRecoversFromFallbackToVault: once Vault becomes reachable
-// again, the NEXT refresh must switch back to vault as the source — the
-// fallback is not sticky.
-func TestRefreshRecoversFromFallbackToVault(t *testing.T) {
-	t.Setenv("OPENAI_API_KEY", "sk-from-k8s-secret")
-
+// TestRefreshRecoversAfterVaultOutage: once Vault becomes reachable
+// again, the next refresh must succeed and update the adapter — a
+// transient outage doesn't permanently wedge the resolver.
+func TestRefreshRecoversAfterVaultOutage(t *testing.T) {
 	fetcher := NewFakeFetcher()
 	fetcher.Tokens["openai"] = "sk-from-vault"
 	fetcher.Err = errors.New("control-plane temporarily unreachable")
 	adapter := &FakeAdapter{}
-	r := NewResolver("openai", "OPENAI_API_KEY", fetcher, adapter, testLogger())
+	r := NewResolver("openai", fetcher, adapter, testLogger())
 
-	if _, err := r.Refresh(context.Background()); err != nil {
-		t.Fatalf("first Refresh: %v", err)
-	}
-	if r.CurrentSource() != SourceK8sSecretFallback {
-		t.Fatalf("expected fallback on first refresh, got %q", r.CurrentSource())
+	if _, err := r.Refresh(context.Background()); err == nil {
+		t.Fatal("expected an error during the outage, got nil")
 	}
 
 	fetcher.Err = nil // vault recovers
 	if _, err := r.Refresh(context.Background()); err != nil {
-		t.Fatalf("second Refresh: %v", err)
+		t.Fatalf("Refresh after recovery: %v", err)
 	}
 	if r.CurrentSource() != SourceVault {
 		t.Errorf("source after recovery = %q, want %q", r.CurrentSource(), SourceVault)

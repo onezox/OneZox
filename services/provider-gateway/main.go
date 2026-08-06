@@ -563,17 +563,18 @@ func main() {
 		r    *credentials.Resolver
 		wait time.Duration
 	}
-	// setupCredential resolves providerName's credential once, synchronously,
-	// before this provider's adapter is ever registered — "proceed with
-	// what's available" (Step J3's own scaffolding discipline): a
-	// provider with neither a Vault secret nor its K8s Secret env var set
-	// simply isn't registered, same as before, just via a different
-	// resolution path now. Only credential_source is ever logged, never
-	// the key value itself (Phase-02.txt SECURITY IMPLEMENTATION: "never
-	// logged") — Resolver.Refresh already enforces this.
+	// setupCredential resolves providerName's credential from Vault once,
+	// synchronously, before this provider's adapter is ever registered —
+	// "proceed with what's available" (Step J3's own scaffolding
+	// discipline) still holds: a provider Vault has no secret for simply
+	// isn't registered. Only credential_source is ever logged, never the
+	// key value itself (Phase-02.txt SECURITY IMPLEMENTATION: "never
+	// logged") — Resolver.Refresh already enforces this. Step O: no
+	// envVarName parameter anymore — the K8s-Secret fallback this took at
+	// Step M is gone, Vault-only by design.
 	var resolvers []resolverWithWait
-	setupCredential := func(providerName, envVarName string, adapter credentials.KeySetter) *credentials.Resolver {
-		r := credentials.NewResolver(providerName, envVarName, tokenFetcher, adapter, log)
+	setupCredential := func(providerName string, adapter credentials.KeySetter) *credentials.Resolver {
+		r := credentials.NewResolver(providerName, tokenFetcher, adapter, log)
 		wait, err := r.Refresh(ctx)
 		if err != nil {
 			log.Warn("provider credential unavailable, adapter not registered",
@@ -585,12 +586,12 @@ func main() {
 	}
 
 	openaiAdapter := openai.New("", "")
-	if r := setupCredential("openai", "OPENAI_API_KEY", openaiAdapter); r != nil {
+	if r := setupCredential("openai", openaiAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, openaiAdapter)
 	}
 
 	anthropicAdapter := anthropic.New("", "")
-	if r := setupCredential("anthropic", "ANTHROPIC_API_KEY", anthropicAdapter); r != nil {
+	if r := setupCredential("anthropic", anthropicAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, anthropicAdapter)
 	}
 
@@ -610,17 +611,17 @@ func main() {
 	// unchanged) — each now dual-path resolved the same as openai/
 	// anthropic above.
 	grokAdapter := openai.NewNamed("grok", "", "https://api.x.ai")
-	if r := setupCredential("grok", "GROK_API_KEY", grokAdapter); r != nil {
+	if r := setupCredential("grok", grokAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, grokAdapter)
 	}
 
 	glmAdapter := openai.NewNamedWithPath("glm", "", "https://api.z.ai", "/api/paas/v4/chat/completions")
-	if r := setupCredential("glm", "GLM_API_KEY", glmAdapter); r != nil {
+	if r := setupCredential("glm", glmAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, glmAdapter)
 	}
 
 	kimiAdapter := openai.NewNamed("kimi", "", "https://api.moonshot.ai")
-	if r := setupCredential("kimi", "KIMI_API_KEY", kimiAdapter); r != nil {
+	if r := setupCredential("kimi", kimiAdapter); r != nil {
 		registeredAdapters = append(registeredAdapters, kimiAdapter)
 	}
 
