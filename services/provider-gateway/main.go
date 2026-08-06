@@ -13,14 +13,20 @@
 // InvokeEmbedding and ProviderHealth stay unimplemented.
 //
 // Step J4-J6: the real openai/anthropic/google adapters register here
-// too, each only if its own API key env var is actually set (envFrom
-// mounts provider-gateway-credentials, Step J3) — a missing key means
-// that provider is simply absent from the registry, not a startup
-// failure, same "proceed with what's available" discipline used
-// elsewhere in Phase-02. All three normalize a genuinely different wire
-// format behind the same adapters.Adapter contract: OpenAI's uniform SSE
-// chunks, Anthropic's named-event stream, and Google's alt=sse variant of
-// its own contents/parts shape.
+// too. All three normalize a genuinely different wire format behind the
+// same adapters.Adapter contract: OpenAI's uniform SSE chunks,
+// Anthropic's named-event stream, and Google's alt=sse variant of its own
+// contents/parts shape.
+//
+// Phase-04 Step M (F9 cutover): openai/anthropic/grok/glm/kimi now
+// resolve their credential via internal/credentials' dual-path Resolver —
+// Vault-first (control-plane's IssueProviderToken), falling back to the
+// same provider-gateway-credentials K8s Secret env vars only if
+// control-plane/Vault is unreachable. "Proceed with what's available"
+// still holds: neither path succeeding means that provider simply isn't
+// registered, same as the original Phase-02 behavior, just resolved
+// differently. Google/Gemini is untouched — still env-var-only, still
+// deactivated (F13).
 //
 // No CockroachDB or MinIO connection, unlike provider-stub: Phase-02.txt's
 // DATABASE TABLES REQUIRED section is explicit that this phase owns no
@@ -71,6 +77,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
@@ -81,6 +88,8 @@ import (
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters/openai"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/breaker"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/coalesce"
+	"github.com/onezox/OneZox/services/provider-gateway/internal/credentials"
+	controlv1 "github.com/onezox/OneZox/services/provider-gateway/internal/pb/control/v1"
 	pb "github.com/onezox/OneZox/services/provider-gateway/internal/pb/provider/v1"
 	"github.com/onezox/OneZox/services/provider-gateway/internal/quota"
 	relay "github.com/onezox/OneZox/services/provider-gateway/internal/stream"
@@ -529,63 +538,97 @@ func main() {
 	fakeBaseURL := envOr("PROVIDER_FAKE_URL", "http://provider-fake.default.svc.cluster.local:8080")
 	registeredAdapters := []adapters.Adapter{fake.New(fakeBaseURL)}
 
-	// Real adapters only register if their key is actually present —
-	// "proceed with what's available" (Step J3's own scaffolding
-	// discipline), not a hard requirement that all three exist. Only
-	// presence is ever logged, never the key value itself
-	// (Phase-02.txt SECURITY IMPLEMENTATION: "never logged").
-	if os.Getenv("OPENAI_API_KEY") != "" {
-		registeredAdapters = append(registeredAdapters, openai.New(os.Getenv("OPENAI_API_KEY"), ""))
-	} else {
-		log.Warn("OPENAI_API_KEY not set, openai adapter not registered")
+	// Phase-04 Step M — F9 cutover: each of the 5 real providers now
+	// resolves its credential VAULT-FIRST (control-plane's
+	// IssueProviderToken, Step J), falling back to its K8s Secret env var
+	// only if control-plane/Vault is unreachable (internal/credentials'
+	// own dual-path Resolver). Plain/insecure gRPC channel credentials at
+	// the app layer — Cilium's SPIFFE/SPIRE-backed mTLS enforcement
+	// (control-plane-mtls, authentication: required, Step K) happens
+	// transparently at the network layer, matching data-plane's own
+	// existing provider-gateway client dial (grpc.aio.insecure_channel).
+	controlPlaneAddr := envOr("CONTROL_PLANE_ADDR", "control-plane.default.svc.cluster.local:50051")
+	controlPlaneConn, err := grpc.NewClient(controlPlaneAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Error("failed to create control-plane gRPC client", "error", err, "addr", controlPlaneAddr)
+		os.Exit(1)
 	}
-	if os.Getenv("ANTHROPIC_API_KEY") != "" {
-		registeredAdapters = append(registeredAdapters, anthropic.New(os.Getenv("ANTHROPIC_API_KEY"), ""))
-	} else {
-		log.Warn("ANTHROPIC_API_KEY not set, anthropic adapter not registered")
+	defer func() { _ = controlPlaneConn.Close() }()
+	tokenFetcher := credentials.NewGRPCFetcher(controlv1.NewControlServiceClient(controlPlaneConn))
+
+	// setupCredential resolves providerName's credential once, synchronously,
+	// before this provider's adapter is ever registered — "proceed with
+	// what's available" (Step J3's own scaffolding discipline): a
+	// provider with neither a Vault secret nor its K8s Secret env var set
+	// simply isn't registered, same as before, just via a different
+	// resolution path now. Only credential_source is ever logged, never
+	// the key value itself (Phase-02.txt SECURITY IMPLEMENTATION: "never
+	// logged") — Resolver.Refresh already enforces this.
+	var resolvers []*credentials.Resolver
+	setupCredential := func(providerName, envVarName string, adapter credentials.KeySetter) *credentials.Resolver {
+		r := credentials.NewResolver(providerName, envVarName, tokenFetcher, adapter, log)
+		if _, err := r.Refresh(ctx); err != nil {
+			log.Warn("provider credential unavailable, adapter not registered",
+				"provider", providerName, "error", err)
+			return nil
+		}
+		return r
 	}
+
+	openaiAdapter := openai.New("", "")
+	if r := setupCredential("openai", "OPENAI_API_KEY", openaiAdapter); r != nil {
+		registeredAdapters = append(registeredAdapters, openaiAdapter)
+		resolvers = append(resolvers, r)
+	}
+
+	anthropicAdapter := anthropic.New("", "")
+	if r := setupCredential("anthropic", "ANTHROPIC_API_KEY", anthropicAdapter); r != nil {
+		registeredAdapters = append(registeredAdapters, anthropicAdapter)
+		resolvers = append(resolvers, r)
+	}
+
+	// Google/Gemini: UNCHANGED, no dual-path — F13 stays deactivated
+	// (Between-Phase provider task), and Step I only loaded Vault secrets
+	// for the 5 ACTIVE providers, deliberately not google. Re-activation
+	// is still "refill this one Secret key plus close F13," exactly as
+	// before.
 	if os.Getenv("GOOGLE_API_KEY") != "" {
 		registeredAdapters = append(registeredAdapters, google.New(os.Getenv("GOOGLE_API_KEY"), ""))
 	} else {
-		// Between-Phase provider task: Gemini deactivated, not removed —
-		// GOOGLE_API_KEY is absent from provider-gateway-credentials on
-		// purpose (F13, Dependencies.txt, is still open: real content-
-		// delta verification against a billed key). The google adapter
-		// package, its tests, and this conditional registration are all
-		// untouched; re-activation is refilling this one Secret key plus
-		// closing F13, not a rebuild. This branch firing (rather than
-		// google.New above) IS the deactivation — confirmed live via
-		// ProviderHealth reporting the registry without "google".
 		log.Warn("GOOGLE_API_KEY not set, google adapter not registered")
 	}
-	// Between-Phase provider task: Grok (xAI), GLM (Zhipu/z.ai), and Kimi
-	// (Moonshot) added via the SAME openai adapter package, not new native
-	// adapters — all three speak a genuine approximation of OpenAI's own
-	// streaming wire format (confirmed live per provider, not assumed
-	// from the "OpenAI-compatible" label alone; see the task's own
-	// findings doc for what each one actually needed).
-	//
-	// Grok and Kimi both match OpenAI's own host+"/v1/chat/completions"
-	// path shape (openai.NewNamed, default path). GLM's z.ai endpoint
-	// does not (openai.NewNamedWithPath, explicit override) — see
-	// openai.go's own doc comments for why.
-	if os.Getenv("GROK_API_KEY") != "" {
-		registeredAdapters = append(registeredAdapters,
-			openai.NewNamed("grok", os.Getenv("GROK_API_KEY"), "https://api.x.ai"))
-	} else {
-		log.Warn("GROK_API_KEY not set, grok adapter not registered")
+
+	// Grok/GLM/Kimi via the same openai adapter package under different
+	// provider names (Between-Phase provider task's own reasoning,
+	// unchanged) — each now dual-path resolved the same as openai/
+	// anthropic above.
+	grokAdapter := openai.NewNamed("grok", "", "https://api.x.ai")
+	if r := setupCredential("grok", "GROK_API_KEY", grokAdapter); r != nil {
+		registeredAdapters = append(registeredAdapters, grokAdapter)
+		resolvers = append(resolvers, r)
 	}
-	if os.Getenv("GLM_API_KEY") != "" {
-		registeredAdapters = append(registeredAdapters,
-			openai.NewNamedWithPath("glm", os.Getenv("GLM_API_KEY"), "https://api.z.ai", "/api/paas/v4/chat/completions"))
-	} else {
-		log.Warn("GLM_API_KEY not set, glm adapter not registered")
+
+	glmAdapter := openai.NewNamedWithPath("glm", "", "https://api.z.ai", "/api/paas/v4/chat/completions")
+	if r := setupCredential("glm", "GLM_API_KEY", glmAdapter); r != nil {
+		registeredAdapters = append(registeredAdapters, glmAdapter)
+		resolvers = append(resolvers, r)
 	}
-	if os.Getenv("KIMI_API_KEY") != "" {
-		registeredAdapters = append(registeredAdapters,
-			openai.NewNamed("kimi", os.Getenv("KIMI_API_KEY"), "https://api.moonshot.ai"))
-	} else {
-		log.Warn("KIMI_API_KEY not set, kimi adapter not registered")
+
+	kimiAdapter := openai.NewNamed("kimi", "", "https://api.moonshot.ai")
+	if r := setupCredential("kimi", "KIMI_API_KEY", kimiAdapter); r != nil {
+		registeredAdapters = append(registeredAdapters, kimiAdapter)
+		resolvers = append(resolvers, r)
+	}
+
+	// Background periodic refresh, well before each resolver's Vault TTL
+	// expires (Resolver.Refresh's own renewal-buffer logic) — without
+	// this, neither Step N's "prove pods are genuinely using Vault" nor
+	// Step P's "poison the old Secret, prove nothing breaks" would mean
+	// anything: a credential fetched once at startup and never revisited
+	// would make both checks blind to what's actually happening on a live
+	// pod.
+	for _, r := range resolvers {
+		go r.Run(ctx)
 	}
 
 	registry := adapters.NewRegistry(registeredAdapters...)
@@ -646,6 +689,22 @@ func main() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("not ready"))
 			return
+		}
+		// Phase-04 Step M: require a live credential from either path
+		// (Vault or K8s-Secret fallback) for every provider whose adapter
+		// is registered. Inert today (a registered resolver's fallback
+		// env var, once present, stays present for the pod's whole
+		// lifetime — so this can't fail post-startup while the Secret
+		// still exists), but becomes a real, meaningful gate once Step P
+		// deletes the Secret: at that point a Vault outage on a later
+		// refresh genuinely could leave a resolver with nothing.
+		for _, cred := range resolvers {
+			if cred.CurrentSource() == "" {
+				log.Error("readiness check failed: provider credential not resolved", "provider", cred.Provider())
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("not ready"))
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))

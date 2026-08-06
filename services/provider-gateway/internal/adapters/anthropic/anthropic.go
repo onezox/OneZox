@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters"
@@ -44,7 +45,7 @@ const (
 )
 
 type Adapter struct {
-	apiKey     string
+	apiKey     atomic.Pointer[string]
 	baseURL    string
 	httpClient *http.Client
 }
@@ -53,14 +54,23 @@ func New(apiKey, baseURL string) *Adapter {
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
-	return &Adapter{
-		apiKey:     apiKey,
+	a := &Adapter{
 		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 60 * time.Second},
 	}
+	a.apiKey.Store(&apiKey)
+	return a
 }
 
 func (a *Adapter) Name() string { return ProviderName }
+
+// SetAPIKey atomically replaces the key used by every subsequent Invoke
+// call — same mechanism and reasoning as openai.Adapter.SetAPIKey (Step
+// M's credential resolver keeping a live adapter's key current as
+// Vault-issued tokens are periodically refreshed).
+func (a *Adapter) SetAPIKey(key string) {
+	a.apiKey.Store(&key)
+}
 
 type wireReqMessage struct {
 	Role    string `json:"role"`
@@ -170,7 +180,7 @@ func (a *Adapter) Invoke(ctx context.Context, req adapters.InvokeRequest) (adapt
 		return nil, fmt.Errorf("anthropic adapter: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", a.apiKey)
+	httpReq.Header.Set("x-api-key", *a.apiKey.Load())
 	httpReq.Header.Set("anthropic-version", apiVersion)
 
 	resp, err := a.httpClient.Do(httpReq)

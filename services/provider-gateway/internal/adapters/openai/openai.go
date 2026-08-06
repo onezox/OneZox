@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/onezox/OneZox/services/provider-gateway/internal/adapters"
@@ -44,9 +45,10 @@ const defaultBaseURL = "https://api.openai.com"
 const defaultCompletionsPath = "/v1/chat/completions"
 
 type Adapter struct {
-	name            string
-	apiKey          string
-	baseURL         string
+	name    string
+	apiKey  atomic.Pointer[string]
+	baseURL string
+
 	completionsPath string
 	httpClient      *http.Client
 }
@@ -92,16 +94,31 @@ func NewNamedWithPath(name, apiKey, baseURL, completionsPath string) *Adapter {
 	if completionsPath == "" {
 		completionsPath = defaultCompletionsPath
 	}
-	return &Adapter{
+	a := &Adapter{
 		name:            name,
-		apiKey:          apiKey,
 		baseURL:         baseURL,
 		completionsPath: completionsPath,
 		httpClient:      &http.Client{Timeout: 60 * time.Second},
 	}
+	a.apiKey.Store(&apiKey)
+	return a
 }
 
 func (a *Adapter) Name() string { return a.name }
+
+// SetAPIKey atomically replaces the key used by every subsequent Invoke
+// call — the mechanism Phase-04 Step M's credential resolver uses to keep
+// a live adapter's key current as Vault-issued tokens are periodically
+// refreshed, without needing to re-register a new Adapter instance (which
+// would also mean re-registering it in adapters.Registry, disruptive to
+// any in-flight coalesced call keyed by the old instance). Safe for
+// concurrent use with Invoke — atomic.Pointer, not a plain field write,
+// specifically because Invoke reads it on every call from arbitrary
+// goroutines while a background refresh goroutine may write it at any
+// time.
+func (a *Adapter) SetAPIKey(key string) {
+	a.apiKey.Store(&key)
+}
 
 type wireReqMessage struct {
 	Role    string `json:"role"`
@@ -183,7 +200,7 @@ func (a *Adapter) Invoke(ctx context.Context, req adapters.InvokeRequest) (adapt
 		return nil, fmt.Errorf("openai adapter: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+a.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+*a.apiKey.Load())
 
 	resp, err := a.httpClient.Do(httpReq)
 	if err != nil {

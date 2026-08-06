@@ -29,4 +29,17 @@ protoc \
   --go-grpc_out="$OUT_DIR" --go-grpc_opt=paths=source_relative \
   proto/provider/v1/provider.proto
 
+# Phase-04 Step M: provider-gateway becomes a gRPC CLIENT of control-plane
+# (IssueProviderToken) — needs its own copy of control.proto's generated
+# stubs too, same "each service commits its own bindings, Docker build
+# context can't reach proto/ at the repo root" reasoning as above. Only
+# the client-side generated code (ControlServiceClient) is actually used;
+# protoc-gen-go-grpc generates the server interface alongside it
+# regardless, unused here, harmless.
+protoc \
+  -I proto \
+  --go_out="$OUT_DIR" --go_opt=paths=source_relative \
+  --go-grpc_out="$OUT_DIR" --go-grpc_opt=paths=source_relative \
+  proto/control/v1/control.proto
+
 echo "Regenerated $OUT_DIR/"
