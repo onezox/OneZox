@@ -1,0 +1,92 @@
+# Phase-04 Step B — Vault (HA): the control plane's provider-credential store
+# and manifest-signing key home (Vault Transit, Step G).
+#
+# Official HashiCorp chart/image (hashicorp/vault on Docker Hub, HashiCorp's
+# own registry) — verified pullable via `docker pull` before committing to
+# this approach, learning from the bitnami/etcd paywall hit in Step A. No
+# Bitnami dependency here at all.
+#
+# HA via Raft integrated storage (server.ha.raft.enabled), not an external
+# Consul backend: self-contained, one fewer service to operate locally, and
+# it's HashiCorp's own recommended default for new HA deployments. 3 replicas
+# matches the same "genuine quorum/HA" framing already used for etcd (Step A)
+# and CockroachDB's local 3-node cluster.
+#
+# TLS disabled (tlsDisable: true) at the listener — same "insecure mode,
+# protection is Cilium mTLS CiliumNetworkPolicy restricting which identities
+# can reach it at all" posture already established for etcd (Step A) and
+# CockroachDB (Phase-00), not an oversight. Vault's own secret-at-rest
+# encryption (its core guarantee) is independent of listener TLS.
+#
+# Injector explicitly disabled: this phase's design has control-plane call
+# Vault's API directly (Kubernetes auth method) to implement IssueProviderToken
+# (Step J) — no pod gets a Vault Agent sidecar or auto-injected secrets.
+# Building injector support here would be scope neither Phase-04.txt nor the
+# approved plan calls for.
+#
+# UI left enabled: harmless, and useful for the user's own init/unseal
+# ceremony (Step B, run by the user — unseal keys/root token must never pass
+# through my own tool calls, same discipline as the earlier credential-script
+# incident).
+
+server:
+  ha:
+    enabled: true
+    replicas: 3
+    raft:
+      enabled: true
+      setNodeId: true
+      config: |
+        ui = true
+
+        listener "tcp" {
+          address = "[::]:8200"
+          cluster_address = "[::]:8201"
+          tls_disable = true
+        }
+
+        storage "raft" {
+          path = "/vault/data"
+        }
+
+        service_registration "kubernetes" {}
+
+  dataStorage:
+    enabled: true
+    size: 1Gi
+
+  auditStorage:
+    # Separate PVC for the audit log device (Step B enables this after
+    # init/unseal) so audit records survive independently of raft data.
+    enabled: true
+    size: 1Gi
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+  extraEnvironmentVars:
+    VAULT_LOG_LEVEL: info
+
+  # Chart default sets a HARD (requiredDuringScheduling) pod anti-affinity —
+  # one Vault server pod per node. Confirmed live, not assumed: with 3
+  # replicas that fails to schedule on this kind cluster, which has only 2
+  # schedulable worker nodes (`onezox-dev-worker`, `onezox-dev-worker2`) plus
+  # a tainted control-plane node — `kubectl describe pod vault-1` showed
+  # `FailedScheduling ... 2 node(s) didn't match pod anti-affinity rules`.
+  # Same local-capacity constraint class as any 3-replica-on-2-node
+  # deployment; disabling it (empty override) permits co-location instead of
+  # redesigning Vault's own HA model — raft still runs with 3 voting members,
+  # this only relaxes which nodes they're allowed to land on.
+  affinity: ""
+
+ui:
+  enabled: true
+  serviceType: ClusterIP
+
+injector:
+  enabled: false
