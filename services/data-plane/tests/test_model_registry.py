@@ -64,7 +64,7 @@ class FakeEtcdReader:
     async def get_prefix(self, key_prefix: bytes):
         return [_KV(key=k, value=v) for k, v in self.store.items() if k.startswith(key_prefix)]
 
-    def watch_prefix(self, key_prefix: bytes):
+    async def watch_prefix(self, key_prefix: bytes):
         raise NotImplementedError("not exercised by these unit tests")
 
 

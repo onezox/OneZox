@@ -85,7 +85,10 @@ class EtcdReader(Protocol):
     Protocol already established for asyncpg."""
 
     async def get_prefix(self, key_prefix: bytes): ...
-    def watch_prefix(self, key_prefix: bytes): ...
+    # aetcd's own watch_prefix is itself async — awaiting it returns the
+    # actual async-iterable Watch object, it is not directly iterable on
+    # its own (confirmed live, see watch_forever's own comment).
+    async def watch_prefix(self, key_prefix: bytes): ...
 
 
 def _parse_worker_ref(spec_json: str) -> str:
@@ -192,7 +195,17 @@ class Cache:
         exits."""
         while True:
             try:
-                async for event in self._etcd.watch_prefix(ETCD_PREFIX.encode()):
+                # watch_prefix is itself a coroutine — awaiting it returns
+                # the Watch object (which supports __aiter__), it is NOT
+                # directly async-iterable on its own. Confirmed live: the
+                # first deploy of this code hit
+                # "'async for' requires an object with __aiter__ method,
+                # got coroutine" in a tight failing loop (caught by the
+                # except below, which is why it degraded to noisy retries
+                # rather than crashing — but it never actually watched
+                # anything until this fix).
+                watch = await self._etcd.watch_prefix(ETCD_PREFIX.encode())
+                async for event in watch:
                     key = event.kv.key.decode()
                     if event.kind == "DELETE":
                         self._handle_delete(key)
