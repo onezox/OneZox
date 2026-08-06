@@ -179,14 +179,15 @@ spec:
 # same step its Deployment first ships — same mesh-identity-safe sequencing
 # every prior service used (edge-gateway Step F2, provider-gateway Step
 # K3, data-plane Step J): no window where a real service is live without
-# mesh identity. Only host (kubelet probes + kubectl port-forward) and
-# prometheus (metrics scrape) rules exist yet — no peer-to-peer rule,
-# because no consuming service actually calls control-plane's gRPC API
-# yet. provider-gateway's own call to IssueProviderToken (Step K) and
-# edge-gateway's own call to ListModels (Step S) each add their own
-# fromEndpoints rule here when THAT step reaches live traffic, matching
-# how every other -mtls block in this file grew its peer rules
-# incrementally rather than all at once.
+# mesh identity. Host (kubelet probes + kubectl port-forward) and
+# prometheus (metrics scrape) rules landed at Step D. Step K adds the
+# first peer-to-peer rule: provider-gateway calling IssueProviderToken —
+# added and confirmed healthy BEFORE Step M's dual-path credential code is
+# deployed, same "prove the new mechanism reachable before anything
+# depends on it" ordering as every mesh cutover so far. edge-gateway's own
+# call to ListModels (Step S) adds its own fromEndpoints rule later, when
+# THAT step reaches live traffic — matching how every other -mtls block in
+# this file grew its peer rules incrementally rather than all at once.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -212,3 +213,12 @@ spec:
         - ports:
             - port: "8080"
               protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app: provider-gateway
+      toPorts:
+        - ports:
+            - port: "50051"
+              protocol: TCP
+      authentication:
+        mode: "required"

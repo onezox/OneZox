@@ -90,6 +90,19 @@ spec:
         - ports:
             - port: "8080"
               protocol: TCP
+    # Phase-04 Step K: control-plane's IssueProviderToken (Step J) — the
+    # F9 cutover's own dual-path code (Step M) needs this reachable BEFORE
+    # it deploys, same ordering discipline as every entry above it. gRPC
+    # only (port 50051); provider-gateway has no reason to reach
+    # control-plane's HTTP :8080 (health/metrics are control-plane's own
+    # kubelet/Prometheus concern, not provider-gateway's).
+    - toEndpoints:
+        - matchLabels:
+            app: control-plane
+      toPorts:
+        - ports:
+            - port: "50051"
+              protocol: TCP
     # The approved real provider endpoints (Step J4-J6). toFQDNs is
     # Cilium's DNS-aware egress mechanism: it allows the resolved IPs for
     # exactly these names, dynamically, as DNS answers for them are
