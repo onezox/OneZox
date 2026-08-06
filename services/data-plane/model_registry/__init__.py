@@ -107,8 +107,26 @@ class Cache:
         self._active: dict[str, str] = {}
 
     async def _verify(self, m: Manifest) -> bool:
+        """Returns False for BOTH a well-formed "no" from the verifier
+        AND a genuine call failure (Vault unreachable, missing/misconfigured
+        role, network error) — a bad-update caller (_handle_manifest_kv)
+        treats these identically: refuse to trust, log, move on. Crashing
+        the whole cache (and therefore the whole boot sequence, since
+        sync_once() runs at startup) over a transient Vault problem would
+        be exactly the hot-path-safety violation this module exists to
+        rule out, just at boot time instead of per-request. Live-caught,
+        not theoretical: this exact path crashed data-plane's boot on
+        first deploy, before data-plane's own Vault role existed yet."""
         payload = signed_payload(m.version_id, m.model_ref, m.spec_json)
-        return await self._verifier.verify(SIGNING_KEY_NAME, payload, m.signature)
+        try:
+            return await self._verifier.verify(SIGNING_KEY_NAME, payload, m.signature)
+        except Exception as e:
+            self._log.warning(
+                f"model_registry: verifier call failed (treated as verification "
+                f"failure, not a crash) model_ref={m.model_ref} "
+                f"version_id={m.version_id} error={e}"
+            )
+            return False
 
     async def _handle_manifest_kv(self, model_ref: str, version_id: str, value: bytes) -> None:
         try:

@@ -34,6 +34,15 @@ class FakeVerifier:
         return hmac.compare_digest(self.sign(payload), signature)
 
 
+class RaisingVerifier:
+    """Simulates a genuine Vault call failure (unreachable, missing role,
+    network error) — distinct from a well-formed "no" — for the boot-crash
+    regression test below."""
+
+    async def verify(self, key_name: str, payload: bytes, signature: str) -> bool:
+        raise RuntimeError("vault kubernetes login failed (status 400): invalid role name")
+
+
 @dataclass
 class _KV:
     key: bytes
@@ -179,6 +188,30 @@ def test_garbage_signature_rejected() -> None:
     try:
         cache.resolve("openai")
         raise AssertionError("expected ManifestNotFound — garbage signature must never resolve")
+    except ManifestNotFound:
+        pass
+
+
+def test_verifier_call_failure_does_not_crash_sync() -> None:
+    """Regression test: live-caught on data-plane's very first deploy —
+    a genuine Vault call failure (data-plane's own K8s-auth role didn't
+    exist yet) during sync_once() propagated as an uncaught exception and
+    crashed the whole boot sequence, not just refused that one manifest.
+    A Vault outage/misconfiguration must degrade to "this manifest isn't
+    trusted" (same as any other verification failure), never take down
+    the process — the same hot-path-safety principle applied to boot
+    time, not just per-request."""
+    etcd = FakeEtcdReader()
+    version_id, model_ref = "v1", "openai"
+    spec_json = '{"worker_ref":"openai:gpt-4o-mini"}'
+    _put_manifest(etcd, version_id, model_ref, spec_json, "some-signature")
+
+    cache = Cache(etcd, RaisingVerifier(), _null_logger())
+    asyncio.run(cache.sync_once())  # must not raise
+
+    try:
+        cache.resolve("openai")
+        raise AssertionError("expected ManifestNotFound — a verify call failure must not trust")
     except ManifestNotFound:
         pass
 
