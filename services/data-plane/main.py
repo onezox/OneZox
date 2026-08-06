@@ -17,6 +17,7 @@ Preliminary deployment — alongside dataplane-stub, no cutover yet, that's
 Step J, same mesh-identity-safe sequencing Phase-01/02 both used.
 """
 
+import asyncio
 import importlib
 import json
 import logging
@@ -26,8 +27,10 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
+import aetcd
 import asyncpg
 import grpc
+import httpx
 from fastapi import FastAPI, Response
 from fastapi.responses import PlainTextResponse
 from opentelemetry import trace
@@ -42,8 +45,10 @@ from redis.asyncio.cluster import RedisCluster
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "generated"))
 import aggregator  # noqa: E402
 import identity  # noqa: E402
+import model_registry  # noqa: E402
 import request_log  # noqa: E402
 import usage_event  # noqa: E402
+import vault_client  # noqa: E402
 import working_memory  # noqa: E402
 from dataplane.v1 import dataplane_pb2, dataplane_pb2_grpc  # noqa: E402
 from planner import classifier, templates  # noqa: E402
@@ -53,12 +58,14 @@ from scheduler import admit, place  # noqa: E402
 SERVICE = "data-plane"
 GRPC_PORT = int(os.environ.get("GRPC_PORT", "50051"))
 
-# Model source is STATIC this phase (Dependencies.txt F10: the signed
-# registry replaces this in Phase-04) — one worker_ref, read from env so
-# the same image can be pointed at provider-fake for every step's own
-# testing (this one included) and the real Anthropic model for Step K's
-# one real call, without a code change between the two.
-STATIC_MODEL_REF = os.environ.get("STATIC_MODEL_REF", "anthropic:claude-haiku-4-5-20251001")
+# Phase-04 Step Q: STATIC_MODEL_REF is gone — model_registry.Cache
+# (etcd-fed, independently signature-verified) resolves a real worker_ref
+# per request now. DEFAULT_MODEL_REF is only what request.model falls
+# back to when a caller leaves it empty — "fake" so the same image still
+# points at provider-fake for cluster-side testing without a code change,
+# same purpose STATIC_MODEL_REF's own env-var default used to serve, just
+# now a model_ref the registry resolves rather than a literal worker_ref.
+DEFAULT_MODEL_REF = os.environ.get("DEFAULT_MODEL_REF", "fake")
 
 # Untuned placeholder fleet-wide in-flight cap — same "not tuned against
 # real data" framing already used for provider-gateway's quota/breaker
@@ -82,6 +89,8 @@ _REQUIRED_MODULES = (
     "usage_event",
     "identity",
     "aggregator",
+    "vault_client",
+    "model_registry",
 )
 
 
@@ -132,6 +141,10 @@ redis_client: RedisCluster | None = None
 provider_channel: grpc.aio.Channel | None = None
 provider_stub: provider_pb2_grpc.ProviderServiceStub | None = None
 grpc_server: grpc.aio.Server | None = None
+vault_http_client: httpx.AsyncClient | None = None
+etcd_client: aetcd.Client | None = None
+registry_cache: model_registry.Cache | None = None
+registry_watch_task: asyncio.Task | None = None
 
 
 async def _finish_request(
@@ -303,11 +316,31 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                 wm_messages = [{"role": m.role, "content": m.content} for m in request.messages]
                 await working_memory.write(redis_client, request_id, {"messages": wm_messages})
 
-                # Scheduler bind (Step E) — the one static worker_ref,
-                # gated on live provider health.
+                # Phase-04 Step Q: model_ref -> worker_ref via the
+                # registry cache (hot-path safe — resolve() is a plain
+                # in-memory dict read, no network call per request), THEN
+                # the SAME live-health gate Step E already established.
+                # request.model empty falls back to DEFAULT_MODEL_REF, the
+                # direct replacement for STATIC_MODEL_REF's own env-var
+                # default.
+                model_ref = request.model or DEFAULT_MODEL_REF
+                try:
+                    worker_ref = registry_cache.resolve(model_ref)
+                except model_registry.ManifestNotFound as e:
+                    log.info(
+                        f"model not found request_id={request_id} org_id={org_id} "
+                        f"model_ref={model_ref}"
+                    )
+                    await _finish_request(
+                        span, request_id, org_id, "model_not_found", start,
+                        usage=None, model_ref=None,
+                    )
+                    await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
+                    return
+
                 try:
                     worker_ref = await place.bind_via_provider_health(
-                        provider_stub, STATIC_MODEL_REF
+                        provider_stub, worker_ref
                     )
                 except place.ProviderUnavailable as e:
                     log.info(
@@ -444,9 +477,38 @@ async def check_provider_gateway(stub: provider_pb2_grpc.ProviderServiceStub) ->
     log.info(f"provider-gateway ProviderHealth reachable statuses={statuses}")
 
 
+async def init_model_registry() -> tuple[httpx.AsyncClient, aetcd.Client, model_registry.Cache]:
+    """Phase-04 Step Q boot sequence for the registry cache: Vault client
+    (data-plane's OWN, independent of control-plane's — see vault_client's
+    own module doc for why), etcd client, then a BLOCKING initial
+    sync_once() before this function returns — the same "prove it before
+    yielding readiness" discipline check_provider_gateway/
+    set_and_get_redis_key already use for their own dependencies. The
+    background watch_forever() task is spawned by the caller, not here,
+    since it needs to keep running past this function's own return.
+    """
+    vault_addr = os.environ.get("VAULT_ADDR", "http://vault-active.default.svc.cluster.local:8200")
+    vault_k8s_role = os.environ.get("VAULT_K8S_ROLE", "data-plane")
+    http_client = httpx.AsyncClient(timeout=10.0)
+    vault = vault_client.Client(vault_addr, vault_k8s_role, http_client)
+
+    etcd_host, _, etcd_port = os.environ.get(
+        "ETCD_ENDPOINT", "etcd.default.svc.cluster.local:2379"
+    ).partition(":")
+    etcd = aetcd.Client(host=etcd_host, port=int(etcd_port) if etcd_port else 2379)
+    await etcd.connect()
+
+    cache = model_registry.Cache(etcd, vault, log)
+    await cache.sync_once()
+    log.info("model_registry: initial sync complete")
+
+    return http_client, etcd, cache
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pg_pool, redis_client, provider_channel, provider_stub, grpc_server
+    global vault_http_client, etcd_client, registry_cache, registry_watch_task
 
     with tracer.start_as_current_span("data_plane.boot"):
         log.info("starting boot sequence")
@@ -473,8 +535,15 @@ async def lifespan(app: FastAPI):
         provider_stub = provider_pb2_grpc.ProviderServiceStub(provider_channel)
         await check_provider_gateway(provider_stub)
 
+        vault_http_client, etcd_client, registry_cache = await init_model_registry()
+
         boot_counter.inc()
         log.info("boot sequence complete")
+
+    # Spawned AFTER the span above closes — this loop runs for the rest of
+    # the process's life, unlike everything inside data_plane.boot which
+    # completes once.
+    registry_watch_task = asyncio.create_task(registry_cache.watch_forever())
 
     grpc_server = grpc.aio.server()
     dataplane_pb2_grpc.add_DataplaneServiceServicer_to_server(DataplaneServicer(), grpc_server)
@@ -485,8 +554,14 @@ async def lifespan(app: FastAPI):
     yield
 
     await grpc_server.stop(grace=5)
+    if registry_watch_task:
+        registry_watch_task.cancel()
     if provider_channel:
         await provider_channel.close()
+    if etcd_client:
+        await etcd_client.close()
+    if vault_http_client:
+        await vault_http_client.aclose()
     if pg_pool:
         await pg_pool.close()
     if redis_client:

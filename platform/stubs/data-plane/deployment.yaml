@@ -17,6 +17,22 @@
 # (content-addressed, not a static "phase03" string) — the convention
 # established in Phase-02 specifically to avoid Phase-01's same-tag-no-diff
 # manual-rollout-restart gap.
+#
+# Phase-04 Step Q: STATIC_MODEL_REF is gone — replaced by
+# model_registry.Cache, an etcd-fed cache with its own INDEPENDENT Vault
+# Transit signature verification (never trusts a manifest just because it
+# came from etcd). Dedicated ServiceAccount added (data-plane had none
+# before — ran under the implicit "default" SA) because Vault's
+# Kubernetes auth role (scripts/vault-setup-data-plane.sh) binds
+# specifically to it; the same "cluster vouches for this identity, not a
+# shared SA" reasoning control-plane's own ServiceAccount already
+# established in Step E.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: data-plane
+  namespace: default
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,17 +50,27 @@ spec:
       labels:
         app: data-plane
     spec:
+      serviceAccountName: data-plane
       containers:
         - name: data-plane
           image: onezox/data-plane:ccf83a5
           imagePullPolicy: IfNotPresent
           env:
-            # Step G/H/I testing all runs against provider-fake, mind
-            # cost (same discipline as every other phase) — Step K flips
-            # this to the real static Anthropic ref for the one real
-            # call, and only then.
-            - name: STATIC_MODEL_REF
-              value: "fake:normal"
+            # DEFAULT_MODEL_REF: what request.model falls back to when a
+            # caller leaves it empty — "fake" so cluster-side testing
+            # still points at provider-fake by default, same purpose
+            # STATIC_MODEL_REF's own env-var default used to serve. Now a
+            # model_ref the registry resolves, not a literal worker_ref —
+            # requires a "fake" manifest actually registered (Step Q's own
+            # live verification does this).
+            - name: DEFAULT_MODEL_REF
+              value: "fake"
+            - name: ETCD_ENDPOINT
+              value: "etcd.default.svc.cluster.local:2379"
+            - name: VAULT_ADDR
+              value: "http://vault-active.default.svc.cluster.local:8200"
+            - name: VAULT_K8S_ROLE
+              value: "data-plane"
           ports:
             - containerPort: 8080
               name: http

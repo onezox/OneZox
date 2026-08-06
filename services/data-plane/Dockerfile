@@ -11,6 +11,8 @@ COPY request_log/ request_log/
 COPY usage_event/ usage_event/
 COPY identity/ identity/
 COPY aggregator/ aggregator/
+COPY vault_client/ vault_client/
+COPY model_registry/ model_registry/
 # Every new top-level module directory needs its own COPY line above —
 # Step F found this list silently stale (it hadn't been touched since
 # Step B) and this line was itself missing when Step G first added

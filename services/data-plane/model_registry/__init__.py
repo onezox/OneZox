@@ -1,0 +1,232 @@
+"""model_registry — Phase-04 Step Q: replaces STATIC_MODEL_REF with a
+real, signed, versioned manifest binding, fed by an etcd-backed cache
+data-plane maintains itself.
+
+Three properties this module exists to guarantee, all adversarially
+tested (tests/test_model_registry.py), not merely asserted to hold:
+
+1. INDEPENDENT verification. Every manifest is signature-checked HERE,
+   against data-plane's own Vault Transit client (vault_client/), before
+   it is ever trusted enough to route a real request — never because "it
+   came from etcd" or "control-plane already checked it." A compromised
+   etcd, or a bad direct write to it, cannot make data-plane serve on an
+   invalid manifest; the same standard Step G already proved at
+   control-plane's own serving path, proved again here independently.
+
+2. BYTE-EXACTNESS. The payload verified is built from spec_json exactly
+   as received over etcd — never round-tripped through json.loads() and
+   re-serialized before verification (that would risk the identical class
+   of bug Step E hit with CockroachDB's JSONB reformatting spec_json's
+   bytes out from under its own signature). spec_json is parsed ONLY
+   after its signature has already verified, and only to pull out
+   worker_ref for resolve()'s own return value — never before, and never
+   as part of what gets hashed.
+
+3. HOT-PATH SAFETY. resolve() reads a plain in-memory dict — no network
+   call, no per-request Vault/etcd round-trip. A verification failure on
+   an incoming etcd update never removes or overwrites an already-trusted
+   manifest (last-known-good); it only prevents that bad update from ever
+   becoming trusted. A model_ref with no verified manifest at all raises
+   the typed ManifestNotFound — never a crash, never a hang.
+"""
+
+import asyncio
+import json
+import logging
+from dataclasses import dataclass
+from typing import Protocol
+
+ETCD_PREFIX = "/onezox/"
+MANIFESTS_PREFIX = "/onezox/manifests/"
+ACTIVE_PREFIX = "/onezox/active/"
+
+SIGNING_KEY_NAME = "model-manifest-signing"
+
+# Re-sync (not just resume-from-last-revision) after any watch failure —
+# the simple, unambiguously-correct recovery: a full re-list from etcd
+# rather than reasoning about exactly which revision a resumed watch
+# would need. Step R's own reconnect test exercises this path directly.
+_RECONNECT_BACKOFF_SECONDS = 2.0
+
+
+class ManifestNotFound(Exception):
+    def __init__(self, model_ref: str) -> None:
+        self.model_ref = model_ref
+        super().__init__(f"no verified manifest for model_ref={model_ref!r}")
+
+
+def signed_payload(version_id: str, model_ref: str, spec_json: str) -> bytes:
+    """MUST match control-plane's own registry.signedPayload exactly
+    (services/control-plane/internal/registry/registry.go) — same field
+    order, same "|" delimiter, same UTF-8 encoding. A mismatch here would
+    make every genuinely-valid manifest fail this independent
+    verification, not just tampered ones."""
+    return f"{version_id}|{model_ref}|{spec_json}".encode()
+
+
+@dataclass(frozen=True)
+class Manifest:
+    version_id: str
+    model_ref: str
+    spec_json: str
+    signature: str
+    created_by: str
+    created_at: str
+    status: str
+
+
+class SignatureVerifier(Protocol):
+    async def verify(self, key_name: str, payload: bytes, signature: str) -> bool: ...
+
+
+class EtcdReader(Protocol):
+    """The subset of an etcd client Cache needs — decouples this module
+    from aetcd's own concrete types, same reasoning usage_event's _PgPool
+    Protocol already established for asyncpg."""
+
+    async def get_prefix(self, key_prefix: bytes): ...
+    def watch_prefix(self, key_prefix: bytes): ...
+
+
+def _parse_worker_ref(spec_json: str) -> str:
+    spec = json.loads(spec_json)
+    worker_ref = spec.get("worker_ref")
+    if not worker_ref:
+        raise ValueError("manifest spec_json has no worker_ref field")
+    return worker_ref
+
+
+class Cache:
+    def __init__(self, etcd: EtcdReader, verifier: SignatureVerifier, log: logging.Logger) -> None:
+        self._etcd = etcd
+        self._verifier = verifier
+        self._log = log
+        # (model_ref, version_id) -> Manifest, ONLY entries that verified.
+        self._manifests: dict[tuple[str, str], Manifest] = {}
+        # model_ref -> version_id, the active pointer.
+        self._active: dict[str, str] = {}
+
+    async def _verify(self, m: Manifest) -> bool:
+        payload = signed_payload(m.version_id, m.model_ref, m.spec_json)
+        return await self._verifier.verify(SIGNING_KEY_NAME, payload, m.signature)
+
+    async def _handle_manifest_kv(self, model_ref: str, version_id: str, value: bytes) -> None:
+        try:
+            envelope = json.loads(value)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._log.warning(
+                f"model_registry: malformed manifest envelope, ignoring "
+                f"model_ref={model_ref} version_id={version_id} error={e}"
+            )
+            return
+
+        m = Manifest(
+            version_id=envelope.get("version_id", version_id),
+            model_ref=envelope.get("model_ref", model_ref),
+            spec_json=envelope.get("spec_json", ""),
+            signature=envelope.get("signature", ""),
+            created_by=envelope.get("created_by", ""),
+            created_at=envelope.get("created_at", ""),
+            status=envelope.get("status", ""),
+        )
+
+        valid = await self._verify(m)
+        if not valid:
+            # Last-known-good: a failed verification NEVER overwrites or
+            # removes whatever this (model_ref, version_id) already held
+            # (if anything) — it just refuses to let the bad update in.
+            self._log.warning(
+                f"model_registry: signature verification FAILED, refusing to trust "
+                f"model_ref={model_ref} version_id={version_id}"
+            )
+            return
+
+        self._manifests[(model_ref, version_id)] = m
+        self._log.info(
+            f"model_registry: verified and cached model_ref={model_ref} version_id={version_id}"
+        )
+
+    def _handle_active_kv(self, model_ref: str, version_id: str) -> None:
+        self._active[model_ref] = version_id
+
+    async def sync_once(self) -> None:
+        """Full re-list from etcd — the initial load, and also what a
+        reconnect after a watch failure falls back to (simpler and safer
+        than reasoning about resuming from a specific revision)."""
+        result = await self._etcd.get_prefix(ETCD_PREFIX.encode())
+        for kv in result:
+            key = kv.key.decode()
+            if key.startswith(MANIFESTS_PREFIX):
+                rest = key[len(MANIFESTS_PREFIX):]
+                model_ref, _, version_id = rest.partition("/")
+                if model_ref and version_id:
+                    await self._handle_manifest_kv(model_ref, version_id, kv.value)
+            elif key.startswith(ACTIVE_PREFIX):
+                model_ref = key[len(ACTIVE_PREFIX):]
+                if model_ref:
+                    self._handle_active_kv(model_ref, kv.value.decode())
+
+    async def watch_forever(self) -> None:
+        """Long-running background task (main.py spawns this once at
+        startup, after sync_once() has already populated the cache).
+        Never raises on its own — a watch failure triggers a full
+        sync_once() re-sync and a fresh watch, forever, until the process
+        exits."""
+        while True:
+            try:
+                async for event in self._etcd.watch_prefix(ETCD_PREFIX.encode()):
+                    key = event.kv.key.decode()
+                    if event.kind == "DELETE":
+                        self._handle_delete(key)
+                        continue
+                    if key.startswith(MANIFESTS_PREFIX):
+                        rest = key[len(MANIFESTS_PREFIX):]
+                        model_ref, _, version_id = rest.partition("/")
+                        if model_ref and version_id:
+                            await self._handle_manifest_kv(model_ref, version_id, event.kv.value)
+                    elif key.startswith(ACTIVE_PREFIX):
+                        model_ref = key[len(ACTIVE_PREFIX):]
+                        if model_ref:
+                            self._handle_active_kv(model_ref, event.kv.value.decode())
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log.warning(f"model_registry: watch failed, re-syncing error={e}")
+                await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
+                try:
+                    await self.sync_once()
+                except Exception as sync_err:
+                    self._log.warning(
+                        f"model_registry: re-sync after watch failure also failed error={sync_err}"
+                    )
+
+    def _handle_delete(self, key: str) -> None:
+        if key.startswith(MANIFESTS_PREFIX):
+            rest = key[len(MANIFESTS_PREFIX):]
+            model_ref, _, version_id = rest.partition("/")
+            self._manifests.pop((model_ref, version_id), None)
+        elif key.startswith(ACTIVE_PREFIX):
+            model_ref = key[len(ACTIVE_PREFIX):]
+            self._active.pop(model_ref, None)
+
+    def resolve(self, model_ref: str) -> str:
+        """Hot-path lookup: pure in-memory dict reads, no I/O. Raises
+        ManifestNotFound (typed, caught explicitly at the call site,
+        mapped to a clean gRPC status) rather than ever returning a
+        placeholder or raising something uncaught."""
+        version_id = self._active.get(model_ref)
+        if version_id is None:
+            raise ManifestNotFound(model_ref)
+        m = self._manifests.get((model_ref, version_id))
+        if m is None:
+            # The pointer exists but its target either never arrived or
+            # never verified — same clean failure, not a crash.
+            raise ManifestNotFound(model_ref)
+        try:
+            return _parse_worker_ref(m.spec_json)
+        except (json.JSONDecodeError, ValueError) as e:
+            self._log.warning(
+                f"model_registry: manifest content unusable model_ref={model_ref} "
+                f"version_id={version_id} error={e}"
+            )
+            raise ManifestNotFound(model_ref) from e
