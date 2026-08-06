@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -40,6 +41,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/onezox/OneZox/services/control-plane/internal/etcdclient"
 	pb "github.com/onezox/OneZox/services/control-plane/internal/pb/control/v1"
 	"github.com/onezox/OneZox/services/control-plane/internal/providertoken"
 	"github.com/onezox/OneZox/services/control-plane/internal/registry"
@@ -182,7 +184,16 @@ func main() {
 	vaultAddr := envOr("VAULT_ADDR", "http://vault-active.default.svc.cluster.local:8200")
 	vaultK8sRole := envOr("VAULT_K8S_ROLE", "control-plane")
 	vaultClient := vaultclient.New(vaultAddr, vaultK8sRole)
-	registrySvc := registry.NewService(registry.NewCockroachStore(db), vaultClient, log)
+
+	etcdEndpoints := strings.Split(envOr("ETCD_ENDPOINTS", "http://etcd.default.svc.cluster.local:2379"), ",")
+	etcdCli, err := etcdclient.New(etcdEndpoints)
+	if err != nil {
+		log.Error("failed to create etcd client", "error", err, "endpoints", etcdEndpoints)
+		os.Exit(1)
+	}
+	defer func() { _ = etcdCli.Close() }()
+
+	registrySvc := registry.NewService(registry.NewCockroachStore(db), vaultClient, etcdCli, log)
 
 	// Genuinely short — separate from and much shorter than Vault's own
 	// K8s-auth login TTL (15m, scripts/vault-setup-control-plane.sh).

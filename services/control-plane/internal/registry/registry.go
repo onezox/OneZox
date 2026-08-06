@@ -49,21 +49,34 @@ type Entry struct {
 // because the version_id must be part of what gets signed, before the row
 // exists.
 type Store interface {
-	InsertManifest(ctx context.Context, versionID, modelRef, specJSON, signature, createdBy string) error
+	InsertManifest(ctx context.Context, versionID, modelRef, specJSON, signature, createdBy string, createdAt time.Time) error
 	SetActive(ctx context.Context, modelRef, versionID string) error
 	GetManifestByVersion(ctx context.Context, versionID string) (*Manifest, error)
 	GetActiveManifest(ctx context.Context, modelRef string) (*Manifest, error)
 	ListActive(ctx context.Context) ([]Entry, error)
 }
 
-type Service struct {
-	store  Store
-	signer vaultclient.Signer
-	log    *slog.Logger
+// Publisher distributes a registered manifest to etcd — the mechanism
+// edge-gateway/data-plane's own caches watch (Step Q/R). CockroachDB
+// (Store) is the source of truth; etcd is a distribution layer, so a
+// publish failure here fails RegisterModelManifest outright (below)
+// rather than silently leaving a "registered" manifest nothing ever
+// actually distributes — same "fail loud, not silently incomplete"
+// discipline as this codebase's other boot-time/write-path guards.
+type Publisher interface {
+	PublishManifest(ctx context.Context, versionID, modelRef, specJSON, signature, createdBy, createdAt, status string) error
+	PublishActive(ctx context.Context, modelRef, versionID string) error
 }
 
-func NewService(store Store, signer vaultclient.Signer, log *slog.Logger) *Service {
-	return &Service{store: store, signer: signer, log: log}
+type Service struct {
+	store     Store
+	signer    vaultclient.Signer
+	publisher Publisher
+	log       *slog.Logger
+}
+
+func NewService(store Store, signer vaultclient.Signer, publisher Publisher, log *slog.Logger) *Service {
+	return &Service{store: store, signer: signer, publisher: publisher, log: log}
 }
 
 // signedPayload is what actually gets signed/verified — binding
@@ -75,13 +88,31 @@ func signedPayload(versionID, modelRef, specJSON string) []byte {
 	return []byte(versionID + "|" + modelRef + "|" + specJSON)
 }
 
+// manifestStatus is the only status value Phase-04 defines — no status
+// transitions exist yet, so this is a literal, not read back from the DB
+// default (data/migrations/0008's own DEFAULT 'published'). Kept in sync
+// with that default manually; a future phase adding real status
+// transitions needs to revisit both.
+const manifestStatus = "published"
+
 // RegisterModelManifest signs spec_json (Step E), writes the immutable
-// model_manifest row, and activates it (model_active) — matching Phase-04.txt's
-// own INTERNAL COMMUNICATION FLOW: "validate + sign -> write model_manifest
-// (immutable) -> set model_active -> publish to etcd" (etcd publish is
-// Step R, not here). Every registration activates immediately: Phase-04
-// has no staged/canary "publish but don't activate" concept — that's
-// Phase-05's rollout UX, out of this phase's scope.
+// model_manifest row, activates it (model_active), and publishes both to
+// etcd (Step Q) — matching Phase-04.txt's own INTERNAL COMMUNICATION FLOW:
+// "validate + sign -> write model_manifest (immutable) -> set model_active
+// -> publish to etcd -> edge + data plane update cached manifest". Every
+// registration activates immediately: Phase-04 has no staged/canary
+// "publish but don't activate" concept — that's Phase-05's rollout UX,
+// out of this phase's scope.
+//
+// version_id AND created_at are both generated here in application code,
+// not left to the DB's own defaults (gen_random_uuid()/now()) — both need
+// to be known values before the etcd envelope can be published without an
+// extra read-back round-trip, and created_at in particular must match
+// EXACTLY between the CockroachDB row and what data-plane's independent
+// verifier sees over etcd (any drift would just be cosmetic here since
+// created_at isn't part of the signed payload, but keeping the two
+// genuinely identical avoids a confusing "same version_id, different
+// created_at" support question later).
 func (s *Service) RegisterModelManifest(ctx context.Context, modelRef, specJSON, createdBy string) (string, error) {
 	// spec_json is a plain STRING column (data/migrations/0013), not JSONB
 	// — CockroachDB's JSONB type reformats input text on storage (e.g.
@@ -95,18 +126,30 @@ func (s *Service) RegisterModelManifest(ctx context.Context, modelRef, specJSON,
 	}
 
 	versionID := uuid.NewString()
+	createdAt := time.Now().UTC()
 
 	signature, err := s.signer.Sign(ctx, SigningKeyName, signedPayload(versionID, modelRef, specJSON))
 	if err != nil {
 		return "", fmt.Errorf("signing manifest: %w", err)
 	}
 
-	if err := s.store.InsertManifest(ctx, versionID, modelRef, specJSON, signature, createdBy); err != nil {
+	if err := s.store.InsertManifest(ctx, versionID, modelRef, specJSON, signature, createdBy, createdAt); err != nil {
 		return "", fmt.Errorf("inserting manifest: %w", err)
 	}
 
 	if err := s.store.SetActive(ctx, modelRef, versionID); err != nil {
 		return "", fmt.Errorf("setting active version: %w", err)
+	}
+
+	// etcd publish failure fails the whole call — see Publisher's own doc
+	// comment for why (a "registered" manifest nothing distributes is
+	// silently broken, not merely incomplete).
+	createdAtStr := createdAt.Format(time.RFC3339)
+	if err := s.publisher.PublishManifest(ctx, versionID, modelRef, specJSON, signature, createdBy, createdAtStr, manifestStatus); err != nil {
+		return "", fmt.Errorf("publishing manifest to etcd: %w", err)
+	}
+	if err := s.publisher.PublishActive(ctx, modelRef, versionID); err != nil {
+		return "", fmt.Errorf("publishing active pointer to etcd: %w", err)
 	}
 
 	s.log.Info("registered model manifest", "model_ref", modelRef, "version_id", versionID, "created_by", createdBy)

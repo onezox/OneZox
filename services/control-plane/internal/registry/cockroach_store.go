@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 )
 
 // CockroachStore is the real Store implementation, backed by
@@ -21,11 +22,11 @@ func NewCockroachStore(db *sql.DB) *CockroachStore {
 	return &CockroachStore{db: db}
 }
 
-func (c *CockroachStore) InsertManifest(ctx context.Context, versionID, modelRef, specJSON, signature, createdBy string) error {
+func (c *CockroachStore) InsertManifest(ctx context.Context, versionID, modelRef, specJSON, signature, createdBy string, createdAt time.Time) error {
 	_, err := c.db.ExecContext(ctx, `
-		INSERT INTO model_manifest (version_id, model_ref, spec_json, signature, created_by)
-		VALUES ($1, $2, $3, $4, $5)
-	`, versionID, modelRef, specJSON, signature, createdBy)
+		INSERT INTO model_manifest (version_id, model_ref, spec_json, signature, created_by, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, versionID, modelRef, specJSON, signature, createdBy, createdAt)
 	return err
 }
 

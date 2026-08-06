@@ -24,7 +24,7 @@ func NewFakeStore() *FakeStore {
 	}
 }
 
-func (f *FakeStore) InsertManifest(ctx context.Context, versionID, modelRef, specJSON, signature, createdBy string) error {
+func (f *FakeStore) InsertManifest(ctx context.Context, versionID, modelRef, specJSON, signature, createdBy string, createdAt time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, exists := f.manifests[versionID]; exists {
@@ -36,7 +36,7 @@ func (f *FakeStore) InsertManifest(ctx context.Context, versionID, modelRef, spe
 		SpecJSON:  specJSON,
 		Signature: signature,
 		CreatedBy: createdBy,
-		CreatedAt: time.Now(),
+		CreatedAt: createdAt,
 		Status:    "published",
 	}
 	return nil
@@ -131,4 +131,55 @@ func (f *FakeSigner) Verify(ctx context.Context, keyName string, input []byte, s
 		return false, err
 	}
 	return hmac.Equal([]byte(expected), []byte(signature)), nil
+}
+
+// PublishedManifest is what FakePublisher records — enough to assert on
+// in tests (e.g. "was this exact version_id ever published, with this
+// exact signature") without needing a real etcd.
+type PublishedManifest struct {
+	VersionID string
+	ModelRef  string
+	SpecJSON  string
+	Signature string
+	CreatedBy string
+	CreatedAt string
+	Status    string
+}
+
+// FakePublisher is an in-memory Publisher for unit tests — no etcd
+// needed. Err, if set, makes both Publish methods fail, for testing
+// RegisterModelManifest's own "etcd publish failure fails the whole call"
+// behavior.
+type FakePublisher struct {
+	mu        sync.Mutex
+	Manifests []PublishedManifest
+	Active    map[string]string // model_ref -> version_id
+	Err       error
+}
+
+func NewFakePublisher() *FakePublisher {
+	return &FakePublisher{Active: make(map[string]string)}
+}
+
+func (f *FakePublisher) PublishManifest(ctx context.Context, versionID, modelRef, specJSON, signature, createdBy, createdAt, status string) error {
+	if f.Err != nil {
+		return f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Manifests = append(f.Manifests, PublishedManifest{
+		VersionID: versionID, ModelRef: modelRef, SpecJSON: specJSON,
+		Signature: signature, CreatedBy: createdBy, CreatedAt: createdAt, Status: status,
+	})
+	return nil
+}
+
+func (f *FakePublisher) PublishActive(ctx context.Context, modelRef, versionID string) error {
+	if f.Err != nil {
+		return f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Active[modelRef] = versionID
+	return nil
 }

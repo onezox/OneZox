@@ -6,13 +6,20 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 func testService() (*Service, *FakeStore) {
+	svc, store, _ := testServiceWithPublisher()
+	return svc, store
+}
+
+func testServiceWithPublisher() (*Service, *FakeStore, *FakePublisher) {
 	store := NewFakeStore()
 	signer := NewFakeSigner()
+	publisher := NewFakePublisher()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewService(store, signer, log), store
+	return NewService(store, signer, publisher, log), store, publisher
 }
 
 func TestRegisterAndGetByActiveVersion(t *testing.T) {
@@ -112,6 +119,45 @@ func TestRegisterModelManifestInvalidJSONRejected(t *testing.T) {
 	}
 }
 
+// TestRegisterModelManifestPublishesToEtcd: a successful registration
+// must publish both the manifest and the active pointer — this is what
+// data-plane/edge-gateway's own caches (Step Q/R) actually watch, not
+// CockroachDB directly.
+func TestRegisterModelManifestPublishesToEtcd(t *testing.T) {
+	ctx := context.Background()
+	svc, _, publisher := testServiceWithPublisher()
+
+	versionID, err := svc.RegisterModelManifest(ctx, "openai", `{"provider":"openai"}`, "test-runner")
+	if err != nil {
+		t.Fatalf("RegisterModelManifest: %v", err)
+	}
+
+	if len(publisher.Manifests) != 1 {
+		t.Fatalf("got %d published manifests, want 1", len(publisher.Manifests))
+	}
+	pub := publisher.Manifests[0]
+	if pub.VersionID != versionID || pub.ModelRef != "openai" || pub.SpecJSON != `{"provider":"openai"}` {
+		t.Errorf("published manifest = %+v, want matching version_id/model_ref/spec_json", pub)
+	}
+	if publisher.Active["openai"] != versionID {
+		t.Errorf("published active[openai] = %q, want %q", publisher.Active["openai"], versionID)
+	}
+}
+
+// TestRegisterModelManifestEtcdFailureFailsCall: CockroachDB is the
+// source of truth, but a manifest nothing ever distributes is silently
+// broken — RegisterModelManifest must fail loud, not return success while
+// leaving etcd stale.
+func TestRegisterModelManifestEtcdFailureFailsCall(t *testing.T) {
+	ctx := context.Background()
+	svc, _, publisher := testServiceWithPublisher()
+	publisher.Err = errors.New("etcd unreachable")
+
+	if _, err := svc.RegisterModelManifest(ctx, "openai", `{"provider":"openai"}`, "test-runner"); err == nil {
+		t.Fatal("expected an error when etcd publish fails, got nil")
+	}
+}
+
 func TestGetModelManifestNotFound(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := testService()
@@ -164,7 +210,7 @@ func TestUnsignedManifestRejected(t *testing.T) {
 	ctx := context.Background()
 	svc, store := testService()
 
-	if err := store.InsertManifest(ctx, "unsigned-version", "openai", `{"provider":"openai"}`, "", "direct-sql-bypass"); err != nil {
+	if err := store.InsertManifest(ctx, "unsigned-version", "openai", `{"provider":"openai"}`, "", "direct-sql-bypass", time.Now()); err != nil {
 		t.Fatalf("InsertManifest (unsigned): %v", err)
 	}
 
@@ -181,7 +227,7 @@ func TestGarbageSignatureRejected(t *testing.T) {
 	ctx := context.Background()
 	svc, store := testService()
 
-	if err := store.InsertManifest(ctx, "garbage-sig-version", "openai", `{"provider":"openai"}`, "fake:v1:not-a-real-signature", "direct-sql-bypass"); err != nil {
+	if err := store.InsertManifest(ctx, "garbage-sig-version", "openai", `{"provider":"openai"}`, "fake:v1:not-a-real-signature", "direct-sql-bypass", time.Now()); err != nil {
 		t.Fatalf("InsertManifest (garbage signature): %v", err)
 	}
 
