@@ -49,6 +49,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/onezox/OneZox/services/admin-api/internal/audit"
 	"github.com/onezox/OneZox/services/admin-api/internal/authn"
 	"github.com/onezox/OneZox/services/admin-api/internal/authz"
 	"github.com/onezox/OneZox/services/admin-api/internal/graph"
@@ -63,18 +64,6 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
-}
-
-// server implements pb.AdminServiceServer. Zero method overrides this
-// step — UnimplementedAdminServiceServer alone makes every RPC return
-// codes.Unimplemented, the exact "defined here, wired when consumed"
-// pattern control-plane's own Step D used. Steps H/L/S give each RPC a
-// real body in its own separately-committed step.
-type server struct {
-	pb.UnimplementedAdminServiceServer
-	db      *sql.DB
-	control controlpb.ControlServiceClient
-	log     *slog.Logger
 }
 
 func main() {
@@ -133,6 +122,11 @@ func main() {
 	// gRPC caller and a GraphQL caller are held to the identical check.
 	authnStore := authn.NewCockroachStore(db)
 
+	// Step H: the one audit_log writer, shared by authz's own denial-audit
+	// path (Step G) and every RPC handler's own success/failure audit
+	// (server.go) — one INSERT statement, one place that issues it.
+	auditWriter := audit.NewCockroachWriter(db)
+
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
@@ -145,9 +139,9 @@ func main() {
 	// the order its arguments are given in.
 	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(
 		authn.UnaryInterceptor(authnStore, log),
-		authz.UnaryInterceptor(log),
+		authz.UnaryInterceptor(auditWriter, log),
 	))
-	pb.RegisterAdminServiceServer(grpcServer, &server{db: db, control: controlClient, log: log})
+	pb.RegisterAdminServiceServer(grpcServer, &server{db: db, control: controlClient, audit: auditWriter, log: log})
 
 	go func() {
 		log.Info("admin-api gRPC listening", "port", grpcPort)

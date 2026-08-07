@@ -65,23 +65,62 @@ func TestGetByExplicitVersion(t *testing.T) {
 		t.Fatal("expected distinct version_id per registration, got the same")
 	}
 
-	// Active should be v2 (most recent registration activates immediately).
+	// Active stays v1 — Phase-05's own bootstrap-vs-rollout rule
+	// (registry.go's RegisterModelManifest doc comment): only a model_ref's
+	// FIRST registration auto-activates. v2 does not, even though it's the
+	// most recent — a real rollout (Step L) is the only thing that could
+	// promote it from here on. See TestSecondRegistrationDoesNotActivate
+	// for this property's own dedicated, explicit test.
 	active, err := svc.GetModelManifest(ctx, "anthropic", "")
 	if err != nil {
 		t.Fatalf("get active: %v", err)
 	}
-	if active.VersionID != v2 {
-		t.Errorf("active version = %q, want %q (most recent)", active.VersionID, v2)
+	if active.VersionID != v1 {
+		t.Errorf("active version = %q, want %q (first registration, unchanged by v2)", active.VersionID, v1)
 	}
 
-	// v1 must still be independently fetchable by its own version_id — a
-	// new version never overwrites or hides the old one, it's a new row.
-	old, err := svc.GetModelManifest(ctx, "anthropic", v1)
+	// v2 must still be independently fetchable by its own version_id even
+	// though it never activated — a new version never overwrites or hides
+	// the old one, it's a new row, signed and stored regardless of
+	// activation state.
+	got2, err := svc.GetModelManifest(ctx, "anthropic", v2)
 	if err != nil {
-		t.Fatalf("get v1 explicitly: %v", err)
+		t.Fatalf("get v2 explicitly: %v", err)
 	}
-	if old.SpecJSON != `{"v":1}` {
-		t.Errorf("v1 spec_json = %q, want {\"v\":1}", old.SpecJSON)
+	if got2.SpecJSON != `{"v":2}` {
+		t.Errorf("v2 spec_json = %q, want {\"v\":2}", got2.SpecJSON)
+	}
+}
+
+// TestSecondRegistrationDoesNotActivate is the EC4-relevant property this
+// step's own investigation surfaced, tested directly and explicitly (not
+// just as a side observation inside TestGetByExplicitVersion): once a
+// model_ref has a live version, publishing a new one must NOT change what
+// real traffic resolves to. Only a rollout's own promotion may do that
+// (Step L) — this is what makes "no path exists to mutate a live model
+// outside signed manifests + rollout" true starting at the publish path
+// itself, not just asserted at the rollout layer.
+func TestSecondRegistrationDoesNotActivate(t *testing.T) {
+	ctx := context.Background()
+	svc, _, publisher := testServiceWithPublisher()
+
+	v1, err := svc.RegisterModelManifest(ctx, "openai", `{"v":1}`, "test-runner")
+	if err != nil {
+		t.Fatalf("register v1: %v", err)
+	}
+	if publisher.Active["openai"] != v1 {
+		t.Fatalf("bootstrap registration must activate: publisher.Active[openai] = %q, want %q", publisher.Active["openai"], v1)
+	}
+
+	if _, err := svc.RegisterModelManifest(ctx, "openai", `{"v":2}`, "test-runner"); err != nil {
+		t.Fatalf("register v2: %v", err)
+	}
+
+	// The etcd active pointer (what data-plane/edge-gateway's own caches
+	// actually resolve requests against, Phase-04 Step Q/R) must be
+	// UNCHANGED — still v1, never touched by v2's own publish.
+	if publisher.Active["openai"] != v1 {
+		t.Errorf("published active[openai] changed to %q after a second, non-bootstrap registration — want unchanged %q", publisher.Active["openai"], v1)
 	}
 }
 

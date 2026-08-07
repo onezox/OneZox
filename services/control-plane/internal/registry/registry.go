@@ -54,6 +54,13 @@ type Store interface {
 	GetManifestByVersion(ctx context.Context, versionID string) (*Manifest, error)
 	GetActiveManifest(ctx context.Context, modelRef string) (*Manifest, error)
 	ListActive(ctx context.Context) ([]Entry, error)
+	// HasActiveVersion reports whether model_ref already has ANY active
+	// version — Phase-05's own bootstrap-vs-rollout distinction (see
+	// RegisterModelManifest's doc comment). Deliberately not
+	// GetActiveManifest reused for this: that method also re-verifies a
+	// signature, work this existence-only check has no reason to do or
+	// depend on succeeding.
+	HasActiveVersion(ctx context.Context, modelRef string) (bool, error)
 }
 
 // Publisher distributes a registered manifest to etcd — the mechanism
@@ -96,13 +103,25 @@ func signedPayload(versionID, modelRef, specJSON string) []byte {
 const manifestStatus = "published"
 
 // RegisterModelManifest signs spec_json (Step E), writes the immutable
-// model_manifest row, activates it (model_active), and publishes both to
-// etcd (Step Q) — matching Phase-04.txt's own INTERNAL COMMUNICATION FLOW:
-// "validate + sign -> write model_manifest (immutable) -> set model_active
-// -> publish to etcd -> edge + data plane update cached manifest". Every
-// registration activates immediately: Phase-04 has no staged/canary
-// "publish but don't activate" concept — that's Phase-05's rollout UX,
-// out of this phase's scope.
+// model_manifest row, and publishes it to etcd (Step Q) — matching
+// Phase-04.txt's own INTERNAL COMMUNICATION FLOW: "validate + sign ->
+// write model_manifest (immutable) -> ... -> publish to etcd -> edge +
+// data plane update cached manifest".
+//
+// Activation (model_active) is now conditional — the Phase-05 change this
+// method's own P04-era comment anticipated ("Phase-04 has no staged/
+// canary 'publish but don't activate' concept — that's Phase-05's rollout
+// UX"): a model_ref with NO existing active version activates immediately
+// on registration (the bootstrap case — there is no live traffic to
+// protect, exactly what registering each of the 5 real providers for the
+// first time needed and got in Phase-04's own Step T). A model_ref that
+// ALREADY has an active version does NOT activate on publish anymore —
+// the new version is signed, stored, and independently fetchable by its
+// own version_id, but stays inert until Phase-05's rollout module (Step
+// L) promotes it. This is what makes EC4's "no path exists to mutate a
+// live model outside signed manifests + rollout" literally true: from
+// this phase forward, publishing alone never changes what's live for an
+// already-active model_ref — only a real rollout's own promotion does.
 //
 // version_id AND created_at are both generated here in application code,
 // not left to the DB's own defaults (gen_random_uuid()/now()) — both need
@@ -137,10 +156,6 @@ func (s *Service) RegisterModelManifest(ctx context.Context, modelRef, specJSON,
 		return "", fmt.Errorf("inserting manifest: %w", err)
 	}
 
-	if err := s.store.SetActive(ctx, modelRef, versionID); err != nil {
-		return "", fmt.Errorf("setting active version: %w", err)
-	}
-
 	// etcd publish failure fails the whole call — see Publisher's own doc
 	// comment for why (a "registered" manifest nothing distributes is
 	// silently broken, not merely incomplete).
@@ -148,11 +163,26 @@ func (s *Service) RegisterModelManifest(ctx context.Context, modelRef, specJSON,
 	if err := s.publisher.PublishManifest(ctx, versionID, modelRef, specJSON, signature, createdBy, createdAtStr, manifestStatus); err != nil {
 		return "", fmt.Errorf("publishing manifest to etcd: %w", err)
 	}
+
+	hasActive, err := s.store.HasActiveVersion(ctx, modelRef)
+	if err != nil {
+		return "", fmt.Errorf("checking existing active version: %w", err)
+	}
+	if hasActive {
+		s.log.Info("registered model manifest (not activated: model_ref already has a live version; a rollout must promote it)",
+			"model_ref", modelRef, "version_id", versionID, "created_by", createdBy)
+		return versionID, nil
+	}
+
+	if err := s.store.SetActive(ctx, modelRef, versionID); err != nil {
+		return "", fmt.Errorf("setting active version: %w", err)
+	}
 	if err := s.publisher.PublishActive(ctx, modelRef, versionID); err != nil {
 		return "", fmt.Errorf("publishing active pointer to etcd: %w", err)
 	}
 
-	s.log.Info("registered model manifest", "model_ref", modelRef, "version_id", versionID, "created_by", createdBy)
+	s.log.Info("registered model manifest (activated: first version for this model_ref)",
+		"model_ref", modelRef, "version_id", versionID, "created_by", createdBy)
 	return versionID, nil
 }
 

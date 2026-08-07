@@ -70,6 +70,13 @@ func (f *FakeStore) GetActiveManifest(ctx context.Context, modelRef string) (*Ma
 	return f.GetManifestByVersion(ctx, versionID)
 }
 
+func (f *FakeStore) HasActiveVersion(ctx context.Context, modelRef string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.active[modelRef]
+	return ok, nil
+}
+
 func (f *FakeStore) ListActive(ctx context.Context) ([]Entry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

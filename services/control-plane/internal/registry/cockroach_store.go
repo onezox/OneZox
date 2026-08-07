@@ -70,6 +70,14 @@ func (c *CockroachStore) GetActiveManifest(ctx context.Context, modelRef string)
 	return scanManifest(row)
 }
 
+func (c *CockroachStore) HasActiveVersion(ctx context.Context, modelRef string) (bool, error) {
+	var exists bool
+	err := c.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM model_active WHERE model_ref = $1)`, modelRef,
+	).Scan(&exists)
+	return exists, err
+}
+
 func (c *CockroachStore) ListActive(ctx context.Context) ([]Entry, error) {
 	rows, err := c.db.QueryContext(ctx, `SELECT model_ref, active_version_id FROM model_active ORDER BY model_ref`)
 	if err != nil {
