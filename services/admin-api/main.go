@@ -49,6 +49,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/onezox/OneZox/services/admin-api/internal/authn"
 	"github.com/onezox/OneZox/services/admin-api/internal/graph"
 	pb "github.com/onezox/OneZox/services/admin-api/internal/pb/admin/v1"
 	controlpb "github.com/onezox/OneZox/services/admin-api/internal/pb/control/v1"
@@ -124,13 +125,20 @@ func main() {
 	}
 	cancel()
 
+	// Step F: authn.Store is admin_user only (migration 0018's own
+	// SELECT-only grant) — structurally disjoint from api_keys, see
+	// authn's own package doc for the full reasoning. Both transports
+	// below share this one Store instance and Authenticate call, so a
+	// gRPC caller and a GraphQL caller are held to the identical check.
+	authnStore := authn.NewCockroachStore(db)
+
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
 		log.Error("failed to listen for gRPC", "error", err, "port", grpcPort)
 		os.Exit(1)
 	}
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(authn.UnaryInterceptor(authnStore, log)))
 	pb.RegisterAdminServiceServer(grpcServer, &server{db: db, control: controlClient, log: log})
 
 	go func() {
@@ -147,8 +155,7 @@ func main() {
 	// that into a clean per-field GraphQL error response, not a crashed
 	// process, the same "return Unimplemented cleanly" property the gRPC
 	// side gets for free from UnimplementedAdminServiceServer. Real
-	// resolver bodies land in their own later steps (H onward), once
-	// Step F/G's auth+RBAC middleware exists for them to depend on.
+	// resolver bodies land in their own later steps (H onward).
 	//
 	// No playground mounted: admin-api's only real client is admin-panel's
 	// own RSC server components (Step D), never a human typing ad hoc
@@ -158,7 +165,10 @@ func main() {
 	graphqlSrv := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: &graph.Resolver{}}))
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /graphql", graphqlSrv)
+	// Step F: every /graphql request requires a verified admin credential
+	// before it ever reaches a resolver — admin.graphql has no anonymous
+	// field, so this wrapper is unconditional, not per-resolver.
+	mux.Handle("POST /graphql", authn.HTTPMiddleware(authnStore, log, graphqlSrv))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
