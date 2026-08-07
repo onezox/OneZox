@@ -30,6 +30,15 @@ async-stream = "0.3"
 futures-util = "0.3"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# Phase-04 Step R: edge-gateway's own etcd-fed model_registry cache +
+# independent Vault Transit verification. etcd-client reuses this crate's
+# existing tonic 0.14/prost 0.14 (confirmed via a scratch build before
+# adding — no duplicate tonic version in the dependency graph). reqwest
+# was previously only a transitive dependency of opentelemetry-otlp, not
+# usable as a general HTTP client without adding it directly.
+etcd-client = "0.19"
+reqwest = { version = "0.13", features = ["json"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

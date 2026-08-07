@@ -287,6 +287,7 @@ mod tests {
             admission_soft_limit: GENEROUS_ADMISSION_LIMIT,
             admission_hard_limit: GENEROUS_ADMISSION_LIMIT,
             dataplane_channel: unreachable_dataplane_channel(),
+            registry_cache: Arc::new(crate::model_registry::empty_cache_for_test()),
         };
         (router().with_state(state), org_id)
     }
@@ -526,6 +527,7 @@ mod tests {
             admission_soft_limit: GENEROUS_ADMISSION_LIMIT,
             admission_hard_limit: GENEROUS_ADMISSION_LIMIT,
             dataplane_channel: unreachable_dataplane_channel(),
+            registry_cache: Arc::new(crate::model_registry::empty_cache_for_test()),
         };
         let app = router().with_state(state);
 
@@ -575,6 +577,7 @@ mod tests {
             admission_soft_limit: 0,
             admission_hard_limit: 1,
             dataplane_channel: unreachable_dataplane_channel(),
+            registry_cache: Arc::new(crate::model_registry::empty_cache_for_test()),
         };
         let app = router().with_state(state);
 

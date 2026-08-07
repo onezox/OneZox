@@ -13,12 +13,14 @@ mod dataplane_client;
 mod ingress;
 mod meter;
 mod metrics;
+mod model_registry;
 mod normalize;
 mod pb;
 mod pipeline;
 mod ratelimit;
 mod state;
 mod stream;
+mod vault_client;
 
 use std::sync::Arc;
 
@@ -152,6 +154,36 @@ async fn main() {
     let dataplane_channel = dataplane_client::connect_lazy(&dataplane_endpoint)
         .expect("invalid DATAPLANE_STUB_ENDPOINT");
 
+    // Phase-04 Step R: edge-gateway's own etcd-fed model_registry cache,
+    // independently Vault-verified — mirrors data-plane's own boot
+    // sequence (services/data-plane/main.py's init_model_registry()): a
+    // BLOCKING connect + sync_once() before boot completes (same "prove
+    // it before yielding readiness" discipline every other dependency
+    // here already uses), then a background watch task spawned only
+    // after that initial sync succeeds.
+    let vault_addr = env("VAULT_ADDR", "http://vault-active.default.svc.cluster.local:8200");
+    let vault_k8s_role = env("VAULT_K8S_ROLE", "edge-gateway");
+    let http_client = reqwest::Client::new();
+    let vault = vault_client::VaultClient::new(vault_addr, vault_k8s_role, http_client);
+
+    let etcd_endpoint = env("ETCD_ENDPOINT", "etcd.default.svc.cluster.local:2379");
+    let etcd = etcd_client::Client::connect([etcd_endpoint], None)
+        .await
+        .expect("failed to connect to etcd");
+    let etcd_reader = Arc::new(model_registry::EtcdClientReader::new(etcd));
+
+    let registry_cache = Arc::new(model_registry::Cache::new(
+        etcd_reader as Arc<dyn model_registry::EtcdReader>,
+        Arc::new(vault) as Arc<dyn model_registry::SignatureVerifier>,
+    ));
+    registry_cache.sync_once().await.expect("model_registry: initial sync failed");
+    tracing::info!("model_registry: initial sync complete");
+
+    let watch_cache = Arc::clone(&registry_cache);
+    tokio::spawn(async move {
+        watch_cache.watch_forever().await;
+    });
+
     let state = AppState {
         api_key_store: Arc::new(CockroachApiKeyStore::new(pool.clone())),
         jwt_secret: Arc::from(jwt_secret.into_bytes().into_boxed_slice()),
@@ -161,6 +193,7 @@ async fn main() {
         admission_soft_limit,
         admission_hard_limit,
         dataplane_channel,
+        registry_cache,
     };
 
     let app = ingress::router()

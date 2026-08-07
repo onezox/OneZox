@@ -6,6 +6,23 @@
 # ciliumnetworkpolicy.yaml) in place — no gap where edge-gateway lacks a
 # mesh identity. Deployed via the onezox-stubs Argo CD Application, not
 # kubectl.
+#
+# Phase-04 Step R: edge-gateway's first real etcd-watch integration — an
+# etcd-fed model_registry cache with its own independent Vault Transit
+# verification (mirroring data-plane's own Step Q). Dedicated
+# ServiceAccount added (edge-gateway had none before — ran under the
+# implicit "default" SA) because Vault's Kubernetes auth role
+# (scripts/vault-setup-edge-gateway.sh) binds specifically to it. No new
+# CiliumNetworkPolicy egress rule needed: edge-gateway has never had an
+# egress allow-list at all (deliberately deferred, matching data-plane's
+# own still-open egress posture as of Step Q) — its egress stays
+# unrestricted, so etcd/Vault reachability needs no new Cilium config.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: edge-gateway
+  namespace: default
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,10 +40,18 @@ spec:
       labels:
         app: edge-gateway
     spec:
+      serviceAccountName: edge-gateway
       containers:
         - name: edge-gateway
           image: onezox/edge-gateway:ccf83a5
           imagePullPolicy: IfNotPresent
+          env:
+            - name: ETCD_ENDPOINT
+              value: "etcd.default.svc.cluster.local:2379"
+            - name: VAULT_ADDR
+              value: "http://vault-active.default.svc.cluster.local:8200"
+            - name: VAULT_K8S_ROLE
+              value: "edge-gateway"
           ports:
             - containerPort: 8080
               name: http

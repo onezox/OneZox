@@ -27,4 +27,8 @@ pub struct AppState {
     /// Send+Sync+Clone (see dataplane_client.rs's doc comment), so it
     /// doesn't need an `Arc` wrapper here.
     pub dataplane_channel: Channel,
+    /// Phase-04 Step R: etcd-fed, independently Vault-verified model
+    /// manifest cache. `Arc` because it's shared with the background
+    /// watch_forever() task spawned in main.rs, not just handlers.
+    pub registry_cache: Arc<crate::model_registry::Cache>,
 }
