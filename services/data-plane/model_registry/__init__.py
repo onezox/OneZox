@@ -77,6 +77,18 @@ class Manifest:
 
 
 @dataclass(frozen=True)
+class ResolvedWorker:
+    """resolve()'s own return type (Step N) — worker_ref alone (Phase-04/
+    K's own shape) isn't enough once a canary can be in progress: the
+    caller needs is_canary too, to label the per-request outcome metric
+    (data_plane_submit_total{model_ref,canary,status}) with the SAME
+    routing decision resolve() itself just made, not a second guess."""
+
+    worker_ref: str
+    is_canary: bool
+
+
+@dataclass(frozen=True)
 class ActivePointer:
     """Phase-05: /onezox/active/{model_ref}'s own shape, grown from a bare
     version_id string (Phase-04) into this small envelope. canary="" means
@@ -113,7 +125,7 @@ def _parse_active_envelope(value: bytes) -> ActivePointer:
         return ActivePointer(stable=value.decode())
 
 
-def _pick_version(pointer: ActivePointer, request_id: str) -> str:
+def _pick_version(pointer: ActivePointer, request_id: str) -> tuple[str, bool]:
     """Deterministic weighted split: hash(request_id) mod 100 against the
     canary_percent threshold. canary_percent=0 (the Phase-04 default,
     still true for every model_ref no rollout has ever touched) always
@@ -121,12 +133,22 @@ def _pick_version(pointer: ActivePointer, request_id: str) -> str:
     envelope existed at all. Hashing request_id (not a random draw) means
     a given request's own canary/stable placement is reproducible if
     ever needed for debugging, though in practice each request_id is
-    unique anyway."""
+    unique anyway.
+
+    Returns (version_id, is_canary) — Step N's own addition: the caller
+    needs to know WHICH path was actually taken to label the per-request
+    outcome metric correctly (data_plane_submit_total's own canary=
+    label). Returning this here, at the one place the decision is
+    actually made, is what keeps the label genuinely tied to the real
+    routing decision rather than a second, possibly-drifting guess made
+    later at the metric call site."""
     if pointer.canary_percent <= 0 or not pointer.canary:
-        return pointer.stable
+        return pointer.stable, False
     digest = hashlib.sha256(request_id.encode()).hexdigest()
     bucket = int(digest, 16) % 100
-    return pointer.canary if bucket < pointer.canary_percent else pointer.stable
+    if bucket < pointer.canary_percent:
+        return pointer.canary, True
+    return pointer.stable, False
 
 
 class SignatureVerifier(Protocol):
@@ -294,7 +316,7 @@ class Cache:
             model_ref = key[len(ACTIVE_PREFIX):]
             self._active.pop(model_ref, None)
 
-    def resolve(self, model_ref: str, request_id: str) -> str:
+    def resolve(self, model_ref: str, request_id: str) -> ResolvedWorker:
         """Hot-path lookup: pure in-memory dict reads plus one SHA256 hash
         of request_id — still no I/O, no network call. Raises
         ManifestNotFound (typed, caught explicitly at the call site,
@@ -307,11 +329,14 @@ class Cache:
         (canary_percent > 0). When canary_percent is 0 (every model_ref
         Phase-04 ever touched, and every model_ref no rollout has ever
         run against), _pick_version always returns stable — this resolves
-        byte-for-byte identically to Phase-04's own behavior."""
+        byte-for-byte identically to Phase-04's own behavior.
+
+        Returns ResolvedWorker (Step N), not a bare string — the caller
+        needs is_canary to label data_plane_submit_total correctly."""
         pointer = self._active.get(model_ref)
         if pointer is None:
             raise ManifestNotFound(model_ref)
-        version_id = _pick_version(pointer, request_id)
+        version_id, is_canary = _pick_version(pointer, request_id)
         m = self._manifests.get((model_ref, version_id))
         if m is None:
             # The pointer exists but its target either never arrived or
@@ -323,10 +348,11 @@ class Cache:
             # successful response instead of surfacing it).
             raise ManifestNotFound(model_ref)
         try:
-            return _parse_worker_ref(m.spec_json)
+            worker_ref = _parse_worker_ref(m.spec_json)
         except (json.JSONDecodeError, ValueError) as e:
             self._log.warning(
                 f"model_registry: manifest content unusable model_ref={model_ref} "
                 f"version_id={version_id} error={e}"
             )
             raise ManifestNotFound(model_ref) from e
+        return ResolvedWorker(worker_ref=worker_ref, is_canary=is_canary)

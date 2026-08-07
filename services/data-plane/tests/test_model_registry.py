@@ -115,7 +115,9 @@ def test_resolve_valid_manifest() -> None:
     cache = Cache(etcd, verifier, _null_logger())
     asyncio.run(cache.sync_once())
 
-    assert cache.resolve("openai", "req-1") == "openai:gpt-4o-mini"
+    resolved = cache.resolve("openai", "req-1")
+    assert resolved.worker_ref == "openai:gpt-4o-mini"
+    assert resolved.is_canary is False
 
 
 def test_resolve_unknown_model_ref_raises_typed_error() -> None:
@@ -234,7 +236,7 @@ def test_last_known_good_survives_a_bad_update() -> None:
 
     cache = Cache(etcd, verifier, _null_logger())
     asyncio.run(cache.sync_once())
-    assert cache.resolve("openai", "req-1") == "openai:gpt-4o-mini"
+    assert cache.resolve("openai", "req-1").worker_ref == "openai:gpt-4o-mini"
 
     # Simulate a bad direct write to etcd overwriting the SAME key with
     # tampered content (empty signature this time).
@@ -248,7 +250,7 @@ def test_last_known_good_survives_a_bad_update() -> None:
     asyncio.run(cache._handle_manifest_kv(model_ref, version_id, etcd.store[manifest_key.encode()]))
 
     # Still resolves — last-known-good, the bad update never took effect.
-    assert cache.resolve("openai", "req-1") == "openai:gpt-4o-mini"
+    assert cache.resolve("openai", "req-1").worker_ref == "openai:gpt-4o-mini"
 
 
 def _put_stable_and_canary(
@@ -305,7 +307,9 @@ def test_bare_string_active_pointer_still_resolves() -> None:
     cache = Cache(etcd, verifier, _null_logger())
     asyncio.run(cache.sync_once())
 
-    assert cache.resolve("openai", "any-request-id") == "openai:gpt-4o-mini"
+    resolved = cache.resolve("openai", "any-request-id")
+    assert resolved.worker_ref == "openai:gpt-4o-mini"
+    assert resolved.is_canary is False
 
 
 def test_zero_canary_percent_always_resolves_stable() -> None:
@@ -326,7 +330,9 @@ def test_zero_canary_percent_always_resolves_stable() -> None:
     asyncio.run(cache.sync_once())
 
     for req_id in ("req-a", "req-b", "req-c", "req-d", "req-e"):
-        assert cache.resolve("openai", req_id) == "openai:gpt-4o-mini"
+        resolved = cache.resolve("openai", req_id)
+        assert resolved.worker_ref == "openai:gpt-4o-mini"
+        assert resolved.is_canary is False
 
 
 def test_canary_percent_100_always_resolves_canary() -> None:
@@ -343,7 +349,9 @@ def test_canary_percent_100_always_resolves_canary() -> None:
     asyncio.run(cache.sync_once())
 
     for req_id in ("req-a", "req-b", "req-c", "req-d", "req-e"):
-        assert cache.resolve("openai", req_id) == "openai:gpt-4o-CANARY"
+        resolved = cache.resolve("openai", req_id)
+        assert resolved.worker_ref == "openai:gpt-4o-CANARY"
+        assert resolved.is_canary is True
 
 
 def test_canary_percent_50_splits_traffic_over_many_requests() -> None:
@@ -366,7 +374,8 @@ def test_canary_percent_50_splits_traffic_over_many_requests() -> None:
     asyncio.run(cache.sync_once())
 
     canary_count = sum(
-        1 for i in range(200) if cache.resolve("openai", f"req-{i}") == "openai:gpt-4o-CANARY"
+        1 for i in range(200)
+        if cache.resolve("openai", f"req-{i}").worker_ref == "openai:gpt-4o-CANARY"
     )
     assert 60 <= canary_count <= 140, (
         f"canary_count={canary_count} out of 200, expected roughly half"

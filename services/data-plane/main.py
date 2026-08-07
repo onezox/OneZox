@@ -134,7 +134,40 @@ trace.set_tracer_provider(provider_tp)
 tracer = trace.get_tracer(SERVICE)
 
 boot_counter = Counter("data_plane_boot_total", "Number of successful boot sequences")
-submit_counter = Counter("data_plane_submit_total", "Number of Submit RPCs served")
+
+# Phase-05 Step N: the SLO signal control-plane's own AnalysisTemplate
+# queries (services/control-plane/internal/analysis/analysisrun.go's own
+# queryFor, committed at Step M ahead of this metric existing) —
+# data_plane_submit_total{model_ref,canary,status}. Labeled, replacing the
+# old unlabeled data_plane_submit_total counter (same metric NAME, so
+# Step M's own already-written PromQL query needs no change; strictly
+# richer than what it replaces since "sum across all labels" reproduces
+# the old plain count exactly).
+#
+# canary/status are not decorative: canary is the SAME is_canary value
+# resolve() itself returned for THIS request (model_registry.ResolvedWorker,
+# Step N) — not re-derived or guessed at the call site — and status is
+# incremented on BOTH the success path and every real-dispatch failure
+# path (provider_unavailable, provider_fallback, provider_stream_error),
+# not success only. A success-only metric would make a regression
+# invisible to the exact AnalysisTemplate this labels feed — the same
+# "success-path-only" gap Phase-01's edge-gateway (Step J3) and Phase-02's
+# provider-gateway (Step N3) both had to retroactively fix for structured
+# LOGGING; this is that same discipline applied to a metric instead.
+submit_outcome_counter = Counter(
+    "data_plane_submit_total",
+    "Submit outcomes by resolved model_ref, canary/stable path, and status",
+    ["model_ref", "canary", "status"],
+)
+
+
+def _record_submit_outcome(model_ref: str, is_canary: bool, status: str) -> None:
+    """The ONE place this metric is ever incremented — every call site
+    below passes the SAME model_ref/is_canary resolve() itself returned
+    for that request, never a re-derived guess."""
+    submit_outcome_counter.labels(
+        model_ref=model_ref, canary="true" if is_canary else "false", status=status
+    ).inc()
 
 pg_pool: asyncpg.Pool | None = None
 redis_client: RedisCluster | None = None
@@ -325,7 +358,7 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                 # default.
                 model_ref = request.model or DEFAULT_MODEL_REF
                 try:
-                    worker_ref = registry_cache.resolve(model_ref, request_id)
+                    resolved = registry_cache.resolve(model_ref, request_id)
                 except model_registry.ManifestNotFound as e:
                     log.info(
                         f"model not found request_id={request_id} org_id={org_id} "
@@ -337,16 +370,24 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                     )
                     await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(e))
                     return
+                # is_canary is fixed at THIS point, from resolve()'s own
+                # decision — never re-derived below. bind_via_provider_health
+                # may still reroute worker_ref to a different provider on
+                # an unhealthy target (a lower-level concern, Step E), but
+                # that does not change which cohort (canary vs stable) this
+                # request belongs to for SLO purposes.
+                is_canary = resolved.is_canary
 
                 try:
                     worker_ref = await place.bind_via_provider_health(
-                        provider_stub, worker_ref
+                        provider_stub, resolved.worker_ref
                     )
                 except place.ProviderUnavailable as e:
                     log.info(
                         f"provider unavailable request_id={request_id} org_id={org_id} "
                         f"reason={e.reason}"
                     )
+                    _record_submit_outcome(model_ref, is_canary, "error")
                     await _finish_request(
                         span, request_id, org_id, "provider_unavailable", start,
                         usage=None, model_ref=None,
@@ -402,7 +443,11 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                     # reading) — no dispatch happened, so unlike the
                     # stream-error branch below, this one stays
                     # model_ref=None too: nothing was attempted, nothing
-                    # to bill.
+                    # to bill. Still a real canary-cohort OUTCOME though
+                    # (the resolved worker_ref was rejected before ever
+                    # streaming) — recorded as "error" for SLO purposes
+                    # even though nothing is billed.
+                    _record_submit_outcome(model_ref, is_canary, "error")
                     await _finish_request(
                         span, request_id, org_id, "provider_fallback", start,
                         usage=None, model_ref=None,
@@ -422,6 +467,7 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                     # which is None/None unless the provider itself
                     # managed to report something before dying), never a
                     # silent zero pretending the call was free.
+                    _record_submit_outcome(model_ref, is_canary, "error")
                     await _finish_request(
                         span, request_id, org_id, "provider_stream_error", start,
                         usage=captured_usage, model_ref=worker_ref,
@@ -430,7 +476,7 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                     return
 
                 await working_memory.delete(redis_client, request_id)
-                submit_counter.inc()
+                _record_submit_outcome(model_ref, is_canary, "ok")
                 await _finish_request(
                     span, request_id, org_id, "ok", start,
                     usage=captured_usage, model_ref=worker_ref,
