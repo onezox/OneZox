@@ -1,0 +1,32 @@
+# Phase-05 Step A — Argo Rollouts controller (Part N.5): the staged-
+# canary state machine + AnalysisTemplate engine driving Model Studio's
+# rollout promotion (1% -> 10% -> 50% -> 100%) with automatic rollback.
+#
+# Official upstream chart (argoproj.github.io/argo-helm, already added as
+# the "argo" repo) — same "verify pullable before committing" discipline
+# Phase-04 Step B applied to Vault's chart after Step A's bitnami/etcd
+# paywall hit. No Bitnami dependency here.
+#
+# Adaptation note (see the Phase-05 plan's Decision 2): this project has no
+# per-model-version Kubernetes workload for Argo Rollouts to natively shift
+# pod traffic toward — a "model" is a config row resolved per-request by
+# data-plane's and edge-gateway's own etcd-fed caches (Phase-04). Argo
+# Rollouts is deployed here for its staged-steps + Prometheus-AnalysisRun
+# state machine only; the actual traffic-affecting write goes through
+# control-plane's own rollout/ module into the same etcd distribution path
+# Phase-04 already built. No TrafficRouting plugin (Istio/SMI/ALB) is
+# configured, since there's no Service-level traffic to shift.
+#
+# Single replica, matching this project's own local-dev convention for
+# every other single-instance controller (provider-fake, etc.) — not HA,
+# this is a kind cluster, not production.
+#
+# dashboard.enabled stays at the chart's own default (false): Phase-05.txt
+# specifies OneZox's own admin-panel as the operator surface for rollout
+# status, not Argo Rollouts' bundled dashboard UI.
+
+controller:
+  replicas: 1
+
+dashboard:
+  enabled: false
