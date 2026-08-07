@@ -44,6 +44,27 @@ func (c *CockroachStore) GetRunningRolloutByModelRef(ctx context.Context, modelR
 	return scanRollout(row)
 }
 
+func (c *CockroachStore) ListRunningRollouts(ctx context.Context) ([]Rollout, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at
+		FROM rollout WHERE status = 'running'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Rollout
+	for rows.Next() {
+		r, err := scanRollout(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
+}
+
 func (c *CockroachStore) GetMostRecentRolloutByModelRef(ctx context.Context, modelRef string) (*Rollout, error) {
 	row := c.db.QueryRowContext(ctx, `
 		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at

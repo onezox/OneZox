@@ -40,7 +40,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 
+	"github.com/onezox/OneZox/services/control-plane/internal/analysis"
 	"github.com/onezox/OneZox/services/control-plane/internal/etcdclient"
 	pb "github.com/onezox/OneZox/services/control-plane/internal/pb/control/v1"
 	"github.com/onezox/OneZox/services/control-plane/internal/providertoken"
@@ -293,6 +296,32 @@ func main() {
 	// — reusing the SAME registry instance every other RPC in this
 	// process uses, not a second connection to the same data.
 	rolloutSvc := rollout.NewService(rollout.NewCockroachStore(db), etcdCli, registrySvc, log)
+
+	// Step M: the in-process reconciler — a plain background goroutine,
+	// no gRPC/HTTP surface of its own (the Phase-05 plan's own Decision 3
+	// refinement: automatic advance/rollback stay network-unreachable).
+	// In-cluster config, not a kubeconfig file — control-plane only ever
+	// runs inside the onezox-dev cluster itself, the same "this is a
+	// hard, boot-time dependency" treatment every other required
+	// connection in this file already gets (DB, etcd).
+	k8sConfig, err := rest.InClusterConfig()
+	if err != nil {
+		log.Error("failed to build in-cluster Kubernetes config", "error", err)
+		os.Exit(1)
+	}
+	dynClient, err := dynamic.NewForConfig(k8sConfig)
+	if err != nil {
+		log.Error("failed to create Kubernetes dynamic client", "error", err)
+		os.Exit(1)
+	}
+	promAddr := envOr("PROMETHEUS_ADDR", "http://prometheus-server.default.svc.cluster.local")
+	analysisNamespace := envOr("ANALYSIS_NAMESPACE", "default")
+	analysisClient := analysis.NewK8sClient(dynClient, analysisNamespace, promAddr)
+	reconciler := analysis.NewReconciler(rolloutSvc, analysisClient, log)
+
+	reconcilerCtx, cancelReconciler := context.WithCancel(context.Background())
+	defer cancelReconciler()
+	go reconciler.Run(reconcilerCtx)
 
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)

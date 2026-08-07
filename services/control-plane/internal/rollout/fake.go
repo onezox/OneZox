@@ -49,6 +49,18 @@ func (f *FakeStore) GetRunningRolloutByModelRef(ctx context.Context, modelRef st
 	return nil, nil
 }
 
+func (f *FakeStore) ListRunningRollouts(ctx context.Context) ([]Rollout, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []Rollout
+	for _, r := range f.rollouts {
+		if r.Status == "running" {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
 func (f *FakeStore) GetMostRecentRolloutByModelRef(ctx context.Context, modelRef string) (*Rollout, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

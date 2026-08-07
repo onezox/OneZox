@@ -106,6 +106,14 @@ type Store interface {
 	GetRollout(ctx context.Context, rolloutID string) (*Rollout, error)
 	GetRunningRolloutByModelRef(ctx context.Context, modelRef string) (*Rollout, error)
 	GetMostRecentRolloutByModelRef(ctx context.Context, modelRef string) (*Rollout, error)
+	// ListRunningRollouts is Step M's own addition — the in-process
+	// reconciler's restart re-attach depends on it: on boot (and on every
+	// poll tick thereafter), it lists EVERY currently-running rollout
+	// from the database itself, not from any in-memory list the process
+	// might have lost across a restart. This is what makes re-attach a
+	// property of the reconcile loop's own normal operation, not a
+	// special-cased "recovery" code path run once at startup.
+	ListRunningRollouts(ctx context.Context) ([]Rollout, error)
 	UpdateRollout(ctx context.Context, rolloutID, stage, status string, endedAt *time.Time) error
 }
 
@@ -210,6 +218,37 @@ func (s *Service) PromoteRollout(ctx context.Context, rolloutID string) (string,
 // always r.StableVersionID (data/migrations/0019).
 func (s *Service) AbortRollout(ctx context.Context, rolloutID string) error {
 	return s.revertCanary(ctx, rolloutID, "aborted")
+}
+
+// AutoAdvance is the in-process reconciler's own trigger (Step M) —
+// called when an AnalysisRun for the current stage reports Successful.
+// Behaviorally IDENTICAL to PromoteRollout (both call the exact same
+// advanceStage): this is a distinct exported name purely so the
+// reconciler's own call site reads correctly ("the automatic path
+// advanced this," not "a human promoted this"), never a second
+// implementation. See the package doc's own "one implementation, two
+// triggers" framing.
+func (s *Service) AutoAdvance(ctx context.Context, rolloutID string) (string, error) {
+	return s.advanceStage(ctx, rolloutID)
+}
+
+// AutoRollback is the in-process reconciler's own trigger — called when
+// an AnalysisRun for the current stage reports Failed/Error. Same
+// revertCanary AbortRollout uses, recorded with status="rolled_back"
+// instead of "aborted" so an operator reading rollout.status (or
+// audit_log — though this path itself is NEVER audited, see the
+// reconciler's own doc comment) can tell "the system caught a regression
+// and reverted" apart from "a human cancelled this."
+func (s *Service) AutoRollback(ctx context.Context, rolloutID string) error {
+	return s.revertCanary(ctx, rolloutID, "rolled_back")
+}
+
+// ListRunningRollouts backs the reconciler's own reconcile-everything
+// pass (Step M) — every rollout currently in status="running", freshly
+// read from the database on every call, never cached across calls or
+// process restarts.
+func (s *Service) ListRunningRollouts(ctx context.Context) ([]Rollout, error) {
+	return s.store.ListRunningRollouts(ctx)
 }
 
 // GetRolloutStatus is read-only — the query-side counterpart within

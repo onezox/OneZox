@@ -25,6 +25,39 @@ metadata:
   name: control-plane
   namespace: default
 ---
+# Phase-05 Step M: RBAC for the in-process reconciler's own AnalysisRun
+# access (internal/analysis/k8s_client.go) — list/get/watch to read
+# status, create to start a new stage's check. Deliberately does NOT
+# grant access to Rollout objects: this project's canary traffic-shifting
+# is Step K's own etcd envelope, not Argo Rollouts' native Rollout
+# resource, so control-plane never needs to touch one. No delete/update
+# either — AnalysisRun objects this process creates are left for Argo
+# Rollouts' own controller and Kubernetes' own garbage collection to
+# manage, not mutated after creation.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: control-plane-analysisrun
+  namespace: default
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["analysisruns"]
+    verbs: ["get", "list", "watch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: control-plane-analysisrun
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: control-plane
+    namespace: default
+roleRef:
+  kind: Role
+  name: control-plane-analysisrun
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -65,6 +98,10 @@ spec:
               value: control-plane
             - name: ETCD_ENDPOINTS
               value: http://etcd.default.svc.cluster.local:2379
+            - name: PROMETHEUS_ADDR
+              value: http://prometheus-server.default.svc.cluster.local
+            - name: ANALYSIS_NAMESPACE
+              value: default
           ports:
             - containerPort: 8080
               name: http
