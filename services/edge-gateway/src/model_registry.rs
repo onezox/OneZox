@@ -58,6 +58,68 @@ pub enum ManifestError {
     NotFound(String),
 }
 
+/// Phase-05: /onezox/active/{model_ref}'s own shape, grown from a bare
+/// version_id string (Phase-04) into this small envelope carrying the
+/// staged-canary state. `canary` is an empty string, not `Option<String>`,
+/// when no canary is in progress — a version_id is a UUID and therefore
+/// never legitimately empty, matching data-plane's own Python
+/// ActivePointer convention exactly (`#[serde(default)]` makes both
+/// fields optional on the wire, so Phase-04's own bare-stable-only
+/// producers — none exist anymore after this step, but nothing here
+/// assumes that — would still deserialize if `canary`/`canary_percent`
+/// were ever omitted from a JSON envelope, as opposed to the value not
+/// being JSON at all, which `parse_active_envelope` below handles
+/// separately).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ActivePointer {
+    stable: String,
+    #[serde(default)]
+    canary: String,
+    #[serde(default)]
+    canary_percent: i32,
+}
+
+/// Backward-compatible with Phase-04's own bare-string wire format — see
+/// data-plane's own `_parse_active_envelope` (services/data-plane/
+/// model_registry/__init__.py) for the full migration reasoning: the 5
+/// real providers' existing active pointers, written by control-plane's
+/// Step T bootstrap, stay bare strings until something calls
+/// PublishActive against them again (Step L onward), by design — no
+/// coordinated one-time etcd rewrite. A value that isn't valid JSON is
+/// treated as a bare stable version_id (canary="", canary_percent=0),
+/// Phase-04's own exact meaning, rather than discarded as malformed.
+fn parse_active_envelope(value: &[u8]) -> ActivePointer {
+    match serde_json::from_slice::<ActivePointer>(value) {
+        Ok(p) => p,
+        Err(_) => ActivePointer {
+            stable: String::from_utf8_lossy(value).into_owned(),
+            canary: String::new(),
+            canary_percent: 0,
+        },
+    }
+}
+
+/// Deterministic weighted split: hash(request_id) mod 100 against the
+/// canary_percent threshold — same algorithm as data-plane's own
+/// `_pick_version` (SHA256 of request_id, not a random draw, so a given
+/// request's own placement is reproducible). canary_percent<=0 or an
+/// empty canary always resolves stable — byte-for-byte the same outcome
+/// every model_ref had before this envelope existed.
+fn pick_version(pointer: &ActivePointer, request_id: &str) -> String {
+    if pointer.canary_percent <= 0 || pointer.canary.is_empty() {
+        return pointer.stable.clone();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(request_id.as_bytes());
+    // Same construction as data-plane's `int(digest, 16) % 100`: take the
+    // digest's own trailing bytes as a big enough integer and reduce mod
+    // 100 — u64 from the last 8 bytes is more than sufficient entropy for
+    // a 0-99 bucket, no need for Python's full-width bigint reduction.
+    let tail = u64::from_be_bytes(digest[digest.len() - 8..].try_into().expect("sha256 digest is 32 bytes"));
+    let bucket = (tail % 100) as i32;
+    if bucket < pointer.canary_percent { pointer.canary.clone() } else { pointer.stable.clone() }
+}
+
 /// MUST match control-plane's own Go signedPayload and data-plane's own
 /// Python signed_payload exactly.
 pub fn signed_payload(version_id: &str, model_ref: &str, spec_json: &str) -> Vec<u8> {
@@ -118,8 +180,8 @@ struct ManifestEnvelope {
 struct CacheState {
     /// (model_ref, version_id) -> manifest, ONLY entries that verified.
     manifests: HashMap<(String, String), ManifestEnvelope>,
-    /// model_ref -> version_id, the active pointer.
-    active: HashMap<String, String>,
+    /// model_ref -> ActivePointer (stable/canary/canary_percent).
+    active: HashMap<String, ActivePointer>,
 }
 
 pub struct Cache {
@@ -189,12 +251,12 @@ impl Cache {
             .insert((model_ref.to_string(), version_id.to_string()), envelope);
     }
 
-    fn handle_active_kv(&self, model_ref: &str, version_id: &str) {
+    fn handle_active_kv(&self, model_ref: &str, value: &[u8]) {
         self.state
             .write()
             .expect("model_registry cache lock poisoned")
             .active
-            .insert(model_ref.to_string(), version_id.to_string());
+            .insert(model_ref.to_string(), parse_active_envelope(value));
     }
 
     fn handle_delete(&self, key: &str) {
@@ -217,7 +279,7 @@ impl Cache {
             }
         } else if let Some(model_ref) = key.strip_prefix(ACTIVE_PREFIX) {
             if !model_ref.is_empty() {
-                self.handle_active_kv(model_ref, &String::from_utf8_lossy(value));
+                self.handle_active_kv(model_ref, value);
             }
         }
     }
@@ -273,18 +335,35 @@ impl Cache {
         }
     }
 
-    /// Hot-path lookup: pure in-memory reads, no I/O. Returns the typed
-    /// ManifestError::NotFound rather than ever panicking or returning a
-    /// placeholder.
-    pub fn resolve(&self, model_ref: &str) -> Result<String, ManifestError> {
+    /// Hot-path lookup: pure in-memory reads plus one SHA256 hash of
+    /// request_id — still no I/O. Returns the typed ManifestError::NotFound
+    /// rather than ever panicking or returning a placeholder.
+    ///
+    /// request_id is a NEW required parameter (Phase-05 Step K), hashed by
+    /// `pick_version` to deterministically split traffic between stable
+    /// and canary when a rollout is in progress. Not currently called from
+    /// any production code path in this service (edge-gateway's own
+    /// GET /v1/models uses `list_active()` instead, Step S) — updated here
+    /// for parity with data-plane's own Cache, which control-plane's
+    /// registry-canary design keeps behaviorally identical across
+    /// languages by convention, not because this exact code path is
+    /// exercised by live traffic yet.
+    ///
+    /// An unverified canary target fails closed to NotFound rather than
+    /// silently falling back to stable — same "fail loud, don't silently
+    /// serve unverified content" principle this module already applies to
+    /// manifest verification itself, extended to the routing decision
+    /// (matches data-plane's own resolve() reasoning exactly).
+    pub fn resolve(&self, model_ref: &str, request_id: &str) -> Result<String, ManifestError> {
         let state = self.state.read().expect("model_registry cache lock poisoned");
-        let version_id = state
+        let pointer = state
             .active
             .get(model_ref)
             .ok_or_else(|| ManifestError::NotFound(model_ref.to_string()))?;
+        let version_id = pick_version(pointer, request_id);
         let m = state
             .manifests
-            .get(&(model_ref.to_string(), version_id.clone()))
+            .get(&(model_ref.to_string(), version_id))
             .ok_or_else(|| ManifestError::NotFound(model_ref.to_string()))?;
 
         let spec: serde_json::Value = serde_json::from_str(&m.spec_json)
@@ -298,21 +377,25 @@ impl Cache {
     /// Hot-path listing: plain in-memory reads, no I/O — Phase-04 Step S's
     /// GET /v1/models, backing off this cache rather than a per-request
     /// control-plane call (same discipline as resolve()). Only includes a
-    /// model_ref whose active pointer's target manifest is ALSO present in
+    /// model_ref whose STABLE pointer's target manifest is ALSO present in
     /// the verified `manifests` map — an active pointer for a manifest
     /// that never verified (or hasn't arrived yet) is not advertised as
     /// available, matching resolve()'s own "only genuinely trusted"
     /// standard: never list a model that would then fail if actually
-    /// invoked.
+    /// invoked. Deliberately keys off `pointer.stable`, never `canary` —
+    /// GET /v1/models lists what's genuinely, unconditionally live, not an
+    /// in-progress canary version that may still be rolled back.
     pub fn list_active(&self) -> Vec<(String, String)> {
         let state = self.state.read().expect("model_registry cache lock poisoned");
         state
             .active
             .iter()
-            .filter(|(model_ref, version_id)| {
-                state.manifests.contains_key(&((*model_ref).clone(), (*version_id).clone()))
+            .filter(|(model_ref, pointer)| {
+                state
+                    .manifests
+                    .contains_key(&((*model_ref).clone(), pointer.stable.clone()))
             })
-            .map(|(model_ref, version_id)| (model_ref.clone(), version_id.clone()))
+            .map(|(model_ref, pointer)| (model_ref.clone(), pointer.stable.clone()))
             .collect()
     }
 }
@@ -620,7 +703,7 @@ mod tests {
         let cache = Cache::new(etcd, Arc::new(FakeVerifier));
         cache.sync_once().await.unwrap();
 
-        assert_eq!(cache.resolve("openai").unwrap(), "openai:gpt-4o-mini");
+        assert_eq!(cache.resolve("openai", "req-1").unwrap(), "openai:gpt-4o-mini");
     }
 
     #[tokio::test]
@@ -628,7 +711,7 @@ mod tests {
         let cache = Cache::new(Arc::new(FakeEtcdReader::default()), Arc::new(FakeVerifier));
         cache.sync_once().await.unwrap();
 
-        assert_eq!(cache.resolve("does-not-exist"), Err(ManifestError::NotFound("does-not-exist".to_string())));
+        assert_eq!(cache.resolve("does-not-exist", "req-1"), Err(ManifestError::NotFound("does-not-exist".to_string())));
     }
 
     #[tokio::test]
@@ -646,7 +729,7 @@ mod tests {
         let cache = Cache::new(etcd, Arc::new(FakeVerifier));
         cache.sync_once().await.unwrap();
 
-        assert!(cache.resolve("openai").is_err(), "tampered manifest must never resolve");
+        assert!(cache.resolve("openai", "req-1").is_err(), "tampered manifest must never resolve");
     }
 
     #[tokio::test]
@@ -658,7 +741,7 @@ mod tests {
         let cache = Cache::new(etcd, Arc::new(FakeVerifier));
         cache.sync_once().await.unwrap();
 
-        assert!(cache.resolve("openai").is_err(), "unsigned manifest must never resolve");
+        assert!(cache.resolve("openai", "req-1").is_err(), "unsigned manifest must never resolve");
     }
 
     #[tokio::test]
@@ -676,7 +759,7 @@ mod tests {
         let cache = Cache::new(etcd, Arc::new(FakeVerifier));
         cache.sync_once().await.unwrap();
 
-        assert!(cache.resolve("openai").is_err(), "garbage signature must never resolve");
+        assert!(cache.resolve("openai", "req-1").is_err(), "garbage signature must never resolve");
     }
 
     #[tokio::test]
@@ -690,7 +773,7 @@ mod tests {
         let cache = Cache::new(etcd, Arc::new(RaisingVerifier));
         cache.sync_once().await.unwrap(); // must not panic
 
-        assert!(cache.resolve("openai").is_err());
+        assert!(cache.resolve("openai", "req-1").is_err());
     }
 
     #[tokio::test]
@@ -703,7 +786,7 @@ mod tests {
 
         let cache = Cache::new(Arc::clone(&etcd) as Arc<dyn EtcdReader>, Arc::new(FakeVerifier));
         cache.sync_once().await.unwrap();
-        assert_eq!(cache.resolve("openai").unwrap(), "openai:gpt-4o-mini");
+        assert_eq!(cache.resolve("openai", "req-1").unwrap(), "openai:gpt-4o-mini");
 
         // Simulate a bad direct write overwriting the SAME key with
         // tampered content (empty signature this time), then exercise the
@@ -713,7 +796,7 @@ mod tests {
             .handle_manifest_kv(model_ref, version_id, &envelope(version_id, model_ref, spec_json, ""))
             .await;
 
-        assert_eq!(cache.resolve("openai").unwrap(), "openai:gpt-4o-mini", "last-known-good must survive");
+        assert_eq!(cache.resolve("openai", "req-1").unwrap(), "openai:gpt-4o-mini", "last-known-good must survive");
     }
 
     #[tokio::test]
@@ -740,5 +823,151 @@ mod tests {
         let mut listed: Vec<String> = cache.list_active().into_iter().map(|(model_ref, _)| model_ref).collect();
         listed.sort();
         assert_eq!(listed, vec!["openai".to_string()], "only the verified model_ref should be listed");
+    }
+
+    /// Publishes two independently-signed manifests for the same
+    /// model_ref, then writes the Phase-05 active envelope pointing at
+    /// both — the shape control-plane's own rollout module (Step L) will
+    /// produce once it exists; hand-constructed here since Step K's own
+    /// scope is the READ side.
+    fn put_stable_and_canary(
+        etcd: &FakeEtcdReader,
+        model_ref: &str,
+        stable_version: &str,
+        stable_worker_ref: &str,
+        canary_version: &str,
+        canary_worker_ref: &str,
+        canary_percent: i32,
+    ) {
+        let stable_spec = format!(r#"{{"worker_ref":"{stable_worker_ref}"}}"#);
+        let stable_sig = FakeVerifier::sign(&signed_payload(stable_version, model_ref, &stable_spec));
+        etcd.put(
+            &format!("/onezox/manifests/{model_ref}/{stable_version}"),
+            envelope(stable_version, model_ref, &stable_spec, &stable_sig),
+        );
+
+        let canary_spec = format!(r#"{{"worker_ref":"{canary_worker_ref}"}}"#);
+        let canary_sig = FakeVerifier::sign(&signed_payload(canary_version, model_ref, &canary_spec));
+        etcd.put(
+            &format!("/onezox/manifests/{model_ref}/{canary_version}"),
+            envelope(canary_version, model_ref, &canary_spec, &canary_sig),
+        );
+
+        etcd.put(
+            &format!("/onezox/active/{model_ref}"),
+            serde_json::json!({
+                "stable": stable_version,
+                "canary": canary_version,
+                "canary_percent": canary_percent,
+            })
+            .to_string()
+            .into_bytes(),
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_string_active_pointer_still_resolves() {
+        // Backward compatibility (Step K's own migration concern): the 5
+        // real providers' existing /onezox/active/{model_ref} keys,
+        // written by control-plane's Phase-04 Step T bootstrap, are still
+        // the OLD bare version_id string — nothing rewrites them until a
+        // rollout touches that model_ref. put_manifest's own active write
+        // is already a bare string (unchanged since Step R), so this test
+        // is really confirming that fact still resolves correctly now
+        // that parsing tries JSON first.
+        let etcd = Arc::new(FakeEtcdReader::default());
+        let (version_id, model_ref) = ("v1", "openai");
+        let spec_json = r#"{"worker_ref":"openai:gpt-4o-mini"}"#;
+        let signature = FakeVerifier::sign(&signed_payload(version_id, model_ref, spec_json));
+        put_manifest(&etcd, version_id, model_ref, spec_json, &signature);
+
+        let cache = Cache::new(etcd, Arc::new(FakeVerifier));
+        cache.sync_once().await.unwrap();
+
+        assert_eq!(cache.resolve("openai", "any-request-id").unwrap(), "openai:gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn zero_canary_percent_always_resolves_stable() {
+        let etcd = Arc::new(FakeEtcdReader::default());
+        put_stable_and_canary(&etcd, "openai", "v1", "openai:gpt-4o-mini", "v2", "openai:gpt-4o-CANARY", 0);
+
+        let cache = Cache::new(etcd, Arc::new(FakeVerifier));
+        cache.sync_once().await.unwrap();
+
+        for req_id in ["req-a", "req-b", "req-c", "req-d", "req-e"] {
+            assert_eq!(cache.resolve("openai", req_id).unwrap(), "openai:gpt-4o-mini");
+        }
+    }
+
+    #[tokio::test]
+    async fn canary_percent_100_always_resolves_canary() {
+        let etcd = Arc::new(FakeEtcdReader::default());
+        put_stable_and_canary(&etcd, "openai", "v1", "openai:gpt-4o-mini", "v2", "openai:gpt-4o-CANARY", 100);
+
+        let cache = Cache::new(etcd, Arc::new(FakeVerifier));
+        cache.sync_once().await.unwrap();
+
+        for req_id in ["req-a", "req-b", "req-c", "req-d", "req-e"] {
+            assert_eq!(cache.resolve("openai", req_id).unwrap(), "openai:gpt-4o-CANARY");
+        }
+    }
+
+    #[tokio::test]
+    async fn canary_percent_50_splits_traffic_over_many_requests() {
+        // Statistical, not exact — same [30%, 70%] generous band data-
+        // plane's own equivalent test uses, avoiding flakiness while still
+        // proving the split genuinely happens rather than sticking at 0
+        // or 100.
+        let etcd = Arc::new(FakeEtcdReader::default());
+        put_stable_and_canary(&etcd, "openai", "v1", "openai:gpt-4o-mini", "v2", "openai:gpt-4o-CANARY", 50);
+
+        let cache = Cache::new(etcd, Arc::new(FakeVerifier));
+        cache.sync_once().await.unwrap();
+
+        let canary_count = (0..200)
+            .filter(|i| cache.resolve("openai", &format!("req-{i}")).unwrap() == "openai:gpt-4o-CANARY")
+            .count();
+        assert!((60..=140).contains(&canary_count), "canary_count={canary_count} out of 200, expected roughly half");
+    }
+
+    #[tokio::test]
+    async fn unverified_canary_fails_closed_not_silent_stable_fallback() {
+        // A canary version that never independently verified (garbage
+        // signature) must NOT silently fall back to stable — same "fail
+        // loud, don't silently succeed on unverified content" principle
+        // this module already applies to manifest verification, extended
+        // to the routing decision. Mirrors data-plane's own equivalent
+        // test exactly.
+        let etcd = Arc::new(FakeEtcdReader::default());
+        let (stable_version, model_ref) = ("v1", "openai");
+        let stable_spec = r#"{"worker_ref":"openai:gpt-4o-mini"}"#;
+        let stable_sig = FakeVerifier::sign(&signed_payload(stable_version, model_ref, stable_spec));
+        etcd.put(
+            &format!("/onezox/manifests/{model_ref}/{stable_version}"),
+            envelope(stable_version, model_ref, stable_spec, &stable_sig),
+        );
+
+        let canary_version = "v2";
+        let canary_spec = r#"{"worker_ref":"openai:gpt-4o-CANARY"}"#;
+        etcd.put(
+            &format!("/onezox/manifests/{model_ref}/{canary_version}"),
+            envelope(canary_version, model_ref, canary_spec, "fake:v1:not-a-real-signature"),
+        );
+
+        etcd.put(
+            &format!("/onezox/active/{model_ref}"),
+            serde_json::json!({"stable": stable_version, "canary": canary_version, "canary_percent": 100})
+                .to_string()
+                .into_bytes(),
+        );
+
+        let cache = Cache::new(etcd, Arc::new(FakeVerifier));
+        cache.sync_once().await.unwrap();
+
+        assert!(
+            cache.resolve("openai", "req-1").is_err(),
+            "unverified canary must fail closed, not silently serve stable"
+        );
     }
 }

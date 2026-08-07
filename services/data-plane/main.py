@@ -325,7 +325,7 @@ class DataplaneServicer(dataplane_pb2_grpc.DataplaneServiceServicer):
                 # default.
                 model_ref = request.model or DEFAULT_MODEL_REF
                 try:
-                    worker_ref = registry_cache.resolve(model_ref)
+                    worker_ref = registry_cache.resolve(model_ref, request_id)
                 except model_registry.ManifestNotFound as e:
                     log.info(
                         f"model not found request_id={request_id} org_id={org_id} "

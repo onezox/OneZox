@@ -83,13 +83,42 @@ func (c *Client) PublishManifest(ctx context.Context, versionID, modelRef, specJ
 	return nil
 }
 
+// ActiveEnvelope is the Phase-05 shape of /onezox/active/{model_ref} —
+// grown from a bare version_id string (Phase-04) into a small envelope
+// carrying the staged-canary state, additively: every Phase-04 consumer
+// that only ever cared about "the one live version" reads Stable exactly
+// where it used to read the whole value; Canary/CanaryPercent are new
+// fields a canary-unaware reader simply never looks at. Canary is an
+// empty string, not a pointer/null, when no canary is in progress — a
+// version_id is a UUID and therefore never legitimately empty, so this is
+// a safe, JSON-simple sentinel that needs no null-handling in any of the
+// three consumer languages (Go, Python, Rust all treat "" the same way:
+// falsy, no special-case unwrapping required).
+type ActiveEnvelope struct {
+	Stable        string `json:"stable"`
+	Canary        string `json:"canary"`
+	CanaryPercent int    `json:"canary_percent"`
+}
+
 // PublishActive updates /onezox/active/{model_ref} — the ONE mutable
 // pointer this package writes, mirroring model_active's own mutability
 // (data/migrations/0009); the manifest content at PublishManifest's key
-// never changes once written.
+// never changes once written. Sets Stable and clears any canary state
+// (Canary: "", CanaryPercent: 0) — this is RegisterModelManifest's own
+// bootstrap-activation call (registry.go), which by definition is never
+// itself an in-progress canary. Step L's rollout module writes a
+// DIFFERENT, more targeted update for setting/advancing canary state,
+// once it exists to consume one — this method's own contract (activate
+// versionID as the stable pointer, no canary) is unchanged from what
+// RegisterModelManifest has always needed from it.
 func (c *Client) PublishActive(ctx context.Context, modelRef, versionID string) error {
+	env := ActiveEnvelope{Stable: versionID}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshaling active envelope: %w", err)
+	}
 	key := fmt.Sprintf("/onezox/active/%s", modelRef)
-	if _, err := c.cli.Put(ctx, key, versionID); err != nil {
+	if _, err := c.cli.Put(ctx, key, string(data)); err != nil {
 		return fmt.Errorf("publishing active pointer to etcd: %w", err)
 	}
 	return nil

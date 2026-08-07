@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 
 from model_registry import Cache, ManifestNotFound, signed_payload
 
+CANARY_PERCENT_ALL = 100
+CANARY_PERCENT_HALF = 50
+
 
 class FakeVerifier:
     def __init__(self) -> None:
@@ -112,7 +115,7 @@ def test_resolve_valid_manifest() -> None:
     cache = Cache(etcd, verifier, _null_logger())
     asyncio.run(cache.sync_once())
 
-    assert cache.resolve("openai") == "openai:gpt-4o-mini"
+    assert cache.resolve("openai", "req-1") == "openai:gpt-4o-mini"
 
 
 def test_resolve_unknown_model_ref_raises_typed_error() -> None:
@@ -120,7 +123,7 @@ def test_resolve_unknown_model_ref_raises_typed_error() -> None:
     asyncio.run(cache.sync_once())
 
     try:
-        cache.resolve("does-not-exist")
+        cache.resolve("does-not-exist", "req-1")
         raise AssertionError("expected ManifestNotFound")
     except ManifestNotFound as e:
         assert e.model_ref == "does-not-exist"
@@ -147,7 +150,7 @@ def test_tampered_manifest_rejected() -> None:
     asyncio.run(cache.sync_once())
 
     try:
-        cache.resolve("openai")
+        cache.resolve("openai", "req-1")
         raise AssertionError("expected ManifestNotFound — tampered manifest must never resolve")
     except ManifestNotFound:
         pass
@@ -168,7 +171,7 @@ def test_unsigned_manifest_rejected() -> None:
     asyncio.run(cache.sync_once())
 
     try:
-        cache.resolve("openai")
+        cache.resolve("openai", "req-1")
         raise AssertionError("expected ManifestNotFound — unsigned manifest must never resolve")
     except ManifestNotFound:
         pass
@@ -186,7 +189,7 @@ def test_garbage_signature_rejected() -> None:
     asyncio.run(cache.sync_once())
 
     try:
-        cache.resolve("openai")
+        cache.resolve("openai", "req-1")
         raise AssertionError("expected ManifestNotFound — garbage signature must never resolve")
     except ManifestNotFound:
         pass
@@ -210,7 +213,7 @@ def test_verifier_call_failure_does_not_crash_sync() -> None:
     asyncio.run(cache.sync_once())  # must not raise
 
     try:
-        cache.resolve("openai")
+        cache.resolve("openai", "req-1")
         raise AssertionError("expected ManifestNotFound — a verify call failure must not trust")
     except ManifestNotFound:
         pass
@@ -231,7 +234,7 @@ def test_last_known_good_survives_a_bad_update() -> None:
 
     cache = Cache(etcd, verifier, _null_logger())
     asyncio.run(cache.sync_once())
-    assert cache.resolve("openai") == "openai:gpt-4o-mini"
+    assert cache.resolve("openai", "req-1") == "openai:gpt-4o-mini"
 
     # Simulate a bad direct write to etcd overwriting the SAME key with
     # tampered content (empty signature this time).
@@ -245,4 +248,171 @@ def test_last_known_good_survives_a_bad_update() -> None:
     asyncio.run(cache._handle_manifest_kv(model_ref, version_id, etcd.store[manifest_key.encode()]))
 
     # Still resolves — last-known-good, the bad update never took effect.
-    assert cache.resolve("openai") == "openai:gpt-4o-mini"
+    assert cache.resolve("openai", "req-1") == "openai:gpt-4o-mini"
+
+
+def _put_stable_and_canary(
+    etcd: FakeEtcdReader,
+    verifier: FakeVerifier,
+    model_ref: str,
+    stable_version: str,
+    stable_worker_ref: str,
+    canary_version: str,
+    canary_worker_ref: str,
+    canary_percent: int,
+) -> None:
+    """Publishes two independently-signed, independently-verified
+    manifests for the same model_ref, then writes the Phase-05 active
+    envelope pointing at both — the shape control-plane's own rollout
+    module (Step L) will produce once it exists, hand-constructed here
+    since Step K's own scope is the READ side."""
+    stable_spec = f'{{"worker_ref":"{stable_worker_ref}"}}'
+    stable_sig = verifier.sign(signed_payload(stable_version, model_ref, stable_spec))
+    etcd.put(
+        f"/onezox/manifests/{model_ref}/{stable_version}",
+        _envelope(stable_version, model_ref, stable_spec, stable_sig),
+    )
+
+    canary_spec = f'{{"worker_ref":"{canary_worker_ref}"}}'
+    canary_sig = verifier.sign(signed_payload(canary_version, model_ref, canary_spec))
+    etcd.put(
+        f"/onezox/manifests/{model_ref}/{canary_version}",
+        _envelope(canary_version, model_ref, canary_spec, canary_sig),
+    )
+
+    etcd.put(
+        f"/onezox/active/{model_ref}",
+        json.dumps(
+            {"stable": stable_version, "canary": canary_version, "canary_percent": canary_percent}
+        ).encode(),
+    )
+
+
+def test_bare_string_active_pointer_still_resolves() -> None:
+    """Backward compatibility (Step K's own migration concern): the 5 real
+    providers' existing /onezox/active/{model_ref} keys, written by
+    control-plane's Phase-04 Step T bootstrap, are still the OLD bare
+    version_id string — nothing rewrites them until a rollout touches that
+    model_ref. A bare string must resolve exactly as it always did, not be
+    treated as malformed just because parsing now tries JSON first."""
+    verifier = FakeVerifier()
+    etcd = FakeEtcdReader()
+    version_id, model_ref = "v1", "openai"
+    spec_json = '{"worker_ref":"openai:gpt-4o-mini"}'
+    signature = verifier.sign(signed_payload(version_id, model_ref, spec_json))
+    _put_manifest(etcd, version_id, model_ref, spec_json, signature)  # bare-string active write
+
+    cache = Cache(etcd, verifier, _null_logger())
+    asyncio.run(cache.sync_once())
+
+    assert cache.resolve("openai", "any-request-id") == "openai:gpt-4o-mini"
+
+
+def test_zero_canary_percent_always_resolves_stable() -> None:
+    """The new JSON envelope with canary_percent=0 (what PublishActive
+    itself always writes, Step K) must behave identically to the bare-
+    string case — every request resolves stable, regardless of
+    request_id."""
+    verifier = FakeVerifier()
+    etcd = FakeEtcdReader()
+    _put_stable_and_canary(
+        etcd, verifier, "openai",
+        stable_version="v1", stable_worker_ref="openai:gpt-4o-mini",
+        canary_version="v2", canary_worker_ref="openai:gpt-4o-CANARY",
+        canary_percent=0,
+    )
+
+    cache = Cache(etcd, verifier, _null_logger())
+    asyncio.run(cache.sync_once())
+
+    for req_id in ("req-a", "req-b", "req-c", "req-d", "req-e"):
+        assert cache.resolve("openai", req_id) == "openai:gpt-4o-mini"
+
+
+def test_canary_percent_100_always_resolves_canary() -> None:
+    verifier = FakeVerifier()
+    etcd = FakeEtcdReader()
+    _put_stable_and_canary(
+        etcd, verifier, "openai",
+        stable_version="v1", stable_worker_ref="openai:gpt-4o-mini",
+        canary_version="v2", canary_worker_ref="openai:gpt-4o-CANARY",
+        canary_percent=CANARY_PERCENT_ALL,
+    )
+
+    cache = Cache(etcd, verifier, _null_logger())
+    asyncio.run(cache.sync_once())
+
+    for req_id in ("req-a", "req-b", "req-c", "req-d", "req-e"):
+        assert cache.resolve("openai", req_id) == "openai:gpt-4o-CANARY"
+
+
+def test_canary_percent_50_splits_traffic_over_many_requests() -> None:
+    """Statistical, not exact — the whole point of hashing request_id is
+    that no single request is special-cased, so the split only shows up
+    over a real sample. 200 distinct request_ids at a 50% threshold
+    should land nowhere near all-one-side; a generous [30%, 70%] band
+    avoids a flaky test while still proving the split is genuinely
+    happening, not stuck at 0% or 100%."""
+    verifier = FakeVerifier()
+    etcd = FakeEtcdReader()
+    _put_stable_and_canary(
+        etcd, verifier, "openai",
+        stable_version="v1", stable_worker_ref="openai:gpt-4o-mini",
+        canary_version="v2", canary_worker_ref="openai:gpt-4o-CANARY",
+        canary_percent=CANARY_PERCENT_HALF,
+    )
+
+    cache = Cache(etcd, verifier, _null_logger())
+    asyncio.run(cache.sync_once())
+
+    canary_count = sum(
+        1 for i in range(200) if cache.resolve("openai", f"req-{i}") == "openai:gpt-4o-CANARY"
+    )
+    assert 60 <= canary_count <= 140, (
+        f"canary_count={canary_count} out of 200, expected roughly half"
+    )
+
+
+def test_unverified_canary_fails_closed_not_silent_stable_fallback() -> None:
+    """A canary version that never independently verified (tampered,
+    unsigned — same adversarial standard as every other manifest check in
+    this module) must NOT silently fall back to stable when a request is
+    routed to it. Falling back would mask a real integrity failure behind
+    a misleadingly successful response — the same "fail loud, don't
+    silently succeed on unverified content" principle this module already
+    applies to manifest verification itself, extended to the routing
+    decision."""
+    verifier = FakeVerifier()
+    etcd = FakeEtcdReader()
+
+    stable_version, model_ref = "v1", "openai"
+    stable_spec = '{"worker_ref":"openai:gpt-4o-mini"}'
+    stable_sig = verifier.sign(signed_payload(stable_version, model_ref, stable_spec))
+    etcd.put(
+        f"/onezox/manifests/{model_ref}/{stable_version}",
+        _envelope(stable_version, model_ref, stable_spec, stable_sig),
+    )
+
+    # Canary manifest exists but with a GARBAGE signature — never verifies.
+    canary_version = "v2"
+    canary_spec = '{"worker_ref":"openai:gpt-4o-CANARY"}'
+    etcd.put(
+        f"/onezox/manifests/{model_ref}/{canary_version}",
+        _envelope(canary_version, model_ref, canary_spec, "fake:v1:not-a-real-signature"),
+    )
+
+    active_envelope = {
+        "stable": stable_version, "canary": canary_version, "canary_percent": CANARY_PERCENT_ALL,
+    }
+    etcd.put(f"/onezox/active/{model_ref}", json.dumps(active_envelope).encode())
+
+    cache = Cache(etcd, verifier, _null_logger())
+    asyncio.run(cache.sync_once())
+
+    # canary_percent=100 means every request routes to canary — which
+    # never verified, so every request must fail, not silently serve stable.
+    try:
+        cache.resolve("openai", "req-1")
+        raise AssertionError("expected ManifestNotFound, not a silent fallback to stable")
+    except ManifestNotFound:
+        pass
