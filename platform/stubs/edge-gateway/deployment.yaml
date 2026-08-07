@@ -43,7 +43,7 @@ spec:
       serviceAccountName: edge-gateway
       containers:
         - name: edge-gateway
-          image: onezox/edge-gateway:d4b6004
+          image: onezox/edge-gateway:e28ff33
           imagePullPolicy: IfNotPresent
           env:
             - name: ETCD_ENDPOINT
