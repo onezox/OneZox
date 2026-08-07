@@ -42,7 +42,7 @@ spec:
       serviceAccountName: admin-api
       containers:
         - name: admin-api
-          image: onezox/admin-api:8f405c7
+          image: onezox/admin-api:bb4a716
           imagePullPolicy: IfNotPresent
           env:
             - name: COCKROACH_HOST
