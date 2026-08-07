@@ -294,6 +294,27 @@ impl Cache {
             .map(String::from)
             .ok_or_else(|| ManifestError::NotFound(model_ref.to_string()))
     }
+
+    /// Hot-path listing: plain in-memory reads, no I/O — Phase-04 Step S's
+    /// GET /v1/models, backing off this cache rather than a per-request
+    /// control-plane call (same discipline as resolve()). Only includes a
+    /// model_ref whose active pointer's target manifest is ALSO present in
+    /// the verified `manifests` map — an active pointer for a manifest
+    /// that never verified (or hasn't arrived yet) is not advertised as
+    /// available, matching resolve()'s own "only genuinely trusted"
+    /// standard: never list a model that would then fail if actually
+    /// invoked.
+    pub fn list_active(&self) -> Vec<(String, String)> {
+        let state = self.state.read().expect("model_registry cache lock poisoned");
+        state
+            .active
+            .iter()
+            .filter(|(model_ref, version_id)| {
+                state.manifests.contains_key(&((*model_ref).clone(), (*version_id).clone()))
+            })
+            .map(|(model_ref, version_id)| (model_ref.clone(), version_id.clone()))
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -418,6 +439,72 @@ pub(crate) fn empty_cache_for_test() -> Cache {
         }
     }
     Cache::new(Arc::new(NoopReader), Arc::new(NoopVerifier))
+}
+
+/// A Cache pre-populated with `models` (model_ref, worker_ref pairs), all
+/// trusted (an always-true verifier — this helper exists to test ROUTE
+/// WIRING, e.g. Step S's GET /v1/models, not verification logic itself,
+/// which model_registry's own adversarial tests already cover
+/// thoroughly). `#[cfg(test)]`, not shipped in the release binary.
+#[cfg(test)]
+pub(crate) async fn cache_with_active_models_for_test(models: &[(&str, &str)]) -> Cache {
+    struct AlwaysTrueVerifier;
+    #[async_trait]
+    impl SignatureVerifier for AlwaysTrueVerifier {
+        async fn verify(&self, _key_name: &str, _payload: &[u8], _signature: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    #[derive(Default)]
+    struct FixedReader {
+        store: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    }
+    #[async_trait]
+    impl EtcdReader for FixedReader {
+        async fn get_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+            Ok(self
+                .store
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect())
+        }
+        async fn watch_prefix(
+            &self,
+            _prefix: &str,
+        ) -> Result<BoxStream<'static, Result<Vec<EtcdEvent>, String>>, String> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    let reader = FixedReader::default();
+    {
+        let mut store = reader.store.lock().unwrap();
+        for (model_ref, worker_ref) in models {
+            let version_id = "test-v1";
+            let spec_json = format!(r#"{{"worker_ref":"{worker_ref}"}}"#);
+            let envelope = serde_json::json!({
+                "version_id": version_id,
+                "model_ref": model_ref,
+                "spec_json": spec_json,
+                "signature": "irrelevant-verifier-always-true",
+                "created_by": "test",
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "published",
+            })
+            .to_string()
+            .into_bytes();
+            store.insert(format!("/onezox/manifests/{model_ref}/{version_id}"), envelope);
+            store.insert(format!("/onezox/active/{model_ref}"), version_id.as_bytes().to_vec());
+        }
+    }
+
+    let cache = Cache::new(Arc::new(reader), Arc::new(AlwaysTrueVerifier));
+    cache.sync_once().await.expect("test fixture sync_once should never fail");
+    cache
 }
 
 // ---------------------------------------------------------------------
@@ -627,5 +714,31 @@ mod tests {
             .await;
 
         assert_eq!(cache.resolve("openai").unwrap(), "openai:gpt-4o-mini", "last-known-good must survive");
+    }
+
+    #[tokio::test]
+    async fn list_active_excludes_unverified_entries() {
+        // Phase-04 Step S: GET /v1/models must never advertise a model_ref
+        // it couldn't actually resolve — a valid active pointer whose
+        // manifest never verified (tampered, unsigned, or simply not
+        // arrived yet) must NOT appear in the list, even though
+        // `active` has an entry for it.
+        let etcd = Arc::new(FakeEtcdReader::default());
+
+        let (v1, openai_ref) = ("v1", "openai");
+        let openai_spec = r#"{"worker_ref":"openai:gpt-4o-mini"}"#;
+        let openai_sig = FakeVerifier::sign(&signed_payload(v1, openai_ref, openai_spec));
+        put_manifest(&etcd, v1, openai_ref, openai_spec, &openai_sig);
+
+        // A second model_ref with an active pointer but NO valid
+        // signature — active, but never trustworthy.
+        put_manifest(&etcd, "v1", "untrusted", r#"{"worker_ref":"untrusted:model"}"#, "");
+
+        let cache = Cache::new(etcd, Arc::new(FakeVerifier));
+        cache.sync_once().await.unwrap();
+
+        let mut listed: Vec<String> = cache.list_active().into_iter().map(|(model_ref, _)| model_ref).collect();
+        listed.sort();
+        assert_eq!(listed, vec!["openai".to_string()], "only the verified model_ref should be listed");
     }
 }

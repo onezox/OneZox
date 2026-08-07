@@ -229,14 +229,25 @@ async fn embeddings(
     ))
 }
 
-async fn models(Admitted(_identity, _guard, _request_context): Admitted) -> impl IntoResponse {
-    // Phase-01.txt: "served from a static list until Phase-04 registry".
-    Json(ModelsListResponse {
-        data: vec![Model {
-            id: "onezox-ultra".to_string(),
-            owned_by: "onezox".to_string(),
-        }],
-    })
+/// Phase-04 Step S: served from edge-gateway's OWN etcd-fed, independently
+/// Vault-verified model_registry cache (Step R) — a plain in-memory read
+/// (Cache::list_active), never a per-request call to control-plane. Same
+/// hot-path discipline as manifest resolution: the registry becoming a
+/// hot-path dependency (Phase-04.txt's own framing) is handled by
+/// resolving from the local cache, not by adding a live network call to
+/// every request this route serves.
+async fn models(
+    State(state): State<AppState>,
+    Admitted(_identity, _guard, _request_context): Admitted,
+) -> impl IntoResponse {
+    let mut data: Vec<Model> = state
+        .registry_cache
+        .list_active()
+        .into_iter()
+        .map(|(model_ref, _version_id)| Model { id: model_ref, owned_by: "onezox".to_string() })
+        .collect();
+    data.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(ModelsListResponse { data })
 }
 
 pub fn router() -> Router<AppState> {
@@ -288,6 +299,29 @@ mod tests {
             admission_hard_limit: GENEROUS_ADMISSION_LIMIT,
             dataplane_channel: unreachable_dataplane_channel(),
             registry_cache: Arc::new(crate::model_registry::empty_cache_for_test()),
+        };
+        (router().with_state(state), org_id)
+    }
+
+    /// Same as test_app(), but with registry_cache pre-populated with real
+    /// (trusted) entries — Step S's own GET /v1/models test needs actual
+    /// content to assert against, not just "the route doesn't crash."
+    async fn test_app_with_models(models: &[(&str, &str)]) -> (Router, Uuid) {
+        let org_id = Uuid::new_v4();
+        let store = FakeApiKeyStore::new();
+        store.insert(TEST_KEY, org_id, None);
+        let state = AppState {
+            api_key_store: Arc::new(store),
+            jwt_secret: Arc::from(b"test-secret".as_slice()),
+            rate_limit_counter: Arc::new(FakeRateLimitCounter::new()),
+            rate_limit_policy_store: Arc::new(FixedRateLimitPolicyStore(RateLimitPolicy {
+                rpm: GENEROUS_RPM,
+            })),
+            admission_gauge: Arc::new(FakeAdmissionGauge::new()),
+            admission_soft_limit: GENEROUS_ADMISSION_LIMIT,
+            admission_hard_limit: GENEROUS_ADMISSION_LIMIT,
+            dataplane_channel: unreachable_dataplane_channel(),
+            registry_cache: Arc::new(crate::model_registry::cache_with_active_models_for_test(models).await),
         };
         (router().with_state(state), org_id)
     }
@@ -493,7 +527,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn models_returns_the_static_list_when_authenticated() {
+    async fn models_returns_an_empty_list_when_the_registry_cache_has_nothing() {
+        // Phase-04 Step S: an empty cache is a valid state (nothing
+        // registered yet, or nothing verified) — GET /v1/models must
+        // return a genuinely empty array, not a placeholder/static entry
+        // that would misrepresent what's actually resolvable.
         let (app, _org_id) = test_app();
         let response = app
             .oneshot(
@@ -505,7 +543,49 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let json = body_json(response).await;
-        assert!(!json["data"].as_array().unwrap().is_empty());
+        assert_eq!(json["data"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn models_returns_exactly_the_active_verified_providers_not_a_deactivated_one() {
+        // Phase-04 Step S's own correctness requirement: the 5 ACTIVE
+        // providers must appear, Gemini (deactivated, F13) must NOT — the
+        // active/deactivated distinction (model_active + F13) must reach
+        // all the way to this user-facing endpoint. Also includes an
+        // UNVERIFIED entry (mirrors model_registry's own
+        // list_active_excludes_unverified_entries test) to prove this
+        // route-level test isn't accidentally passing because everything
+        // in the fixture happens to verify.
+        let (app, _org_id) = test_app_with_models(&[
+            ("openai", "openai:gpt-4o-mini"),
+            ("anthropic", "anthropic:claude-haiku-4-5"),
+            ("grok", "grok:grok-2-mini"),
+            ("glm", "glm:glm-4-flash"),
+            ("kimi", "kimi:moonshot-v1-8k"),
+        ])
+        .await;
+        let response = app
+            .oneshot(
+                authed(Request::get("/v1/models"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let mut ids: Vec<String> = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["anthropic", "glm", "grok", "kimi", "openai"],
+            "must be exactly the 5 active providers — no more, no fewer, and no deactivated gemini"
+        );
     }
 
     #[tokio::test]
