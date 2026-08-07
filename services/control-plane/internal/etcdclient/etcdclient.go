@@ -112,7 +112,29 @@ type ActiveEnvelope struct {
 // versionID as the stable pointer, no canary) is unchanged from what
 // RegisterModelManifest has always needed from it.
 func (c *Client) PublishActive(ctx context.Context, modelRef, versionID string) error {
-	env := ActiveEnvelope{Stable: versionID}
+	return c.publishActiveEnvelope(ctx, modelRef, ActiveEnvelope{Stable: versionID})
+}
+
+// PublishCanaryState is Step L's rollout module's own write path — the
+// SANCTIONED way canary_percent ever changes, called only from
+// rollout.Service's internal advanceStage/revertCanary functions, never
+// directly by any RPC handler. Writes the full envelope: stable stays
+// whatever it was before this rollout began (rollout.stable_version_id,
+// data/migrations/0019 — never re-derived, always the value captured at
+// CreateRollout), canary/percent carry the in-progress staged values.
+// canaryVersionID="" and percent=0 together mean "no canary in progress"
+// — the same revert-to-stable-only shape AbortRollout and an automatic
+// rollback both produce, and the same sentinel PublishActive's own
+// Canary/CanaryPercent zero values already establish.
+func (c *Client) PublishCanaryState(ctx context.Context, modelRef, stableVersionID, canaryVersionID string, percent int) error {
+	return c.publishActiveEnvelope(ctx, modelRef, ActiveEnvelope{
+		Stable:        stableVersionID,
+		Canary:        canaryVersionID,
+		CanaryPercent: percent,
+	})
+}
+
+func (c *Client) publishActiveEnvelope(ctx context.Context, modelRef string, env ActiveEnvelope) error {
 	data, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshaling active envelope: %w", err)

@@ -16,17 +16,21 @@ import (
 )
 
 // controlPublisher is a narrow slice of controlpb.ControlServiceClient —
-// only the one method this step's handler actually calls, the same
+// only the methods admin-api's own handlers actually call, the same
 // pattern provider-gateway's own credentials.TokenFetcher already
 // established for calling control-plane (a narrow interface local to the
 // consumer, not a dependency on the full 8-method generated client). Kept
-// narrow deliberately: a fake implementing this needs exactly one method,
-// and the real *grpc.ClientConn-backed controlpb.ControlServiceClient
-// (main.go) satisfies it without any adapter. Grows to include
-// CreateRollout/PromoteRollout/AbortRollout/GetRolloutStatus as Step L
-// gives their own admin-api handlers real bodies.
+// narrow deliberately: a fake implementing this needs exactly these
+// methods, and the real *grpc.ClientConn-backed
+// controlpb.ControlServiceClient (main.go) satisfies it without any
+// adapter. GetRolloutStatus is deliberately NOT here — it's a read, wired
+// into the GraphQL side (Step U) when the panel actually needs it, not
+// this command-only interface.
 type controlPublisher interface {
 	RegisterModelManifest(ctx context.Context, in *controlpb.RegisterModelManifestRequest, opts ...grpc.CallOption) (*controlpb.RegisterModelManifestResponse, error)
+	CreateRollout(ctx context.Context, in *controlpb.CreateRolloutRequest, opts ...grpc.CallOption) (*controlpb.CreateRolloutResponse, error)
+	PromoteRollout(ctx context.Context, in *controlpb.PromoteRolloutRequest, opts ...grpc.CallOption) (*controlpb.PromoteRolloutResponse, error)
+	AbortRollout(ctx context.Context, in *controlpb.AbortRolloutRequest, opts ...grpc.CallOption) (*controlpb.AbortRolloutResponse, error)
 }
 
 // server implements pb.AdminServiceServer. Every method here runs AFTER
@@ -128,4 +132,124 @@ func (s *server) PublishModelVersion(ctx context.Context, req *pb.PublishModelVe
 
 	s.log.Info("published model version", "model_ref", req.GetModelRef(), "version_id", resp.GetVersionId(), "user_id", id.UserID)
 	return &pb.PublishModelVersionResponse{VersionId: resp.GetVersionId()}, nil
+}
+
+// StartRollout/PromoteRollout/AbortRollout — Step L. Same shape as
+// PublishModelVersion in every respect that matters: thin passthrough to
+// control-plane's own rollout/ module (no state machine logic
+// duplicated here), created_by/actor always the authenticated caller
+// (never client-supplied), audit_log written for both success and
+// control-plane-call failure, and an audit-write failure after a real
+// control-plane success still fails the RPC — an unaudited success must
+// never reach a caller, the same fail-loud rule Step H established.
+
+func (s *server) StartRollout(ctx context.Context, req *pb.StartRolloutRequest) (*pb.StartRolloutResponse, error) {
+	id, ok := authn.IdentityFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "no verified identity")
+	}
+	const action = "start_rollout"
+
+	resp, err := s.control.CreateRollout(ctx, &controlpb.CreateRolloutRequest{
+		ModelRef:     req.GetModelRef(),
+		VersionId:    req.GetVersionId(),
+		StrategyJson: req.GetStrategyJson(),
+	})
+	if err != nil {
+		s.log.Error("StartRollout: control-plane call failed", "model_ref", req.GetModelRef(), "version_id", req.GetVersionId(), "user_id", id.UserID, "error", err)
+		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetModelRef()}); auditErr != nil {
+			s.log.Error("StartRollout: failed to audit a failed attempt", "model_ref", req.GetModelRef(), "user_id", id.UserID, "error", auditErr)
+		}
+		return nil, status.Error(codes.Internal, "failed to start rollout")
+	}
+
+	auditErr := s.audit.Write(ctx, audit.Entry{
+		Actor:  id.UserID,
+		Action: action,
+		Target: req.GetModelRef(),
+		After: map[string]string{
+			"rollout_id":    resp.GetRolloutId(),
+			"model_ref":     req.GetModelRef(),
+			"version_id":    req.GetVersionId(),
+			"strategy_json": req.GetStrategyJson(),
+		},
+	})
+	if auditErr != nil {
+		s.log.Error("StartRollout: rollout started but audit write failed — reporting as failed",
+			"rollout_id", resp.GetRolloutId(), "model_ref", req.GetModelRef(), "user_id", id.UserID, "error", auditErr)
+		return nil, status.Error(codes.Internal, "rollout may have started but could not be recorded; treat as failed and verify with an operator")
+	}
+
+	s.log.Info("started rollout", "rollout_id", resp.GetRolloutId(), "model_ref", req.GetModelRef(), "version_id", req.GetVersionId(), "user_id", id.UserID)
+	return &pb.StartRolloutResponse{RolloutId: resp.GetRolloutId()}, nil
+}
+
+func (s *server) PromoteRollout(ctx context.Context, req *pb.PromoteRolloutRequest) (*pb.PromoteRolloutResponse, error) {
+	id, ok := authn.IdentityFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "no verified identity")
+	}
+	const action = "promote_rollout"
+
+	resp, err := s.control.PromoteRollout(ctx, &controlpb.PromoteRolloutRequest{RolloutId: req.GetRolloutId()})
+	if err != nil {
+		s.log.Error("PromoteRollout: control-plane call failed", "rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", err)
+		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetRolloutId()}); auditErr != nil {
+			s.log.Error("PromoteRollout: failed to audit a failed attempt", "rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", auditErr)
+		}
+		return nil, status.Error(codes.Internal, "failed to promote rollout")
+	}
+
+	// before_json is nil here deliberately, not fetched via an extra
+	// GetRolloutStatus call purely for the audit record's own sake — the
+	// PRIOR stage is already whatever the previous audit_log row for this
+	// same rollout_id recorded as its own "after" (this row's own
+	// creation, or the previous promote), so the full sequence is
+	// reconstructable from audit_log alone without a redundant read here.
+	auditErr := s.audit.Write(ctx, audit.Entry{
+		Actor:  id.UserID,
+		Action: action,
+		Target: req.GetRolloutId(),
+		After:  map[string]string{"new_stage": resp.GetNewStage()},
+	})
+	if auditErr != nil {
+		s.log.Error("PromoteRollout: rollout advanced but audit write failed — reporting as failed",
+			"rollout_id", req.GetRolloutId(), "new_stage", resp.GetNewStage(), "user_id", id.UserID, "error", auditErr)
+		return nil, status.Error(codes.Internal, "promotion may have succeeded but could not be recorded; treat as failed and verify with an operator")
+	}
+
+	s.log.Info("promoted rollout", "rollout_id", req.GetRolloutId(), "new_stage", resp.GetNewStage(), "user_id", id.UserID)
+	return &pb.PromoteRolloutResponse{NewStage: resp.GetNewStage()}, nil
+}
+
+func (s *server) AbortRollout(ctx context.Context, req *pb.AbortRolloutRequest) (*pb.AbortRolloutResponse, error) {
+	id, ok := authn.IdentityFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "no verified identity")
+	}
+	const action = "abort_rollout"
+
+	_, err := s.control.AbortRollout(ctx, &controlpb.AbortRolloutRequest{RolloutId: req.GetRolloutId()})
+	if err != nil {
+		s.log.Error("AbortRollout: control-plane call failed", "rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", err)
+		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetRolloutId()}); auditErr != nil {
+			s.log.Error("AbortRollout: failed to audit a failed attempt", "rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", auditErr)
+		}
+		return nil, status.Error(codes.Internal, "failed to abort rollout")
+	}
+
+	auditErr := s.audit.Write(ctx, audit.Entry{
+		Actor:  id.UserID,
+		Action: action,
+		Target: req.GetRolloutId(),
+		After:  map[string]string{"status": "aborted"},
+	})
+	if auditErr != nil {
+		s.log.Error("AbortRollout: rollout aborted but audit write failed — reporting as failed",
+			"rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", auditErr)
+		return nil, status.Error(codes.Internal, "abort may have succeeded but could not be recorded; treat as failed and verify with an operator")
+	}
+
+	s.log.Info("aborted rollout", "rollout_id", req.GetRolloutId(), "user_id", id.UserID)
+	return &pb.AbortRolloutResponse{}, nil
 }

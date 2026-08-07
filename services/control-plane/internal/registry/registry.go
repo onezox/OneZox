@@ -174,16 +174,33 @@ func (s *Service) RegisterModelManifest(ctx context.Context, modelRef, specJSON,
 		return versionID, nil
 	}
 
-	if err := s.store.SetActive(ctx, modelRef, versionID); err != nil {
-		return "", fmt.Errorf("setting active version: %w", err)
-	}
-	if err := s.publisher.PublishActive(ctx, modelRef, versionID); err != nil {
-		return "", fmt.Errorf("publishing active pointer to etcd: %w", err)
+	if err := s.ActivateVersion(ctx, modelRef, versionID); err != nil {
+		return "", err
 	}
 
 	s.log.Info("registered model manifest (activated: first version for this model_ref)",
 		"model_ref", modelRef, "version_id", versionID, "created_by", createdBy)
 	return versionID, nil
+}
+
+// ActivateVersion sets modelRef's stable pointer to versionID — both in
+// CockroachDB (model_active) and etcd (the active-pointer key,
+// data/migrations/0016's own JSON envelope, K's own canary/percent fields
+// implicitly cleared since PublishActive writes stable-only). Two callers
+// share this exact logic, deliberately not duplicated: RegisterModelManifest's
+// own bootstrap-activation branch above (a model_ref's first-ever version),
+// and Step L's rollout module's own promotion transition (a canary that
+// reached its final stage becomes the new stable) — both are "make this
+// version THE live one," the same operation regardless of which path led
+// there.
+func (s *Service) ActivateVersion(ctx context.Context, modelRef, versionID string) error {
+	if err := s.store.SetActive(ctx, modelRef, versionID); err != nil {
+		return fmt.Errorf("setting active version: %w", err)
+	}
+	if err := s.publisher.PublishActive(ctx, modelRef, versionID); err != nil {
+		return fmt.Errorf("publishing active pointer to etcd: %w", err)
+	}
+	return nil
 }
 
 // GetModelManifest resolves a manifest (a specific version_id, or the

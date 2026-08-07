@@ -45,6 +45,7 @@ import (
 	pb "github.com/onezox/OneZox/services/control-plane/internal/pb/control/v1"
 	"github.com/onezox/OneZox/services/control-plane/internal/providertoken"
 	"github.com/onezox/OneZox/services/control-plane/internal/registry"
+	"github.com/onezox/OneZox/services/control-plane/internal/rollout"
 	"github.com/onezox/OneZox/services/control-plane/internal/vaultclient"
 )
 
@@ -78,6 +79,7 @@ type server struct {
 	db            *sql.DB
 	registry      *registry.Service
 	providerToken *providertoken.Service
+	rollout       *rollout.Service
 	log           *slog.Logger
 }
 
@@ -157,6 +159,88 @@ func (s *server) IssueProviderToken(ctx context.Context, req *pb.IssueProviderTo
 	return &pb.IssueProviderTokenResponse{Token: token, TtlSeconds: ttlSeconds}, nil
 }
 
+// CreateRollout/PromoteRollout/AbortRollout/GetRolloutStatus — Step L.
+// Only the human-triggered half of the rollout state machine is exposed
+// as RPCs at all (control.proto's own header, Step D) — the automatic
+// timer/AnalysisRun-driven advance and rollback live entirely inside
+// this process (Step M), never reachable over the network. Enforced at
+// the network layer the same way IssueProviderToken already is
+// (control-plane-mtls's own admin-api ingress rule, added at admin-api's
+// Step E) — admin-api is the only additional identity authorized to
+// reach this port beyond provider-gateway.
+func (s *server) CreateRollout(ctx context.Context, req *pb.CreateRolloutRequest) (*pb.CreateRolloutResponse, error) {
+	rolloutID, err := s.rollout.CreateRollout(ctx, req.GetModelRef(), req.GetVersionId(), req.GetStrategyJson())
+	if err != nil {
+		s.log.Error("CreateRollout failed", "model_ref", req.GetModelRef(), "version_id", req.GetVersionId(), "error", err)
+		return nil, mapRolloutError(err)
+	}
+	return &pb.CreateRolloutResponse{RolloutId: rolloutID}, nil
+}
+
+func (s *server) PromoteRollout(ctx context.Context, req *pb.PromoteRolloutRequest) (*pb.PromoteRolloutResponse, error) {
+	newStage, err := s.rollout.PromoteRollout(ctx, req.GetRolloutId())
+	if err != nil {
+		s.log.Error("PromoteRollout failed", "rollout_id", req.GetRolloutId(), "error", err)
+		return nil, mapRolloutError(err)
+	}
+	return &pb.PromoteRolloutResponse{NewStage: newStage}, nil
+}
+
+func (s *server) AbortRollout(ctx context.Context, req *pb.AbortRolloutRequest) (*pb.AbortRolloutResponse, error) {
+	if err := s.rollout.AbortRollout(ctx, req.GetRolloutId()); err != nil {
+		s.log.Error("AbortRollout failed", "rollout_id", req.GetRolloutId(), "error", err)
+		return nil, mapRolloutError(err)
+	}
+	return &pb.AbortRolloutResponse{}, nil
+}
+
+// GetRolloutStatus is read-only (Step D's own commands-vs-queries split,
+// held within control-plane too) — no audit_log write happens for this
+// RPC anywhere in the call chain, matching every other pure read in this
+// service (GetModelManifest, ListModels).
+func (s *server) GetRolloutStatus(ctx context.Context, req *pb.GetRolloutStatusRequest) (*pb.GetRolloutStatusResponse, error) {
+	r, err := s.rollout.GetRolloutStatus(ctx, req.GetRolloutId(), req.GetModelRef())
+	if err != nil {
+		if errors.Is(err, rollout.ErrNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		s.log.Error("GetRolloutStatus failed", "rollout_id", req.GetRolloutId(), "model_ref", req.GetModelRef(), "error", err)
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	resp := &pb.GetRolloutStatusResponse{
+		RolloutId:     r.RolloutID,
+		ModelRef:      r.ModelRef,
+		VersionId:     r.VersionID,
+		Stage:         r.Stage,
+		Status:        r.Status,
+		CanaryPercent: rollout.StagePercent(r.Stage),
+		StartedAt:     r.StartedAt.Format(time.RFC3339),
+	}
+	if r.EndedAt != nil {
+		resp.EndedAt = r.EndedAt.Format(time.RFC3339)
+	}
+	return resp, nil
+}
+
+// mapRolloutError translates rollout package sentinel errors to the
+// gRPC status codes that actually distinguish them for a caller — "you
+// asked for something that doesn't exist" (NotFound) is not the same
+// class of problem as "your request conflicts with current state"
+// (FailedPrecondition), and neither is an opaque Internal.
+func mapRolloutError(err error) error {
+	switch {
+	case errors.Is(err, rollout.ErrNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, rollout.ErrNotRunning),
+		errors.Is(err, rollout.ErrAlreadyRunning),
+		errors.Is(err, rollout.ErrAlreadyFullyPromoted),
+		errors.Is(err, rollout.ErrNoActiveVersion):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	default:
+		return status.Error(codes.Internal, err.Error())
+	}
+}
+
 func main() {
 	handler := slog.NewJSONHandler(os.Stdout, nil)
 	log := slog.New(handler).With("service", serviceName)
@@ -204,6 +288,12 @@ func main() {
 	providerTokenTTL := time.Duration(envInt64Or("PROVIDER_TOKEN_TTL_SECONDS", 300)) * time.Second
 	providerTokenSvc := providertoken.NewService(vaultClient, providerTokenTTL, log)
 
+	// Step L: rollout.Service depends on registrySvc directly (the
+	// Registry interface it declares) for GetModelManifest/ActivateVersion
+	// — reusing the SAME registry instance every other RPC in this
+	// process uses, not a second connection to the same data.
+	rolloutSvc := rollout.NewService(rollout.NewCockroachStore(db), etcdCli, registrySvc, log)
+
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
@@ -215,6 +305,7 @@ func main() {
 		db:            db,
 		registry:      registrySvc,
 		providerToken: providerTokenSvc,
+		rollout:       rolloutSvc,
 		log:           log,
 	})
 

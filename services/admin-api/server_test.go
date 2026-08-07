@@ -19,11 +19,21 @@ import (
 
 // fakeControlPublisher implements the narrow controlPublisher interface —
 // no dependency on the full generated gRPC client, matching provider-
-// gateway's own credentials.FakeFetcher precedent.
+// gateway's own credentials.FakeFetcher precedent. One err/response pair
+// per method so each RPC's own failure mode can be tested independently.
 type fakeControlPublisher struct {
 	versionID string
 	err       error
 	lastReq   *controlpb.RegisterModelManifestRequest
+
+	rolloutID      string
+	createErr      error
+	lastCreateReq  *controlpb.CreateRolloutRequest
+	newStage       string
+	promoteErr     error
+	lastPromoteReq *controlpb.PromoteRolloutRequest
+	abortErr       error
+	lastAbortReq   *controlpb.AbortRolloutRequest
 }
 
 func (f *fakeControlPublisher) RegisterModelManifest(ctx context.Context, in *controlpb.RegisterModelManifestRequest, opts ...grpc.CallOption) (*controlpb.RegisterModelManifestResponse, error) {
@@ -32,6 +42,30 @@ func (f *fakeControlPublisher) RegisterModelManifest(ctx context.Context, in *co
 		return nil, f.err
 	}
 	return &controlpb.RegisterModelManifestResponse{VersionId: f.versionID}, nil
+}
+
+func (f *fakeControlPublisher) CreateRollout(ctx context.Context, in *controlpb.CreateRolloutRequest, opts ...grpc.CallOption) (*controlpb.CreateRolloutResponse, error) {
+	f.lastCreateReq = in
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	return &controlpb.CreateRolloutResponse{RolloutId: f.rolloutID}, nil
+}
+
+func (f *fakeControlPublisher) PromoteRollout(ctx context.Context, in *controlpb.PromoteRolloutRequest, opts ...grpc.CallOption) (*controlpb.PromoteRolloutResponse, error) {
+	f.lastPromoteReq = in
+	if f.promoteErr != nil {
+		return nil, f.promoteErr
+	}
+	return &controlpb.PromoteRolloutResponse{NewStage: f.newStage}, nil
+}
+
+func (f *fakeControlPublisher) AbortRollout(ctx context.Context, in *controlpb.AbortRolloutRequest, opts ...grpc.CallOption) (*controlpb.AbortRolloutResponse, error) {
+	f.lastAbortReq = in
+	if f.abortErr != nil {
+		return nil, f.abortErr
+	}
+	return &controlpb.AbortRolloutResponse{}, nil
 }
 
 func testServer(control controlPublisher, auditWriter audit.Writer) *server {
@@ -125,5 +159,140 @@ func TestPublishModelVersionNoIdentityFailsClosed(t *testing.T) {
 	}
 	if len(auditW.Entries) != 0 {
 		t.Errorf("got %d audit entries, want 0 — no real identity to attribute one to", len(auditW.Entries))
+	}
+}
+
+func TestStartRolloutSuccess(t *testing.T) {
+	control := &fakeControlPublisher{rolloutID: "r-1"}
+	auditW := audit.NewFakeWriter()
+	s := testServer(control, auditW)
+
+	resp, err := s.StartRollout(adminCtx(), &pb.StartRolloutRequest{
+		ModelRef: "openai", VersionId: "v-2", StrategyJson: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("StartRollout: %v", err)
+	}
+	if resp.GetRolloutId() != "r-1" {
+		t.Errorf("rollout_id = %q, want r-1", resp.GetRolloutId())
+	}
+	if control.lastCreateReq.GetModelRef() != "openai" || control.lastCreateReq.GetVersionId() != "v-2" {
+		t.Errorf("unexpected CreateRollout request: %+v", control.lastCreateReq)
+	}
+	if len(auditW.Entries) != 1 || auditW.Entries[0].Action != "start_rollout" || auditW.Entries[0].Actor != "u1" {
+		t.Fatalf("unexpected audit entries: %+v", auditW.Entries)
+	}
+}
+
+func TestStartRolloutControlPlaneFailureIsAudited(t *testing.T) {
+	control := &fakeControlPublisher{createErr: errors.New("model_ref already has a running rollout")}
+	auditW := audit.NewFakeWriter()
+	s := testServer(control, auditW)
+
+	_, err := s.StartRollout(adminCtx(), &pb.StartRolloutRequest{ModelRef: "openai", VersionId: "v-2", StrategyJson: `{}`})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("err = %v, want codes.Internal", err)
+	}
+	if len(auditW.Entries) != 1 || auditW.Entries[0].Action != "start_rollout_failed" {
+		t.Fatalf("unexpected audit entries: %+v", auditW.Entries)
+	}
+}
+
+func TestStartRolloutAuditFailureFailsTheCall(t *testing.T) {
+	control := &fakeControlPublisher{rolloutID: "r-1"}
+	auditW := audit.NewFakeWriter()
+	auditW.Err = errors.New("audit_log insert failed")
+	s := testServer(control, auditW)
+
+	_, err := s.StartRollout(adminCtx(), &pb.StartRolloutRequest{ModelRef: "openai", VersionId: "v-2", StrategyJson: `{}`})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("err = %v, want codes.Internal — an unaudited success must not reach the caller as success", err)
+	}
+}
+
+func TestPromoteRolloutSuccess(t *testing.T) {
+	control := &fakeControlPublisher{newStage: "canary_10"}
+	auditW := audit.NewFakeWriter()
+	s := testServer(control, auditW)
+
+	resp, err := s.PromoteRollout(adminCtx(), &pb.PromoteRolloutRequest{RolloutId: "r-1"})
+	if err != nil {
+		t.Fatalf("PromoteRollout: %v", err)
+	}
+	if resp.GetNewStage() != "canary_10" {
+		t.Errorf("new_stage = %q, want canary_10", resp.GetNewStage())
+	}
+	if control.lastPromoteReq.GetRolloutId() != "r-1" {
+		t.Errorf("unexpected PromoteRollout request: %+v", control.lastPromoteReq)
+	}
+	if len(auditW.Entries) != 1 || auditW.Entries[0].Action != "promote_rollout" || auditW.Entries[0].Target != "r-1" {
+		t.Fatalf("unexpected audit entries: %+v", auditW.Entries)
+	}
+}
+
+func TestPromoteRolloutAuditFailureFailsTheCall(t *testing.T) {
+	control := &fakeControlPublisher{newStage: "stable"}
+	auditW := audit.NewFakeWriter()
+	auditW.Err = errors.New("audit_log insert failed")
+	s := testServer(control, auditW)
+
+	_, err := s.PromoteRollout(adminCtx(), &pb.PromoteRolloutRequest{RolloutId: "r-1"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("err = %v, want codes.Internal", err)
+	}
+}
+
+func TestAbortRolloutSuccess(t *testing.T) {
+	control := &fakeControlPublisher{}
+	auditW := audit.NewFakeWriter()
+	s := testServer(control, auditW)
+
+	if _, err := s.AbortRollout(adminCtx(), &pb.AbortRolloutRequest{RolloutId: "r-1"}); err != nil {
+		t.Fatalf("AbortRollout: %v", err)
+	}
+	if control.lastAbortReq.GetRolloutId() != "r-1" {
+		t.Errorf("unexpected AbortRollout request: %+v", control.lastAbortReq)
+	}
+	if len(auditW.Entries) != 1 || auditW.Entries[0].Action != "abort_rollout" {
+		t.Fatalf("unexpected audit entries: %+v", auditW.Entries)
+	}
+}
+
+func TestAbortRolloutControlPlaneFailureIsAudited(t *testing.T) {
+	control := &fakeControlPublisher{abortErr: errors.New("rollout is not running")}
+	auditW := audit.NewFakeWriter()
+	s := testServer(control, auditW)
+
+	_, err := s.AbortRollout(adminCtx(), &pb.AbortRolloutRequest{RolloutId: "r-1"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("err = %v, want codes.Internal", err)
+	}
+	if len(auditW.Entries) != 1 || auditW.Entries[0].Action != "abort_rollout_failed" {
+		t.Fatalf("unexpected audit entries: %+v", auditW.Entries)
+	}
+}
+
+// TestRolloutRPCsNoIdentityFailClosed covers all three new handlers with
+// the same defensive no-identity case PublishModelVersion already has —
+// unreachable in practice (authn's interceptor runs first) but must fail
+// closed regardless, and must never attempt an audit write with no real
+// actor to attribute it to.
+func TestRolloutRPCsNoIdentityFailClosed(t *testing.T) {
+	control := &fakeControlPublisher{rolloutID: "r-1", newStage: "canary_10"}
+	auditW := audit.NewFakeWriter()
+	s := testServer(control, auditW)
+	ctx := context.Background()
+
+	if _, err := s.StartRollout(ctx, &pb.StartRolloutRequest{ModelRef: "openai", VersionId: "v-2", StrategyJson: `{}`}); status.Code(err) != codes.Internal {
+		t.Errorf("StartRollout: err = %v, want codes.Internal", err)
+	}
+	if _, err := s.PromoteRollout(ctx, &pb.PromoteRolloutRequest{RolloutId: "r-1"}); status.Code(err) != codes.Internal {
+		t.Errorf("PromoteRollout: err = %v, want codes.Internal", err)
+	}
+	if _, err := s.AbortRollout(ctx, &pb.AbortRolloutRequest{RolloutId: "r-1"}); status.Code(err) != codes.Internal {
+		t.Errorf("AbortRollout: err = %v, want codes.Internal", err)
+	}
+	if len(auditW.Entries) != 0 {
+		t.Errorf("got %d audit entries, want 0 — no real identity to attribute any to", len(auditW.Entries))
 	}
 }

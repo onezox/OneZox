@@ -23,6 +23,10 @@ const (
 	ControlService_GetModelManifest_FullMethodName      = "/control.v1.ControlService/GetModelManifest"
 	ControlService_ListModels_FullMethodName            = "/control.v1.ControlService/ListModels"
 	ControlService_IssueProviderToken_FullMethodName    = "/control.v1.ControlService/IssueProviderToken"
+	ControlService_CreateRollout_FullMethodName         = "/control.v1.ControlService/CreateRollout"
+	ControlService_PromoteRollout_FullMethodName        = "/control.v1.ControlService/PromoteRollout"
+	ControlService_AbortRollout_FullMethodName          = "/control.v1.ControlService/AbortRollout"
+	ControlService_GetRolloutStatus_FullMethodName      = "/control.v1.ControlService/GetRolloutStatus"
 )
 
 // ControlServiceClient is the client API for ControlService service.
@@ -33,6 +37,10 @@ type ControlServiceClient interface {
 	GetModelManifest(ctx context.Context, in *GetModelManifestRequest, opts ...grpc.CallOption) (*GetModelManifestResponse, error)
 	ListModels(ctx context.Context, in *ListModelsRequest, opts ...grpc.CallOption) (*ListModelsResponse, error)
 	IssueProviderToken(ctx context.Context, in *IssueProviderTokenRequest, opts ...grpc.CallOption) (*IssueProviderTokenResponse, error)
+	CreateRollout(ctx context.Context, in *CreateRolloutRequest, opts ...grpc.CallOption) (*CreateRolloutResponse, error)
+	PromoteRollout(ctx context.Context, in *PromoteRolloutRequest, opts ...grpc.CallOption) (*PromoteRolloutResponse, error)
+	AbortRollout(ctx context.Context, in *AbortRolloutRequest, opts ...grpc.CallOption) (*AbortRolloutResponse, error)
+	GetRolloutStatus(ctx context.Context, in *GetRolloutStatusRequest, opts ...grpc.CallOption) (*GetRolloutStatusResponse, error)
 }
 
 type controlServiceClient struct {
@@ -83,6 +91,46 @@ func (c *controlServiceClient) IssueProviderToken(ctx context.Context, in *Issue
 	return out, nil
 }
 
+func (c *controlServiceClient) CreateRollout(ctx context.Context, in *CreateRolloutRequest, opts ...grpc.CallOption) (*CreateRolloutResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateRolloutResponse)
+	err := c.cc.Invoke(ctx, ControlService_CreateRollout_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlServiceClient) PromoteRollout(ctx context.Context, in *PromoteRolloutRequest, opts ...grpc.CallOption) (*PromoteRolloutResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PromoteRolloutResponse)
+	err := c.cc.Invoke(ctx, ControlService_PromoteRollout_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlServiceClient) AbortRollout(ctx context.Context, in *AbortRolloutRequest, opts ...grpc.CallOption) (*AbortRolloutResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AbortRolloutResponse)
+	err := c.cc.Invoke(ctx, ControlService_AbortRollout_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlServiceClient) GetRolloutStatus(ctx context.Context, in *GetRolloutStatusRequest, opts ...grpc.CallOption) (*GetRolloutStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRolloutStatusResponse)
+	err := c.cc.Invoke(ctx, ControlService_GetRolloutStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServiceServer is the server API for ControlService service.
 // All implementations must embed UnimplementedControlServiceServer
 // for forward compatibility.
@@ -91,6 +139,10 @@ type ControlServiceServer interface {
 	GetModelManifest(context.Context, *GetModelManifestRequest) (*GetModelManifestResponse, error)
 	ListModels(context.Context, *ListModelsRequest) (*ListModelsResponse, error)
 	IssueProviderToken(context.Context, *IssueProviderTokenRequest) (*IssueProviderTokenResponse, error)
+	CreateRollout(context.Context, *CreateRolloutRequest) (*CreateRolloutResponse, error)
+	PromoteRollout(context.Context, *PromoteRolloutRequest) (*PromoteRolloutResponse, error)
+	AbortRollout(context.Context, *AbortRolloutRequest) (*AbortRolloutResponse, error)
+	GetRolloutStatus(context.Context, *GetRolloutStatusRequest) (*GetRolloutStatusResponse, error)
 	mustEmbedUnimplementedControlServiceServer()
 }
 
@@ -112,6 +164,18 @@ func (UnimplementedControlServiceServer) ListModels(context.Context, *ListModels
 }
 func (UnimplementedControlServiceServer) IssueProviderToken(context.Context, *IssueProviderTokenRequest) (*IssueProviderTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method IssueProviderToken not implemented")
+}
+func (UnimplementedControlServiceServer) CreateRollout(context.Context, *CreateRolloutRequest) (*CreateRolloutResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateRollout not implemented")
+}
+func (UnimplementedControlServiceServer) PromoteRollout(context.Context, *PromoteRolloutRequest) (*PromoteRolloutResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PromoteRollout not implemented")
+}
+func (UnimplementedControlServiceServer) AbortRollout(context.Context, *AbortRolloutRequest) (*AbortRolloutResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbortRollout not implemented")
+}
+func (UnimplementedControlServiceServer) GetRolloutStatus(context.Context, *GetRolloutStatusRequest) (*GetRolloutStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRolloutStatus not implemented")
 }
 func (UnimplementedControlServiceServer) mustEmbedUnimplementedControlServiceServer() {}
 func (UnimplementedControlServiceServer) testEmbeddedByValue()                        {}
@@ -206,6 +270,78 @@ func _ControlService_IssueProviderToken_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlService_CreateRollout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateRolloutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServiceServer).CreateRollout(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlService_CreateRollout_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServiceServer).CreateRollout(ctx, req.(*CreateRolloutRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlService_PromoteRollout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PromoteRolloutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServiceServer).PromoteRollout(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlService_PromoteRollout_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServiceServer).PromoteRollout(ctx, req.(*PromoteRolloutRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlService_AbortRollout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbortRolloutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServiceServer).AbortRollout(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlService_AbortRollout_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServiceServer).AbortRollout(ctx, req.(*AbortRolloutRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlService_GetRolloutStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRolloutStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServiceServer).GetRolloutStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlService_GetRolloutStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServiceServer).GetRolloutStatus(ctx, req.(*GetRolloutStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlService_ServiceDesc is the grpc.ServiceDesc for ControlService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -228,6 +364,22 @@ var ControlService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "IssueProviderToken",
 			Handler:    _ControlService_IssueProviderToken_Handler,
+		},
+		{
+			MethodName: "CreateRollout",
+			Handler:    _ControlService_CreateRollout_Handler,
+		},
+		{
+			MethodName: "PromoteRollout",
+			Handler:    _ControlService_PromoteRollout_Handler,
+		},
+		{
+			MethodName: "AbortRollout",
+			Handler:    _ControlService_AbortRollout_Handler,
+		},
+		{
+			MethodName: "GetRolloutStatus",
+			Handler:    _ControlService_GetRolloutStatus_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
