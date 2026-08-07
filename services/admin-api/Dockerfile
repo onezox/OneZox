@@ -9,11 +9,23 @@
 # Confirmed live (Step E): `find /build/internal` inside the builder stage
 # shows pb/ and graph/ both actually present in the build context, not
 # just the repo.
+#
+# `COPY *.go ./`, not `COPY main.go ./`: Step E's own original version of
+# this line named main.go individually and hit the EXACT same class of gap
+# one step later, at Step H — adding server.go as a second top-level file
+# broke the Docker build (`undefined: server`) because the explicit
+# COPY line never mentioned it. Caught immediately by the build itself
+# failing loud (Go's own "undefined" compile error), not silently, but
+# it's the same lesson this file's own header already warned about,
+# recurring at a different scope (top-level files, not just internal/
+# subdirectories) — fixed here with a wildcard for the same reason
+# internal/ already gets a blanket copy: no per-file line left to forget
+# as more top-level files are added.
 FROM docker.io/library/golang:1.26-bookworm AS builder
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go ./
+COPY *.go ./
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -o /admin-api .
 
