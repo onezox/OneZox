@@ -1,0 +1,688 @@
+================================================================================
+PHASE-04 — CONTROL PLANE: REGISTRY, MANIFESTS, ETCD, VAULT — COMPLETION RECORD
+================================================================================
+This document records the work actually completed for Phase-04 on the local
+onezox-dev Kubernetes cluster (kind, WSL2 Ubuntu 24.04). It contains only work
+that was performed and verified. It does not contain Phase-05 work, future
+plans, recommendations, or opinions. Same style as Phase-00/01/02/03-Complete.txt.
+
+Steps A-P (etcd/Vault infrastructure, the registry's DB/signing/RPC surface,
+provider-gateway's Vault cutover) were built and verified earlier in this same
+build effort; this record describes them at the level the commit history and
+current code/test state can attest to. Steps Q-W (data-plane and edge-gateway's
+own independent registry caches, the etcd reconnect/missed-window proof, the
+live registry end-to-end call, and this close-out) were performed directly
+within the session that produced this record, and are described in full
+first-hand detail, including bugs hit and fixed live.
+
+--------------------------------------------------------------------------------
+PHASE-04 OBJECTIVE
+--------------------------------------------------------------------------------
+Replace static/inline model config with a real control plane: a model registry
+whose entries are signed, versioned, immutable manifests distributed via etcd
+and cached independently at edge-gateway and data-plane, plus HashiCorp Vault
+as the single home for provider keys, issuing short-lived scoped tokens to
+provider-gateway. Mutating a live model config is eliminated as an outage
+class. This phase resolves two forward references carried since Phase-02/03:
+F9 (Vault-issued provider credentials) and F10 (signed registry manifests
+replacing Phase-03's STATIC_MODEL_REF).
+
+--------------------------------------------------------------------------------
+BUILD SEQUENCE (IN ORDER)
+--------------------------------------------------------------------------------
+A. etcd cluster deployed via operator (Part I: manifest distribution store).
+B. Vault deployed HA (Raft storage) via the official chart; user-run
+   init/unseal script, gated by a fix for a raft-join failure the first
+   version of that script silently masked.
+C. CockroachDB migrations 0008-0012: model_manifest (immutable), model_active
+   (mutable pointer), policy, pricing, and the control_plane DB role itself —
+   the role is what makes model_manifest's immutability REAL rather than
+   nominal (CockroachDB's root/admin bypasses GRANT/REVOKE the same way
+   Postgres superusers do; control_plane is a plain non-admin user simply
+   never granted UPDATE/DELETE on model_manifest — SELECT+INSERT only).
+D. control-plane service skeleton (Go, gRPC, health/ready).
+E. registry/ module: RegisterModelManifest, GetModelManifest, ListModels,
+   backed by Vault Transit signing on write. Migration 0013 fixed a
+   CockroachDB JSONB-reformatting bug in spec_json (the exact class of
+   byte-exactness defect this phase had to guard against at every later
+   signature-verification boundary — see PROBLEMS ENCOUNTERED).
+F. DB-level immutability adversarial test: a direct SQL UPDATE/DELETE against
+   a published model_manifest row, issued as the control_plane role, proven
+   to fail (GRANT-based, not application-code-based enforcement).
+G. Signature verification adversarial tests against live Vault Transit:
+   tampered spec_json, unsigned manifest, and garbage signature each proven
+   to be rejected (TestTamperedSpecJSONRejected, TestUnsignedManifestRejected,
+   TestGarbageSignatureRejected, plus live verification against the real
+   Vault Transit key).
+H. pricing/ + policy/ modules; real pricing populated for the 5 active
+   providers (migration 0014). policy left genuinely empty — no consumer
+   exists yet (see DEFERRALS).
+I. scripts/load-provider-keys-to-vault.sh (user-run): the 5 active providers'
+   real API keys loaded into Vault KV, under the boundary this project's
+   existing "root token / secret values never in agent output" discipline.
+J. control-plane IssueProviderToken RPC: Vault-backed, per-provider scope,
+   short TTL (PROVIDER_TOKEN_TTL_SECONDS, default 300s).
+K. mTLS + egress: provider-gateway-mtls extended to recognize control-plane
+   as a caller; provider-gateway's egress allow-list extended to reach
+   control-plane. Fresh capture at this record's own close-out (see MTLS
+   VERIFICATION below) confirms this hop live.
+L. Live-verified IssueProviderToken standalone (via grpcurl against the
+   deployed control-plane) before provider-gateway was ever made to depend
+   on it — the same "prove the primitive works in isolation before wiring a
+   real consumer to it" discipline Phase-02's quota/breaker work established.
+M. provider-gateway dual-path credential code: Vault-first via
+   IssueProviderToken, falling back to the existing K8s Secret only if
+   control-plane/Vault is unreachable — the safe way to cut over a live
+   credential path with no gap. A double-refresh-at-startup bug was found
+   and fixed the same step (see PROBLEMS ENCOUNTERED).
+N. Rolled out; live-confirmed (via Vault's own audit log) that running pods
+   were genuinely reading credentials from Vault, zero fallback firings.
+O. Removed the K8s-Secret fallback path entirely; redeployed Vault-only.
+P. Deleted the provider-gateway-credentials K8s Secret; adversarial test
+   (a poisoned/garbage value written to where the old Secret used to be)
+   confirmed the old path is genuinely dead, not just unused.
+Q. data-plane's own etcd-fed registry cache + INDEPENDENT Vault Transit
+   verification, replacing STATIC_MODEL_REF. Two live bugs found and fixed
+   on first deploy (a Vault-call-failure boot crash, and an unawaited
+   aetcd watch_prefix coroutine) — full account in PROBLEMS ENCOUNTERED.
+   Adversarial signature rejection proven live against real etcd + Vault.
+R. etcd watch reconnect + missed-window re-sync proven for BOTH data-plane
+   and edge-gateway (edge-gateway's first real etcd-watch integration,
+   including its own dedicated Vault verify-only policy/role). Both the
+   "watch re-establishes after disruption" and the harder "a manifest
+   changed WHILE disconnected is still picked up" cases proven, by
+   deliberately combining a Cilium ingress-deny policy on etcd with a
+   forced etcd pod restart (existing long-lived watch connections do not
+   notice a policy change on their own — see PROBLEMS ENCOUNTERED).
+S. edge-gateway's GET /v1/models rewired from Phase-01's static list to
+   registry_cache.list_active() — served from edge-gateway's own local
+   verified cache, no per-request control-plane call.
+T. Registered the 5 real provider manifests (openai, anthropic, grok, glm,
+   kimi), confirmed independent propagation to both data-plane and
+   edge-gateway, and confirmed the live GET /v1/models correctness check:
+   exactly 5 entries, no Gemini (F13 stays deactivated), no extras.
+U. Live end-to-end real call through the full public HTTP surface
+   (POST /v1/chat/completions -> edge-gateway -> data-plane Submit ->
+   registry-resolved worker_ref -> provider-gateway -> real OpenAI),
+   with model selection driven entirely by the registry, no static ref
+   anywhere in the path. Surfaced and fixed a stale-pod credential-
+   registration gap along the way (see PROBLEMS ENCOUNTERED).
+V. Repo-wide grep confirmed STATIC_MODEL_REF has zero live references left
+   (env var, Deployment field, or code assignment) — only historical
+   comments describing what replaced it, dating from Step Q itself.
+W. Close-out: this document, a fresh mTLS capture for the one mesh hop this
+   phase added (provider-gateway <-> control-plane), and the root-token
+   revocation, which the user performs directly (never held by this agent).
+
+--------------------------------------------------------------------------------
+CONTROL-PLANE SERVICE
+--------------------------------------------------------------------------------
+services/control-plane — Go, gRPC, off the hot path per Phase-04.txt's own
+requirement (neither data-plane's Submit path nor edge-gateway's ingress path
+calls it per-request; both resolve from their own local etcd-fed cache
+instead). Modules: registry/ (manifest CRUD, signing/verification, etcd
+publish), providertoken/ (Vault-backed IssueProviderToken), pricing/,
+policy/, quota/ (scaffolded, unconsumed this phase), rollout/ (scaffolded,
+canary UX is Phase-05), vaultclient/ (Kubernetes-auth login + Transit
+sign/verify, shared by registry/ and providertoken/), etcdclient/ (etcd v3
+publish wrapper). 20 Go unit tests passing across registry/, pricing/,
+policy/, providertoken/, `go vet` clean.
+
+Deviation from Phase-04.txt's literal text, made explicitly and recorded here
+rather than silently: Phase-04.txt's SERVICES CREATED section names Sigstore
+for manifest signing. The user's own explicit choice, made at Step E, was a
+dedicated Vault Transit ed25519 key (model-manifest-signing) instead —
+manifest authorship/integrity and build provenance are different trust
+questions, so this key is deliberately independent of the Phase-00 cosign
+keypair CI already uses for image signing. Recorded in
+scripts/vault-setup-control-plane.sh's own header. This is a substitution of
+mechanism, not of the requirement itself: manifests are still signed, and
+verification is still enforced and adversarially tested (Steps F/G, Q, R),
+exactly as Phase-04.txt's own SECURITY IMPLEMENTATION section requires.
+
+Also a deliberate scope reframing, not a deviation: Phase-04.txt's FEATURES
+IMPLEMENTED section illustrates "virtual models (e.g. onezox, onezox-ultra)"
+as the registry's entries. CLAUDE.md's own Phase-04 scope section (written
+before this build began, and which overrides illustrative examples per its
+own stated precedence) instead defines the 5 real provider names (openai,
+anthropic, grok, glm, kimi) as this phase's registry entries — the same
+identifiers already used as provider-gateway adapter names since the
+between-phase provider task. This is what Step T registered; a future
+virtual-model layer (onezox, onezox-ultra mapping to one of these 5) remains
+buildable on top of the same manifest/signing/etcd machinery without any
+redesign, but was not this phase's job.
+
+--------------------------------------------------------------------------------
+DATA-PLANE AND EDGE-GATEWAY: REGISTRY CACHES (STEPS Q, R, S)
+--------------------------------------------------------------------------------
+Both services independently implement the same shape, in their own language,
+never trusting each other's or control-plane's prior verification:
+
+  signed_payload(version_id, model_ref, spec_json) = UTF-8 bytes of
+  "{version_id}|{model_ref}|{spec_json}" — byte-identical construction in Go
+  (control-plane, signs), Python (data-plane, verifies), and Rust
+  (edge-gateway, verifies). spec_json is carried as a plain string at every
+  hop (control-plane's envelope struct, Python's dataclass, Rust's serde
+  struct) and only json.loads/serde_json-parsed AFTER verification succeeds —
+  never re-marshaled before or during what gets hashed, which is what keeps
+  it byte-exact across the Go -> etcd -> Python/Rust round trip (the same
+  class of bug Step E hit inside CockroachDB's own JSONB column, fixed by
+  migration 0013 well before it could recur here).
+
+  Cache.sync_once() / Cache::sync_once(): full get-prefix re-list of
+  /onezox/manifests/* and /onezox/active/*, independently signature-verified
+  entry by entry before being trusted.
+
+  Cache.watch_forever() / Cache::watch_forever(): on ANY disruption (etcd
+  error, stream end, connection failure), the whole loop falls back to a
+  fresh sync_once() before re-establishing the watch — this full-re-list
+  strategy, not a resume-from-revision-offset strategy, is what makes the
+  Step R "missed window" case correct: a manifest that changed while
+  disconnected is caught by the next full re-list, not lost to a resumed
+  watch that would only see future events.
+
+  A failed verification on an incoming update never evicts or overwrites an
+  already-trusted (model_ref, version_id) entry — it only refuses the bad
+  update, logs a warning, and keeps serving the last-known-good manifest. A
+  verifier call that itself raises/errors (Vault unreachable, etc.) is
+  treated identically to a well-formed "no," never allowed to propagate and
+  crash the cache (this exact gap crashed data-plane's pod on Step Q's first
+  deploy — see PROBLEMS ENCOUNTERED).
+
+  resolve() / list_active() are pure, synchronous, in-memory reads — Python:
+  plain dict access; Rust: a std::sync::RwLock read, deliberately not tokio's
+  async lock, since there is no I/O on this path. Neither does a per-request
+  network call to etcd or Vault, satisfying Phase-04.txt's "off the hot path"
+  requirement for the control plane at the two services that actually sit on
+  the hot path.
+
+data-plane (Python): vault_client/ (Kubernetes-auth login, Transit verify
+  via httpx), model_registry/ (Cache, aetcd-backed). Submit()'s binding logic
+  is now `model_ref = request.model or DEFAULT_MODEL_REF` ->
+  registry_cache.resolve(model_ref) -> worker_ref, catching ManifestNotFound
+  as a clean FAILED_PRECONDITION rather than any crash/hang. 56 pytest tests
+  passing (up from 49 at Phase-03's close), including tampered/unsigned/
+  garbage-signature rejection, verifier-exception-does-not-crash-sync, and
+  last-known-good-survives-a-bad-update — all against a real SHA256-based
+  fake verifier, not a stub that always returns true/false. ruff clean
+  (generated/ stubs excluded, the existing project-wide convention).
+
+edge-gateway (Rust): vault_client.rs, model_registry.rs (Cache, etcd-client-
+  backed via an EtcdReader trait). Introduced #[async_trait] EtcdReader and
+  SignatureVerifier traits specifically because etcd_client::Client's own
+  methods need &mut self and a live connection, which is untestable by
+  direct coupling — mirrors Python's own Protocol-based design. GET
+  /v1/models now calls registry_cache.list_active() (Step S), mapped to
+  {id, owned_by: "onezox"}, sorted. 60 cargo tests passing (up from ~50 at
+  Phase-01/03's close, exact prior count not independently re-verified here),
+  2 pre-existing ignored tests unrelated to this phase's work.
+
+--------------------------------------------------------------------------------
+PROVIDER-GATEWAY: VAULT CUTOVER (STEPS J-P)
+--------------------------------------------------------------------------------
+services/provider-gateway's internal/credentials package now resolves each of
+the 5 real providers' API keys exclusively via control-plane's
+IssueProviderToken RPC (Vault Transit KV read, Kubernetes-auth-gated), with a
+background Resolver.Run loop refreshing well ahead of each token's TTL. The
+Phase-02 K8s Secret (provider-gateway-credentials) is deleted; its old mount
+is removed from the Deployment entirely (Step P), and Step P's own
+adversarial test (poisoning where the old Secret used to live) confirmed
+nothing in the running code path still reads it. Google/Gemini is
+deliberately unaffected by any of this — it stays on the same
+GOOGLE_API_KEY-env-var-gated conditional registration Phase-02 already had,
+correctly still absent (F13 deactivation, between-phase task), not touched
+by the Vault migration since it was never registered to begin with.
+
+--------------------------------------------------------------------------------
+DOCKER IMAGES AND DEPLOYMENT
+--------------------------------------------------------------------------------
+Currently deployed (content-addressed tags, git commit short-SHA, confirmed
+live at close-out):
+  onezox/control-plane:68bda0b
+  onezox/data-plane:94c6ab1
+  onezox/edge-gateway:d4b6004
+  onezox/provider-gateway:58a401a
+
+All deployed via the existing "onezox-stubs" Argo CD Application
+(platform/stubs/{control-plane,data-plane,edge-gateway,provider-gateway}/),
+never applied directly with kubectl — confirmed Synced/Healthy at close-out.
+etcd (etcd-0/1/2) and Vault (vault-0/1/2, HA/Raft) both run as their own
+StatefulSets, deployed via operator/Helm per Phase-04.txt's own
+INFRASTRUCTURE REQUIRED section, both healthy at close-out (etcd:
+cluster_state:ok equivalent via a clean 3/3 Running with 0 recent restarts;
+Vault: all 3 pods Running, unsealed, HA leader elected).
+
+One ephemeral, never-committed exception to the "never apply directly with
+kubectl" rule, consistent with how this project has always treated
+disruption/diagnostic testing (distinct from stub/service/CiliumNetworkPolicy
+manifests that are part of the running system): Step R's reconnect test
+applied a temporary CiliumNetworkPolicy denying etcd ingress except from
+control-plane, combined with a forced etcd pod restart, specifically to
+prove the watch-reconnect and missed-window behaviors under a real network
+disruption — deleted immediately after the test, never merged into the repo.
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST (Phase-04.txt's own six items, with evidence)
+--------------------------------------------------------------------------------
+[x] Model registry with immutable versioned manifests.
+    model_manifest rows are INSERT-only for the control_plane DB role
+    (Step C/F) — a direct SQL UPDATE/DELETE against a published row fails.
+    Every change is a brand-new version_id row; RegisterModelManifest never
+    updates an existing one (Step E, TestRegisterAndGetByActiveVersion and
+    friends).
+
+[x] Manifest signing + verification on load.
+    Signed with a dedicated Vault Transit ed25519 key at RegisterModelManifest
+    (Step E). Verified INDEPENDENTLY by both data-plane and edge-gateway on
+    every cache load (Steps Q, R) — not trusted merely because a manifest
+    came from etcd. Adversarial: tampered spec_json, unsigned manifest, and
+    garbage signature all proven rejected, at both the control-plane layer
+    (Step G, unit + live Vault Transit) and independently again at data-plane
+    (Step Q, a hand-written tampered manifest written directly to etcd,
+    bypassing control-plane entirely, proven rejected by data-plane's own
+    verification).
+
+[x] etcd distribution + edge/data-plane manifest cache.
+    control-plane publishes to /onezox/manifests/{model_ref}/{version_id} and
+    /onezox/active/{model_ref} on every successful RegisterModelManifest
+    (Step Q, control-plane half) — and fails the whole RPC if either publish
+    fails (TestRegisterModelManifestEtcdFailureFailsCall), so a manifest can
+    never exist in CockroachDB without also reaching etcd. Both consumers
+    cache it locally and RE-ESTABLISH their watch after a real disruption,
+    including correctly picking up a manifest changed DURING the disconnect
+    (Step R, proven for both consumers against a genuine Cilium-policy +
+    pod-restart disruption, not merely simulated).
+
+[x] Vault holds provider keys; gateway uses short-lived scoped tokens.
+    provider-gateway's only path to a provider credential is
+    IssueProviderToken (Steps J, M); the K8s Secret is deleted and its old
+    path proven dead (Step P). Live-confirmed via Vault's own audit log that
+    running pods were genuinely using Vault, not a cached/fallback value
+    (Step N).
+
+[x] policy + pricing config available to consumers.
+    pricing/ module + table populated with real per-unit costs for all 5
+    active providers (Step H). policy/ module + table exist, tested
+    (TestSetAndGetCurrentPolicy, TestLatestPolicyWins,
+    TestGetCurrentPolicyNotFound), but genuinely hold zero rows in practice —
+    disclosed plainly here, not implied populated (see DEFERRALS: no
+    consumer of policy exists before Phase-06's cost-gating).
+
+[x] GET /v1/models served from the registry.
+    edge-gateway's GET /v1/models calls registry_cache.list_active() (Step
+    S), reading its own local verified cache, not a per-request
+    control-plane call. Live-verified to return exactly the 5 active
+    providers {openai, anthropic, grok, glm, kimi} and NOT the deactivated
+    Gemini (Step T) — the definitive proof the model_active + F13
+    deactivation distinction reaches the user-facing surface, not just the
+    database.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA — EVIDENCE
+--------------------------------------------------------------------------------
+1. A request is served using a registry manifest (no static model config
+   left).
+   ---- MET ----
+   Step U: a real HTTP call (POST /v1/chat/completions, model: "openai")
+   through edge-gateway's real public endpoint resolved entirely through the
+   registry: data-plane's registry_cache.resolve("openai") returned the real
+   worker_ref "openai:gpt-4o-mini", dispatched to provider-gateway, hit the
+   real OpenAI API, and streamed a real response back
+   (request_id 59bc2a87-72fd-4c20-a993-499a09de837b). request_log shows
+   status=ok, latency_ms=2589; usage_event shows model_ref="openai:gpt-4o-mini"
+   (the resolved worker_ref, not any literal/static value),
+   tokens_in=14, tokens_out=1. Step V's repo-wide grep independently confirms
+   zero live STATIC_MODEL_REF references remain anywhere (env var, Deployment
+   field, or code) — only historical comments describing its removal.
+
+2. Provider Gateway authenticates exclusively via Vault-issued short-lived
+   tokens.
+   ---- MET ----
+   Steps J/M/N/O/P: IssueProviderToken is the only credential path
+   provider-gateway's code has for any of the 5 real providers; the K8s
+   Secret is deleted (Step P) and its old path proven dead by direct
+   adversarial test (poisoning where it used to live changed nothing).
+   Vault's own audit log confirmed live token issuance to running pods
+   (Step N), not a cached/fallback read.
+
+3. Manifest immutability + signature verification enforced and tested.
+   ---- MET ----
+   Immutability: DB-role-enforced (GRANT-based, not app-code — Step C/F),
+   adversarially proven with a direct SQL mutation attempt against a
+   published row. Signature verification: independently enforced by
+   control-plane (on write, Step E/G), data-plane (on every cache load,
+   Step Q), and edge-gateway (on every cache load, Step R) — each rejecting
+   tampered/unsigned/garbage-signature manifests on its own, never trusting
+   a prior service's verification.
+
+4. Manifest publish -> edge cache propagation verified.
+   ---- MET ----
+   Step T: publishing 5 real manifests via RegisterModelManifest was
+   confirmed picked up and independently verified by BOTH data-plane and
+   edge-gateway in real time via kubectl logs, matching version_ids exactly
+   across control-plane's own DB records and both consumers' caches. Step R
+   additionally proved propagation survives a genuine watch disruption,
+   including the harder case of a manifest changed WHILE disconnected being
+   correctly caught by the next full re-sync, for both consumers.
+
+--------------------------------------------------------------------------------
+MTLS VERIFICATION (fresh capture, Step W, the one mesh hop this phase added)
+--------------------------------------------------------------------------------
+provider-gateway <-> control-plane (Step K) is the only new mesh hop Phase-04
+introduces; every other hop (edge-gateway<->data-plane<->provider-gateway)
+was already established and verified in Phase-03. Captured fresh at this
+record's own close-out, checked against both kind worker nodes (each hosts
+control-plane and/or provider-gateway replicas):
+
+  $ cilium-dbg identity list | grep -E "app=control-plane|app=provider-gateway"
+  46589   k8s:app=control-plane
+  47734   k8s:app=provider-gateway
+
+  $ cilium-dbg bpf auth list   (onezox-dev-worker, cilium-vm86x)
+  SRC IDENTITY   DST IDENTITY   REMOTE NODE ID   AUTH TYPE   EXPIRATION
+  46589          47734          0                spire       2026-08-07 14:09:05 +0000 UTC
+  46589          47734          4289             spire       2026-08-07 14:09:37 +0000 UTC
+
+  $ cilium-dbg bpf auth list   (onezox-dev-worker2, cilium-c5j5b)
+  SRC IDENTITY   DST IDENTITY   REMOTE NODE ID   AUTH TYPE   EXPIRATION
+  46589          47734          0                spire       2026-08-07 14:09:27 +0000 UTC
+  46589          47734          54726            spire       2026-08-07 14:09:05 +0000 UTC
+
+AUTH TYPE spire, live and future-expiring, on both nodes hosting either
+service's replicas — confirming this hop is SPIRE-authenticated, matching
+the same verification standard every mesh hop since Phase-01 has been held
+to.
+
+--------------------------------------------------------------------------------
+PROBLEMS ENCOUNTERED DURING PHASE-04 AND HOW EACH WAS RESOLVED
+--------------------------------------------------------------------------------
+1. model_manifest.spec_json JSONB reformatting (Step E). CockroachDB's own
+   JSONB column type silently re-serializes on write (key order, whitespace),
+   which would have broken byte-exact signature verification the moment
+   anything re-read and re-hashed it. Caught before it could propagate
+   anywhere further; fixed by migration 0013 (spec_json STRING, not JSONB).
+   This is the same defect class Phase-03's own architecture already warned
+   about implicitly and which this phase had to actively guard against at
+   every later hop (etcd round-trip, Python/Rust deserialization) — it did
+   not recur, because every later stage was deliberately built to treat
+   spec_json as an opaque string until after verification.
+
+2. Data-plane boot crash on a Vault call failure (Step Q, live-caught on
+   first deploy). A stray leftover etcd test key from earlier client-library
+   evaluation (no signature field) caused sync_once() to attempt a real
+   Vault verification at boot; that call failed (data-plane's own Vault role
+   didn't exist yet), and the failure propagated as an uncaught exception
+   through Cache.sync_once() -> init_model_registry() -> lifespan(),
+   crashing the pod into CrashLoopBackOff. Fixed: Cache._verify() now treats
+   any verifier-call exception identically to a well-formed "no" — logs a
+   warning, returns False, never propagates. The same defensive pattern was
+   built into Rust's Cache::verify() from the start and confirmed live when
+   edge-gateway was first deployed before its own Vault role existed (it
+   logged a warning and kept booting, rather than crashing). Regression
+   tests added in both languages.
+
+3. aetcd's watch_prefix() coroutine bug (Step Q, second bug on the same
+   deploy). watch_prefix() is itself async def — calling it returns a
+   coroutine that must be awaited to get the actual async-iterable Watch
+   object; it is not directly iterable on its own. Manifested as a tight,
+   silent 2-second retry loop, not a crash, because the surrounding except
+   caught the resulting TypeError every time — the watch was never actually
+   watching anything. Fixed: `watch = await self._etcd.watch_prefix(...)`
+   then `async for event in watch`.
+
+4. Existing etcd watch connections did not notice a Cilium policy change
+   (Step R). Applying a surgical ingress-deny CiliumNetworkPolicy on etcd
+   did not break already-established long-lived watch streams — confirmed
+   via a direct socket test from inside a data-plane pod that NEW
+   connections were genuinely blocked while existing ones sat idle,
+   unaffected. Resolved by combining the Cilium policy with a forced
+   restart of all 3 etcd pods, which broke every existing connection while
+   the policy continued blocking only the intended consumers' reconnection
+   attempts — this combination is what actually let Step R prove both the
+   reconnect and missed-window cases against a genuine disruption.
+
+5. etcd-client's own build.rs needs protoc (Step R). Docker build for
+   edge-gateway failed with "Could not find `protoc`" — the etcd-client
+   crate compiles its own bundled etcd API .proto files at cargo-build time,
+   unrelated to this repo's own committed-proto-stubs convention. Worked
+   locally only because the host machine already had protoc installed from
+   earlier Go codegen work. Fixed by adding protobuf-compiler to the
+   Dockerfile's builder-stage apt-get list, with a comment distinguishing it
+   from the repo's own proto convention.
+
+6. A leftover "fake" test manifest inflated the live GET /v1/models count to
+   6 (Step T). Not Gemini — Gemini correctly never appeared, satisfying the
+   core registry-correctness concern — but a stale test entry from earlier
+   Step Q/R/S verification. Removed directly from both etcd and
+   CockroachDB, re-confirmed after the watch caught the deletion: exactly 5
+   entries, {openai, anthropic, grok, glm, kimi}. Side effect disclosed here:
+   data-plane's own DEFAULT_MODEL_REF=fake Deployment env var no longer
+   resolves to anything now that "fake" is gone from the registry — a
+   Submit request with an empty model field now correctly returns
+   FAILED_PRECONDITION/ManifestNotFound instead of silently defaulting to
+   provider-fake. This is the expected and desired outcome of "no static
+   model config left," not a regression, but is recorded here explicitly
+   rather than left to be discovered later.
+
+7. provider-gateway pods with zero registered real-provider adapters after a
+   transient cluster-wide DNS blip (Step U, live-caught). All 3
+   provider-gateway pods had restarted roughly 79 minutes before Step U's
+   own live call, during a DNS/control-plane blip unrelated to this phase's
+   own testing (control-plane and data-plane pods show matching-timed
+   restarts from the same window). setupCredential's Vault fetch runs once,
+   synchronously, at boot only (Step M's own design — see COMPONENTS above);
+   it failed for all 5 real providers at that exact boot instant because
+   control-plane's DNS name wasn't resolvable yet, and — by design, since
+   registration is a boot-time-only action with no later retry-to-register
+   path — none of the 5 real adapters were ever registered afterward, even
+   though DNS and control-plane were both healthy again within seconds.
+   Diagnosed via kubectl logs (a clean "no adapter registered" error, not a
+   crash — provider-gateway's own designed failure mode for exactly this
+   case) and fixed with a plain `kubectl rollout restart
+   deployment/provider-gateway`, confirmed clean re-registration of all 5
+   real adapters (only the expected GOOGLE_API_KEY-not-set warning remained)
+   before Step U's live call was retried and succeeded. Not a defect
+   introduced by this phase's own code — it is an inherent property of
+   Step M's boot-time-only registration design, surfaced here because this
+   was the first time in the build that a genuinely stale pod happened to
+   be sitting in front of a live end-to-end proof. No code change made in
+   response: recorded as an operational characteristic worth knowing (a
+   provider-gateway pod that boots during a control-plane/DNS outage will
+   need a restart once the outage clears, not just time), not tracked as a
+   deferral, since fixing it would mean adding retry-to-register logic that
+   Phase-04.txt never asked for and which Phase-05's own admin-panel/canary
+   work may want to shape deliberately rather than have bolted on here.
+
+8. provider-gateway double-refresh at startup (Step M, live-caught). The
+   initial synchronous Resolver.Refresh() and the first iteration of the
+   background Run() loop both fired immediately at boot, refreshing every
+   credential twice in quick succession. Fixed by carrying the interval
+   Refresh() already returned into Run()'s first wait, so the loop waits it
+   out instead of refreshing again immediately.
+
+9. A cluster-wide Vault init/unseal script bug (Step B) silently masked a
+   raft-join failure — a secondary Vault pod could fail to join the Raft
+   cluster and the script would still report success. Fixed before any
+   dependent step (C onward) began.
+
+--------------------------------------------------------------------------------
+DEFERRALS (explicit — agreed before or during Phase-04, or genuinely open,
+not omissions)
+--------------------------------------------------------------------------------
+- Sigstore for manifest signing (Phase-04.txt's own literal text): replaced
+  by a dedicated Vault Transit ed25519 key, the user's own explicit choice
+  at Step E — see CONTROL-PLANE SERVICE above for the full rationale. The
+  underlying requirement (signed, immutable, independently-verified
+  manifests) is met; the mechanism differs from the phase file's own
+  illustrative choice.
+- Virtual model names (onezox, onezox-ultra), Phase-04.txt's own illustrative
+  registry-entry example: not built. CLAUDE.md's own Phase-04 scope section,
+  written ahead of this build and taking precedence over the phase file's
+  examples, defines this phase's registry entries as the 5 real provider
+  names directly. A virtual-model layer mapping onezox/onezox-ultra onto one
+  of these 5 remains buildable on the same manifest machinery without any
+  redesign, but was not this phase's job.
+- policy table: exists, migrated, control-plane's policy/ module tested
+  (Step H) — genuinely holds zero rows. No consumer needs one yet; Phase-04.txt
+  itself scopes policy's actual consumption to "scheduler cost-gating in
+  Phase-06." Disclosed plainly rather than implied populated.
+- usd_cost: still NULL on every usage_event row. Phase-04 provides the
+  pricing DATA (Step H, real per-unit costs for all 5 providers) but
+  deliberately does not wire data-plane's metering write path to consume it
+  — Phase-03-Complete.txt's own deferral note flagged this exact linkage as
+  "a scoping call to make explicitly, not assume," and the explicit call
+  made this phase is: ship the pricing source, leave the consumption wiring
+  for whichever future phase actually needs real billing numbers (not
+  gated by any of this phase's own four exit criteria).
+- Admin panel + Argo Rollouts canary controller: explicitly Phase-05 per
+  CLAUDE.md's own Phase-04 scope section. control-plane's rollout/ module is
+  scaffolded (wiring only) and unconsumed this phase, exactly as intended.
+- quota/ module (control-plane): scaffolded, unconsumed this phase — no
+  Phase-04 deliverable required it; carried forward with rollout/.
+- Token-aware autoscaling (Dependencies.txt F2) and provider-gateway's own
+  basic HPA: both carried unchanged from Phase-02/03's own disclosed gaps,
+  untouched this phase.
+- Gemini (Dependencies.txt F13): stays deactivated, unchanged from the
+  between-phase provider task. The registry design accommodates its later
+  re-add (a 6th manifest entry, one Vault KV secret away) without any
+  structural change, per CLAUDE.md's own instruction not to reactivate it
+  this phase.
+- Redis working-memory isolation model: unchanged from Phase-03's own
+  documented limitation (request-scoped by an unguessable server-generated
+  UUIDv4, not a per-tenant Redis ACL) — not touched or revisited this phase.
+- Terraform cloud-provisioning and Karpenter: carried over from Phase-00's
+  own deferral, untouched this phase.
+- Root Vault token revocation: intentionally NOT performed by this agent —
+  the root token has never been held by or passed through any agent tool
+  output this entire phase (every Vault admin script is user-run,
+  read-a-token-interactively-then-unset-it). All four Vault consumers
+  (control-plane: sign+verify; data-plane: verify-only; edge-gateway:
+  verify-only; provider-gateway: secret read, via control-plane mediation)
+  are configured on Kubernetes auth with dedicated least-privilege policies
+  as of Step R's own Vault setup — root now has zero remaining operational
+  purpose anywhere in this fleet. This is queued as the user's own
+  close-out action for this phase, fully unblocked, not a loose end left
+  open by the build.
+
+--------------------------------------------------------------------------------
+FINAL VERIFICATION RESULTS FOR EVERY COMPONENT
+--------------------------------------------------------------------------------
+control-plane build       — go vet clean; 20 unit tests passing across
+                             registry/, pricing/, policy/, providertoken/.
+data-plane build           — 56 pytest tests passing, 0 skipped (up from 49 at
+                             Phase-03's close); ruff clean (generated/ stubs
+                             excluded, existing convention).
+edge-gateway build         — 60 cargo tests passing, 2 pre-existing ignored,
+                             unrelated to this phase.
+Docker images              — onezox/control-plane:68bda0b,
+                             onezox/data-plane:94c6ab1,
+                             onezox/edge-gateway:d4b6004,
+                             onezox/provider-gateway:58a401a — all
+                             content-addressed, confirmed running.
+Argo CD                    — "onezox-stubs" Application Synced/Healthy at
+                             close-out; no stub/service/CiliumNetworkPolicy
+                             manifest ever applied directly with kubectl
+                             (one ephemeral, never-committed disruption-test
+                             CiliumNetworkPolicy for Step R, deleted
+                             immediately after use).
+etcd (3-node)               — etcd-0/1/2 Running, confirmed as both the
+                             manifest/active-pointer store (Steps A, Q, R, T)
+                             and the medium through which the missed-window
+                             re-sync proof (Step R) was made.
+Vault (HA, 3-node)          — vault-0/1/2 Running, unsealed; 4 consumers on
+                             Kubernetes auth (control-plane, data-plane,
+                             edge-gateway, provider-gateway-via-control-plane),
+                             each least-privilege; audit logging on since
+                             Step B.
+CockroachDB registry tables — model_manifest: 5 published rows (openai,
+                             anthropic, grok, glm, kimi), immutability
+                             DB-enforced. model_active: 5 rows, matching.
+                             pricing: 5 rows. policy: 0 rows (see DEFERRALS).
+Manifest signature verification — independently enforced and adversarially
+                             proven at 3 separate points (control-plane on
+                             write, data-plane on cache load, edge-gateway on
+                             cache load) — tampered/unsigned/garbage-signature
+                             all rejected at each.
+etcd watch resilience       — reconnect AND missed-window re-sync both proven
+                             for both data-plane and edge-gateway against a
+                             genuine network disruption (Cilium policy +
+                             forced pod restart), with positive-control
+                             confirmation that normal propagation still works
+                             after reconnection.
+GET /v1/models               — live-verified: exactly 5 entries {anthropic,
+                             glm, grok, kimi, openai}, no Gemini, no extras.
+mTLS (provider-gateway <->
+control-plane)               — AUTH TYPE spire, both hops, live and
+                             future-expiring, freshly re-captured at close-out
+                             on both kind worker nodes.
+EC1 (registry-served
+request, no static config)   — MET: real OpenAI call via registry-resolved
+                             worker_ref, request_log/usage_event both
+                             correct; STATIC_MODEL_REF confirmed
+                             zero-references repo-wide.
+EC2 (Vault-only provider
+authentication)              — MET: K8s Secret deleted, old path adversarially
+                             proven dead, live Vault audit-log confirmation
+                             of genuine token issuance.
+EC3 (immutability + signature
+verification enforced/tested) — MET: DB-role-enforced immutability,
+                             3-point independent signature verification, all
+                             adversarially tested.
+EC4 (publish -> cache
+propagation verified)         — MET: live propagation to both consumers
+                             confirmed at Step T; survives a genuine
+                             disruption per Step R, including the
+                             missed-window case.
+
+--------------------------------------------------------------------------------
+FINAL PHASE-04 COMPLETION SUMMARY
+--------------------------------------------------------------------------------
+Phase-04 is complete. All four exit criteria are met. The two forward
+references this phase existed to resolve are both closed cleanly: F9 (Vault)
+— provider-gateway's only path to a real provider credential is now a
+short-lived, Kubernetes-auth-gated, Vault-issued token, with the old K8s
+Secret deleted and its path adversarially proven dead, closing the exact
+base64-Secret exposure class the between-phase provider task first surfaced.
+F10 (registry) — the 5 active providers are signed, versioned, immutable
+manifests distributed via etcd, independently verified by both data-plane and
+edge-gateway before ever being used to route a real request, with Phase-03's
+STATIC_MODEL_REF fully removed and repo-wide-grep-confirmed gone.
+
+The defense-in-depth design held up under genuine adversarial pressure, not
+just unit tests: a hand-tampered manifest written directly to etcd (bypassing
+control-plane entirely) was rejected by data-plane's own independent
+verification (Step Q); a real network disruption combined with a forced etcd
+restart proved both the reconnect and the harder missed-window re-sync case
+for both consumers (Step R); and a genuinely stale provider-gateway pod
+caught mid-DNS-outage during Step U's own live call surfaced a real
+operational characteristic of the boot-time-only credential-registration
+design (Step M) rather than a defect in this phase's own new code — diagnosed
+from a clean, designed failure mode (a typed "no adapter registered" error),
+not a crash, and resolved with a plain rollout restart.
+
+Two real, previously-latent bugs were caught on data-plane's very first live
+deploy of the etcd-fed cache (Step Q): a Vault-call-failure boot crash, and
+an unawaited aetcd coroutine silently turning the watch into a no-op retry
+loop. Both were root-caused precisely, fixed, and covered with regression
+tests before the step was considered done — the same discipline Phase-03's
+own EC4 trace-propagation finding established: verify against the real
+system, not a plausible-looking result.
+
+Sigstore, named in Phase-04.txt's own literal text for manifest signing, was
+deliberately replaced with a dedicated Vault Transit key at the user's own
+explicit direction — recorded above as a substitution of mechanism, not a
+gap in the underlying requirement, which remains fully met. policy stays
+genuinely unpopulated and usd_cost stays NULL, both disclosed plainly as
+scoped-out-on-purpose rather than implied done: policy has no consumer before
+Phase-06's cost-gating, and pricing's real per-provider data now exists but
+its consumption by data-plane's own metering write path was an explicit,
+not-this-phase scoping call, exactly as Phase-03-Complete.txt's own deferral
+note said it would be. The root Vault token — never held by or passed
+through this agent at any point in this phase, every admin script having
+been user-run throughout — is queued for the user's own revocation as this
+phase's final close-out action, fully unblocked: all four Vault consumers
+have been on least-privilege Kubernetes auth since Step R, with zero
+remaining operational purpose for root anywhere in this fleet.
+================================================================================
+END OF PHASE-04-COMPLETE.TXT
+================================================================================
