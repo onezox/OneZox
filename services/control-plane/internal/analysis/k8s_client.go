@@ -90,6 +90,22 @@ func (c *K8sClient) CreateForStage(ctx context.Context, rolloutID, modelRef, sta
 						// reads the Prometheus vector's own first sample.
 						"successCondition": "result[0] < 0.5",
 						"failureCondition": "result[0] >= 0.5",
+						// consecutiveErrorLimit, not left at Argo Rollouts'
+						// own unbounded-retry default: a query evaluation
+						// ERROR (as opposed to a clean pass/fail) — e.g. no
+						// data yet, confirmed live against a real cluster
+						// before Step N's own metric existed — would
+						// otherwise retry forever, leaving a real rollout
+						// stuck Running indefinitely instead of resolving
+						// one way or the other. 3 consecutive errors
+						// terminalizes to "Error," which this package's own
+						// Phase handling already treats as a rollback
+						// trigger (reconciler.go) — a query that can't get
+						// real data fails SAFE (reverts to stable) rather
+						// than hanging, the same "don't silently wait
+						// forever" discipline this project applies
+						// everywhere else.
+						"consecutiveErrorLimit": int64(3),
 					},
 				},
 			},
