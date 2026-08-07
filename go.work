@@ -12,8 +12,12 @@ go 1.26.5
 // services/control-plane joined at Phase-04 Step D: control plane
 // skeleton (registry, rollout scaffold-only, quota scaffold-only, policy,
 // pricing modules; gRPC ControlService + health/ready HTTP).
+// services/admin-api joined at Phase-05 Step E: admin-panel <-> control-
+// plane gateway skeleton (query-only GraphQL, command-only gRPC, both
+// registered with unimplemented/panic stubs — Steps F-S wire real bodies).
 // Still to come (Part Q):
 //   - services/chat-service (later: single owner of chat history)
 use ./services/provider-gateway
 use ./services/provider-fake
 use ./services/control-plane
+use ./services/admin-api

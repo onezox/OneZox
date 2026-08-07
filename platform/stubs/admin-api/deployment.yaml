@@ -1,0 +1,85 @@
+# Phase-05 Step E: admin-api skeleton — gRPC AdminService (Unimplemented
+# stubs) + query-only GraphQL (panic-stub resolvers) + health/ready.
+# RPC/resolver bodies land in later, separately-committed steps (F-S).
+#
+# 2 replicas, matching control-plane's own sizing exactly: same "off the
+# hot path" service class (Phase-05.txt: "admin-api on a control/general
+# pool"), no streaming/backpressure/coalescing to size for.
+#
+# Dedicated ServiceAccount, not the shared "default" one — same reasoning
+# control-plane's own Step E comment already documents, extended here even
+# though admin-api itself has no Vault role of its own (Decision 3's own
+# design: admin-api never talks to Vault directly) — a distinct
+# ServiceAccount is still what gives admin-api its own Cilium/SPIFFE mesh
+# identity, which is what admin-api-mtls and control-plane-mtls's new
+# admin-api ingress rule (both added this same step) actually key off.
+#
+# Image tag is the git commit short-SHA this Deployment was built at
+# (content-addressed convention, unchanged since Phase-02).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-api
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-api
+  namespace: default
+  labels:
+    app: admin-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: admin-api
+  template:
+    metadata:
+      labels:
+        app: admin-api
+    spec:
+      serviceAccountName: admin-api
+      containers:
+        - name: admin-api
+          image: onezox/admin-api:PLACEHOLDER_SHA
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: COCKROACH_HOST
+              value: onezox-crdb-public.default.svc.cluster.local
+            - name: COCKROACH_PORT
+              value: "26257"
+            - name: COCKROACH_USER
+              value: admin_api
+            - name: CONTROL_PLANE_ADDR
+              value: control-plane.default.svc.cluster.local:50051
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50051
+              name: grpc
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 192Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-api
+  namespace: default
+  labels:
+    app: admin-api
+spec:
+  selector:
+    app: admin-api
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
+    - { name: grpc, port: 50051, targetPort: 50051 }

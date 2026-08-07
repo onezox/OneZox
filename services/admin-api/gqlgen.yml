@@ -1,0 +1,27 @@
+# Schema lives in proto/ (this project's one canonical location for every
+# cross-service contract, Part Q) rather than a service-local copy — same
+# "generate/commit local bindings from the shared proto/ source" pattern
+# generate_proto.sh already uses for admin.proto/control.proto.
+schema:
+  - ../../proto/admin/v1/admin.graphql
+
+exec:
+  filename: internal/graph/generated.go
+  package: graph
+
+model:
+  filename: internal/graph/models_gen.go
+  package: graph
+
+resolver:
+  layout: single-file
+  filename: internal/graph/resolver.go
+  package: graph
+
+# ID scalar maps to string (matches every ID field's use here — UUIDs
+# passed through as plain strings, same convention control.proto already
+# uses for version_id/model_ref rather than a typed UUID message).
+models:
+  ID:
+    model:
+      - github.com/99designs/gqlgen/graphql.ID

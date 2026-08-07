@@ -222,3 +222,56 @@ spec:
               protocol: TCP
       authentication:
         mode: "required"
+    # Phase-05 Step E: admin-api's own peer rule, added the same step its
+    # gRPC client dial to control-plane first ships — same "no window
+    # where a real service is live without mesh identity" sequencing as
+    # every prior rule in this block (edge-gateway Step F2, provider-
+    # gateway Step K3, data-plane Step J, admin-api's own predecessor
+    # rules here at Step Q/S). CreateRollout/PromoteRollout/AbortRollout/
+    # GetRolloutStatus/RegisterModelManifest all arrive over this same
+    # port; no separate rule is needed per RPC — L7 authorization (which
+    # RPCs a given caller may invoke) isn't this project's established
+    # pattern, matching the note on provider-gateway's own IssueProviderToken
+    # rule above.
+    - fromEndpoints:
+        - matchLabels:
+            app: admin-api
+      toPorts:
+        - ports:
+            - port: "50051"
+              protocol: TCP
+      authentication:
+        mode: "required"
+---
+# Phase-05 Step E: admin-api's own mTLS ingress policy, added the same
+# step its Deployment first ships — same mesh-identity-safe sequencing
+# every prior service used. Host (kubelet probes) and prometheus (metrics
+# scrape) rules land now; admin-panel's own fromEndpoints rule is added at
+# Step V, when THAT service first reaches live traffic — the same
+# incremental-peer-rule-growth pattern control-plane-mtls's own header
+# documents.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: admin-api-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: admin-api
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+            - port: "50051"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
