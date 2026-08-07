@@ -137,7 +137,24 @@ func (r *Reconciler) reconcileOne(ctx context.Context, ro rollout.Rollout) {
 		// reconcileAll tick (the run==nil branch above, now reading the
 		// just-updated stage) — no recursion needed here.
 
-	case PhaseFailed, PhaseError:
+	case PhaseFailed, PhaseError, PhaseInconclusive:
+		// Inconclusive shares AutoRollback with Failed/Error rather than
+		// "still waiting," deliberately: with this package's own count:1
+		// AnalysisRun spec, Inconclusive is Argo Rollouts' own TERMINAL
+		// verdict (status.completedAt is already set) — the same object
+		// never re-evaluates and never transitions to Successful on its
+		// own. Grouping it with Pending/Running below would silently
+		// orphan the rollout at this stage forever (live-caught, not
+		// hypothetical): a thin/zero-traffic canary window makes the
+		// AnalysisTemplate's ratio a genuine 0/0 (no canary requests
+		// landed during the query's rate() window yet), which is NaN —
+		// neither successCondition nor failureCondition matches NaN, so
+		// Argo terminalizes Inconclusive instead of Successful/Failed. An
+		// ambiguous verdict gets the same fail-safe treatment the
+		// consecutiveErrorLimit fix already established for a query that
+		// can't get data at all: don't promote an unvetted canary to more
+		// live traffic on an uncertain signal, and don't hang forever
+		// either — revert to known-good stable.
 		if err := r.driver.AutoRollback(ctx, ro.RolloutID); err != nil {
 			r.log.Error("reconciler: AutoRollback failed", "rollout_id", ro.RolloutID, "stage", ro.Stage, "error", err)
 			return
@@ -145,7 +162,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, ro rollout.Rollout) {
 		r.log.Warn("reconciler: rolled back rollout automatically", "rollout_id", ro.RolloutID,
 			"model_ref", ro.ModelRef, "stage", ro.Stage, "analysis_run", run.Name, "analysis_phase", run.Phase)
 
-	case PhasePending, PhaseRunning, PhaseInconclusive:
+	case PhasePending, PhaseRunning:
 		// Still waiting — nothing to do until the next tick observes a
 		// terminal phase.
 	}

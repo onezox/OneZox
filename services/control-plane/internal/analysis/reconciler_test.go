@@ -137,12 +137,36 @@ func TestReconcilerErrorPhaseAlsoRollsBack(t *testing.T) {
 	}
 }
 
+// TestReconcilerInconclusivePhaseAlsoRollsBack: Inconclusive is Argo
+// Rollouts' own TERMINAL verdict for a count:1 AnalysisRun (status.
+// completedAt is already set — the object never re-evaluates), so it
+// gets the same fail-safe AutoRollback as Failed/Error rather than being
+// treated as "still waiting." Grouping it with Pending/Running would
+// silently orphan the rollout at this stage forever, live-caught during
+// O's own proof when a thin canary traffic window produced a genuine
+// 0/0 (NaN) ratio.
+func TestReconcilerInconclusivePhaseAlsoRollsBack(t *testing.T) {
+	r, driver, client, _, rolloutID := testSetup(t)
+	ctx := context.Background()
+
+	r.reconcileAll(ctx)
+	client.SetPhase(rolloutID, "canary_1", PhaseInconclusive)
+	r.reconcileAll(ctx)
+
+	if len(driver.AutoRollbackCalls) != 1 {
+		t.Fatalf("AutoRollback calls = %v, want exactly one", driver.AutoRollbackCalls)
+	}
+	if len(driver.AutoAdvanceCalls) != 0 {
+		t.Fatalf("AutoAdvance calls = %v, want none", driver.AutoAdvanceCalls)
+	}
+}
+
 // TestReconcilerWaitsWhileAnalysisInProgress is the negative half of the
-// same proof: Pending/Running/Inconclusive must NOT trigger anything —
-// a reconciler that advanced on every tick regardless of phase would
-// make the whole gate meaningless.
+// same proof: Pending/Running must NOT trigger anything — a reconciler
+// that advanced on every tick regardless of phase would make the whole
+// gate meaningless.
 func TestReconcilerWaitsWhileAnalysisInProgress(t *testing.T) {
-	for _, phase := range []Phase{PhasePending, PhaseRunning, PhaseInconclusive} {
+	for _, phase := range []Phase{PhasePending, PhaseRunning} {
 		t.Run(string(phase), func(t *testing.T) {
 			r, driver, client, _, rolloutID := testSetup(t)
 			ctx := context.Background()
