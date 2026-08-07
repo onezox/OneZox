@@ -50,6 +50,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/onezox/OneZox/services/admin-api/internal/authn"
+	"github.com/onezox/OneZox/services/admin-api/internal/authz"
 	"github.com/onezox/OneZox/services/admin-api/internal/graph"
 	pb "github.com/onezox/OneZox/services/admin-api/internal/pb/admin/v1"
 	controlpb "github.com/onezox/OneZox/services/admin-api/internal/pb/control/v1"
@@ -138,7 +139,14 @@ func main() {
 		log.Error("failed to listen for gRPC", "error", err, "port", grpcPort)
 		os.Exit(1)
 	}
-	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(authn.UnaryInterceptor(authnStore, log)))
+	// Step G: authz.UnaryInterceptor MUST run after authn's — it only
+	// reads the Identity authn already attached to context, it performs
+	// no authentication of its own. grpc.ChainUnaryInterceptor preserves
+	// the order its arguments are given in.
+	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(
+		authn.UnaryInterceptor(authnStore, log),
+		authz.UnaryInterceptor(log),
+	))
 	pb.RegisterAdminServiceServer(grpcServer, &server{db: db, control: controlClient, log: log})
 
 	go func() {
