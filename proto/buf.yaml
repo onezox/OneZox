@@ -8,9 +8,12 @@ breaking:
   use:
     - FILE
   ignore:
-    # One-time: provider/v1/placeholder.proto was deleted and replaced by
-    # the real Phase-02 internal contract in provider.proto. Same exception
-    # Phase-01 used for dataplane/v1 (commit 82cc0a8 retired it once done).
-    # Remove in the next proto-touching commit once this comparison is no
-    # longer live.
-    - provider/v1/placeholder.proto
+    # One-time: admin/v1/placeholder.proto was deleted and replaced by the
+    # real Phase-05 contract in admin.proto — same exception Phase-01 used
+    # for dataplane/v1 and Phase-02 used for provider/v1. Remove in the
+    # next proto-touching commit once this comparison is no longer live.
+    # (provider/v1/placeholder.proto's own prior entry here was removed
+    # this same commit: confirmed via a local `buf breaking` run against
+    # HEAD with it stripped out that it no longer changes the result —
+    # HEAD has carried provider.proto, not the placeholder, since Phase-02.)
+    - admin/v1/placeholder.proto

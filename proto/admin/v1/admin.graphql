@@ -1,0 +1,124 @@
+# Phase-05's admin-api read contract (Architecture Part R). Query-only —
+# deliberately no `type Mutation`, not an oversight: every operation with a
+# real side effect is a gRPC command instead (proto/admin/v1/admin.proto)
+# — see that file's own header for the split's full rationale (flexible
+# per-page field selection for reads vs. fixed-shape typed commands for
+# writes). Next.js RSC server components consume this for every panel
+# page's data (dashboard, model-studio's read side, providers, audit); the
+# SAME components call admin-api's gRPC AdminService directly, server-side,
+# for every mutation — RSC runs in Node.js, not the browser, so a native
+# gRPC client works with no grpc-web layer needed.
+#
+# Kept alongside admin.proto in proto/ rather than under
+# services/admin-api/ — this project treats proto/ as the one place every
+# cross-service contract lives (Part Q), and a GraphQL schema between two
+# services-to-be-built is exactly that, the same as any .proto file here.
+# admin-api's own gqlgen codegen config points at this file rather than a
+# service-local copy, mirroring how every service in this project generates
+# its own bindings from the shared proto/ source rather than redefining
+# the contract locally.
+#
+# Every field here reads data that already exists as of Phase-04 (control-
+# plane's registry, Prometheus, provider-gateway's ProviderHealth) or this
+# phase's own new tables (rollout, audit_log, api_keys) — nothing here
+# reads ClickHouse or ties into eval data (F11: those panels are
+# scaffolded-but-inert this phase, Step U, and have no schema here at all
+# rather than a schema pointing nowhere).
+
+type Query {
+  "The authenticated caller's own identity — the panel uses this to hide/disable mutating controls for a viewer, though the real enforcement is server-side (Step F/G), never the UI alone."
+  me: AdminUser!
+
+  "Backed by control.v1.ControlService/ListModels (Phase-04, unchanged)."
+  models: [ModelSummary!]!
+
+  "The currently active manifest for modelRef, as the Model Studio editor's starting point. Read-only — this is what Phase-05.txt calls createModelDraft; it persists nothing (see admin.proto's header)."
+  modelDraft(modelRef: String!): ModelManifest!
+
+  "Backed by control.v1.ControlService/GetModelManifest. versionId omitted resolves the active version — used for the Model Studio diff view (a specific past version vs. current active)."
+  modelVersion(modelRef: String!, versionId: String): ModelManifest!
+
+  rollout(rolloutId: ID!): Rollout
+  "Current/most recent rollout for modelRef, or null if none has ever run."
+  rolloutByModel(modelRef: String!): Rollout
+  "Full history, most recent first."
+  rollouts: [Rollout!]!
+
+  "Hashes and raw values are never returned — see ApiKeySummary."
+  apiKeys: [ApiKeySummary!]!
+
+  "Real data (Prometheus queries + simple DB counts), not the ClickHouse/WS-live-tail vision in Architecture Part R — that lands with F6/P13. Modest but genuinely real this phase."
+  dashboardMetrics: DashboardMetrics!
+
+  auditLog(limit: Int = 50, actor: ID, action: String): [AuditEntry!]!
+
+  "Backed by provider-gateway's existing ProviderHealth RPC (Phase-02, unchanged) — the Provider Console section."
+  providerHealth: [ProviderHealth!]!
+}
+
+type AdminUser {
+  id: ID!
+  orgId: ID!
+  role: String!
+}
+
+type ModelSummary {
+  modelRef: String!
+  activeVersionId: ID!
+}
+
+type ModelManifest {
+  versionId: ID!
+  modelRef: String!
+  specJson: String!
+  signature: String!
+  createdBy: String!
+  createdAt: String!
+  status: String!
+}
+
+type Rollout {
+  rolloutId: ID!
+  modelRef: String!
+  versionId: ID!
+  strategyJson: String!
+  stage: String!
+  status: String!
+  canaryPercent: Int!
+  startedAt: String!
+  endedAt: String
+}
+
+"Never exposes hash or raw key — raw_key is returned exactly once, by the createApiKey gRPC command's own response, never by a query."
+type ApiKeySummary {
+  keyId: ID!
+  orgId: ID!
+  scopes: [String!]!
+  createdAt: String!
+  revokedAt: String
+}
+
+type DashboardMetrics {
+  requestsPerSecond: Float!
+  p95LatencyMs: Float!
+  errorRate: Float!
+  activeModelsCount: Int!
+  activeRolloutsCount: Int!
+}
+
+type AuditEntry {
+  auditId: ID!
+  actor: ID!
+  action: String!
+  target: String!
+  beforeJson: String
+  afterJson: String
+  ts: String!
+}
+
+type ProviderHealth {
+  provider: String!
+  healthy: Boolean!
+  quotaHeadroom: Float!
+  breakerState: String!
+}

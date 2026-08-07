@@ -14,12 +14,33 @@ option go_package = "github.com/onezox/OneZox/services/control-plane/internal/pb
 // UnimplementedControlServiceServer and every method here returns
 // codes.Unimplemented, the same "defined here, wired when consumed"
 // pattern provider-gateway's own ProviderHealth used in Phase-02.
+//
+// Phase-05 Step D adds four rollout/-owned RPCs (Step L implements them).
+// Deliberately only the HUMAN-TRIGGERED half of the rollout state machine
+// is exposed here: CreateRollout starts one, PromoteRollout/AbortRollout
+// are manual overrides (Architecture Part R's "live promote/rollback
+// controls"), GetRolloutStatus reads one. The AUTOMATIC timer- and
+// AnalysisRun-driven advance/rollback logic is NOT an RPC at all — it
+// lives entirely inside control-plane's own process (a background
+// goroutine watching Argo Rollouts' Rollout/AnalysisRun CRDs via
+// client-go, Step M), so it is unreachable over the network by
+// construction, not merely rejected by a parameter check. None of the
+// four new RPCs below accepts a target stage or a canary percentage —
+// PromoteRollout always advances exactly one staged step, the same rule
+// the internal automatic advance follows; there is no field or code path
+// anywhere in this service that sets a live traffic percentage directly.
+// This is the EC4 "no path exists to mutate a live model outside signed
+// manifests + rollout" guarantee, enforced by this contract's own shape.
 
 service ControlService {
   rpc RegisterModelManifest(RegisterModelManifestRequest) returns (RegisterModelManifestResponse);
   rpc GetModelManifest(GetModelManifestRequest) returns (GetModelManifestResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc IssueProviderToken(IssueProviderTokenRequest) returns (IssueProviderTokenResponse);
+  rpc CreateRollout(CreateRolloutRequest) returns (CreateRolloutResponse);
+  rpc PromoteRollout(PromoteRolloutRequest) returns (PromoteRolloutResponse);
+  rpc AbortRollout(AbortRolloutRequest) returns (AbortRolloutResponse);
+  rpc GetRolloutStatus(GetRolloutStatusRequest) returns (GetRolloutStatusResponse);
 }
 
 // spec_json carries the manifest body as a JSON-encoded string (mirrors
@@ -75,4 +96,56 @@ message IssueProviderTokenRequest {
 message IssueProviderTokenResponse {
   string token = 1;
   int64 ttl_seconds = 2;
+}
+
+// strategy_json is opaque here too (mirrors RegisterModelManifestRequest's
+// own spec_json reasoning) — it configures the Argo Rollouts Rollout
+// resource's step list (Step M), not a field this RPC's own contract
+// needs to understand. Deliberately no target-stage or percent field
+// anywhere on this message: a rollout always starts at its first step.
+message CreateRolloutRequest {
+  string model_ref = 1;
+  string version_id = 2;
+  string strategy_json = 3;
+}
+
+message CreateRolloutResponse {
+  string rollout_id = 1;
+}
+
+// No target-stage field — advances exactly one staged step from wherever
+// the rollout currently is. Same rule the internal automatic advance
+// (control-plane's own Rollout-CRD watch loop, Step M) follows; this RPC
+// only lets a human trigger that same one-step transition early instead
+// of waiting out the current pause.
+message PromoteRolloutRequest {
+  string rollout_id = 1;
+}
+
+message PromoteRolloutResponse {
+  string new_stage = 1;
+}
+
+message AbortRolloutRequest {
+  string rollout_id = 1;
+}
+
+message AbortRolloutResponse {}
+
+message GetRolloutStatusRequest {
+  // Either identifies the rollout directly, or — if rollout_id is empty —
+  // resolves model_ref's current/most recent rollout.
+  string rollout_id = 1;
+  string model_ref = 2;
+}
+
+message GetRolloutStatusResponse {
+  string rollout_id = 1;
+  string model_ref = 2;
+  string version_id = 3;
+  string stage = 4;
+  string status = 5;
+  int32 canary_percent = 6;
+  string started_at = 7;
+  string ended_at = 8;
 }
