@@ -78,7 +78,7 @@ spec:
       serviceAccountName: control-plane
       containers:
         - name: control-plane
-          image: onezox/control-plane:45286b8
+          image: onezox/control-plane:ac74fa8
           imagePullPolicy: IfNotPresent
           env:
             - name: COCKROACH_HOST
