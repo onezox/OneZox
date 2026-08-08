@@ -1,0 +1,518 @@
+================================================================================
+ONEZOX ENGINE — POST-M2 CODEBASE AUDIT
+================================================================================
+Scope: full read-only audit of the OneZox engine as it stands after Phase-05
+(MILESTONE M2 — Safe Model Ops), conducted against the actual files on disk and
+the live onezox-dev cluster, not against the completion records' account of what
+was built.
+
+Method: every finding below was verified by reading the file or querying the
+cluster at audit time. One temporary read-only probe pod was created and deleted;
+nothing was mutated. Credential values are redacted throughout — where a
+credential had to be checked, only its lookup RESULT is recorded, never the value
+or its hash.
+
+Sections:
+  1. ACTIVE BUGS AND UNRESOLVED ISSUES
+  2. KNOWN ISSUES, DEFERRALS, AND TRACKED ITEMS
+  3. RECOMMENDATIONS AND HARDENING
+
+================================================================================
+SECTION 1: ACTIVE BUGS AND UNRESOLVED ISSUES
+================================================================================
+
+--------------------------------------------------------------------------------
+S1-1  [CRITICAL]  Datastores have no network policy, and two services connect to
+                  CockroachDB as root. This defeats EC3 and EC4 outside the
+                  narrow paths they were proven on.
+--------------------------------------------------------------------------------
+WHAT IS BROKEN — three facts that compose into one exposure:
+
+  1. root is a superuser and bypasses all GRANT/REVOKE:
+       rolname,rolsuper
+       root,t        admin_api,f        control_plane,f
+
+  2. Two services connect as root:
+       services/edge-gateway/src/auth/store.rs:18
+         cfg.user = Some("root".to_string());
+       services/data-plane/main.py:567
+         host=pg_host, port=26257, user="root", database="defaultdb", ssl=False,
+
+  3. NO CiliumNetworkPolicy exists for any datastore. The 7 policies in the
+     cluster cover application services only. CockroachDB, etcd, Vault, Redis and
+     MinIO have none — so they are not default-deny, they are default-ALLOW.
+     (Cilium only switches an endpoint to default-deny once a policy selects it.)
+
+REPRODUCTION (run during this audit, read-only). An unlabeled pod in the default
+namespace, with no credentials and no mesh identity:
+
+    connected_as,is_superuser
+    root,t
+    model_active_rows_readable   5
+    audit_rows_readable          24
+
+TCP reachability from that same pod:
+
+    etcd:2379             OPEN
+    vault:8200            OPEN
+    redis:6379            OPEN
+    control-plane:50051   BLOCKED (timeout)   <-- positive control
+
+The control-plane result is the positive control: services WITH a policy are
+genuinely protected, which is what proves the datastore results are an absence of
+policy rather than a broken test.
+
+WHY THIS MATTERS. Superuser read implies superuser write. Any pod in the default
+namespace can therefore UPDATE model_active — changing the live model pointer
+outside signed manifests and rollout — and UPDATE/DELETE audit_log. etcd being
+open is a second, independent bypass: /onezox/active/{model_ref} lives there, so
+writing it directly changes what data-plane resolves without touching the
+database at all.
+
+RELATION TO THE EXISTING PROOFS. Phase-05 Step T's proofs are not wrong. They
+tested admin_api's DB role, and network access TO control-plane, and both hold
+exactly as recorded. But EC3's "audit_log is immutable" and EC4's "no path exists
+to mutate a live model outside signed manifests + rollout" were stated generally,
+and generally they do not hold. The proofs were scoped narrower than the claims
+they were taken to establish.
+
+SEVERITY: blocks the security claims (not the functionality).
+
+SUGGESTED FIX:
+  (a) Create edge_gateway and data_plane DB roles with real least-privilege
+      grants; change both connection strings off root.
+  (b) Add CiliumNetworkPolicies for crdb / etcd / vault / redis / minio,
+      allowing only the services that legitimately need each.
+  (c) Re-run Step T's DB-layer probe as each non-root role, and add a direct
+      etcd-write attempt to the EC4 proof set.
+
+--------------------------------------------------------------------------------
+S1-2  [CRITICAL]  CI runs zero tests.
+--------------------------------------------------------------------------------
+.github/workflows/ci.yml is 159 lines and contains exactly two jobs:
+
+    JOB: proto        (buf lint + buf breaking)
+    JOB: build-sign   (docker build, SBOM, sigstore signing)
+
+Grep across the whole file for `go test|cargo test|pytest|npm test|tsc` returns
+ZERO matches.
+
+The ~155 tests that back the M2 exit criteria — 49 admin-api, 45 control-plane,
+61 data-plane, plus edge-gateway's Rust suite — run only when invoked by hand. A
+regression in the RBAC allow-list, the rollout state machine, the audit fail-loud
+path, or the canary weighting would pass CI silently.
+
+HOW TO OBSERVE: open .github/workflows/ci.yml; there is no test job.
+
+SEVERITY: blocks confidence in every future change. This is a process defect, not
+a code defect, but its blast radius is every EC proven so far.
+
+SUGGESTED FIX: add a `test` job with a per-language matrix (go/cargo/pytest/tsc);
+make build-sign depend on it.
+
+--------------------------------------------------------------------------------
+S1-3  [HIGH]  CI build matrix omits three services, including both Phase-05
+              services.
+--------------------------------------------------------------------------------
+.github/workflows/ci.yml:69
+
+    service: [edge-gateway, data-plane, provider-gateway, control-plane]
+
+Missing: admin-api, admin-panel, provider-fake.
+
+So the two services that hold the admin credential surface and the operator
+console receive no CI build, NO SBOM, and NO sigstore signature — while four
+older services do. This is the same "CI matrix entry" class of gap that the
+Phase-02 and Phase-03 stub removals tracked explicitly when pruning provider-stub
+and dataplane-stub.
+
+SEVERITY: silent supply-chain gap.
+
+SUGGESTED FIX: add admin-api and admin-panel to the matrix. Decide deliberately
+whether test-only provider-fake belongs there.
+
+--------------------------------------------------------------------------------
+S1-4  [HIGH]  A real tenant API key sits in a tracked file, via a mechanism that
+              will keep re-adding them.
+--------------------------------------------------------------------------------
+.claude/settings.json:274 contains a Claude Code permission-allowlist entry that
+records a full curl command INCLUDING its Authorization: Bearer oz_test_<...>
+header.
+
+VERIFIED (without printing the value or its hash): lookup against api_keys
+returned found,active = 1,0 — the key is REAL (present in the table) and ALREADY
+REVOKED, so it is not currently exploitable against this cluster.
+
+The structural problem is worse than this one key:
+  - .claude/settings.json IS tracked (committed at b606aef, Phase-00).
+  - .gitignore covers .claude/settings.local.json but NOT settings.json.
+  - HEAD's committed version is clean; the key exists in the WORKING TREE only.
+    It has stayed uncommitted purely because every commit in this build used
+    explicit paths — it is one `git commit -a` away from permanent history.
+  - The allowlist grows automatically on every approved
+    `curl ... -H 'Authorization: Bearer ...'`, so this recurs BY DESIGN.
+
+This is the FOURTH credential exposure in this build, and the first that persists
+on disk rather than only in a transcript. (Prior three: P04 base64 secret dump,
+P04 IssueProviderToken response, P05 Set-Cookie header.)
+
+SEVERITY: high — currently contained, structurally recurring.
+
+SUGGESTED FIX: add .claude/settings.json to .gitignore and `git rm --cached` it,
+or strip credential-bearing entries plus add a pre-commit hook.
+
+--------------------------------------------------------------------------------
+S1-5  [HIGH]  edge-gateway's Docker build has no lockfile — builds are not
+              reproducible.
+--------------------------------------------------------------------------------
+services/edge-gateway/Dockerfile:12
+
+    COPY Cargo.toml Cargo.lock* ./
+
+`ls services/edge-gateway/` returns: Cargo.toml  Dockerfile  src — there is NO
+Cargo.lock. The lockfile is at the repo root (workspace-level, tracked), but the
+build context is services/edge-gateway (.github/workflows/ci.yml:87). The `*`
+glob therefore matches nothing and the build silently proceeds WITHOUT a lockfile.
+
+Every dependency in services/edge-gateway/Cargo.toml is a caret range
+(axum = "0.8", tokio = "1", serde = "1", sha2 = "0.10", ...), so any rebuild can
+resolve different transitive crate versions than the ones tested and deployed.
+
+Notably edge-gateway is the lone exception: the four Go services ship go.sum and
+admin-panel ships package-lock.json, all correctly copied.
+
+SEVERITY: silent correctness / supply-chain risk. No current misbehavior, but a
+rebuild months from now is not guaranteed to produce the audited binary.
+
+SUGGESTED FIX: build from repo root with `-f services/edge-gateway/Dockerfile .`,
+or commit a service-local Cargo.lock.
+
+--------------------------------------------------------------------------------
+S1-6  [MEDIUM]  A manifest that fails signature verification is never re-verified
+                until an etcd event or a process restart.
+--------------------------------------------------------------------------------
+services/data-plane/model_registry/__init__.py:266-308
+
+watch_forever re-syncs on WATCH failure only (the except branch at lines
+300-308). Verification failures do not raise — they mark the manifest untrusted,
+and sync_once still reports success. With etcd healthy there are no new events,
+so nothing ever re-verifies.
+
+This is precisely the failure observed live during Phase-05 Step P: data-plane
+logged `signature verification FAILED, refusing to trust` for all six openai
+manifests, then `initial sync complete`, and served model_not_found until a
+manual `kubectl rollout restart`.
+
+ASYMMETRY WORTH NOTING: services/edge-gateway/src/main.rs:179 uses
+`.expect("model_registry: initial sync failed")`, which panics -> crash-loop ->
+Kubernetes restarts it -> it self-recovers once Vault returns. The Rust service
+accidentally has BETTER recovery behavior than the Python one.
+
+This is the concrete mechanism behind the tracked boot-retry gap (S2, item 4) —
+recorded here as a bug because "sticky verification failure" is more specific and
+more actionable than "no retry at boot".
+
+SEVERITY: silent correctness — the service looks healthy (readyz passes, boot
+completes) while serving nothing.
+
+SUGGESTED FIX: a periodic re-sync timer, or backoff re-verification of entries
+currently marked untrusted.
+
+--------------------------------------------------------------------------------
+S1-7  [MEDIUM]  edge-gateway's canary resolve() is dead code — the Step K
+                "both languages" parity is unexercised.
+--------------------------------------------------------------------------------
+cargo clippy on hand-written code:
+
+    method `resolve` is never used         --> src/model_registry.rs:357
+    function `pick_version` is never used  --> src/model_registry.rs:108
+    enum `ManifestError` is never used     --> src/model_registry.rs:57
+
+The cache IS synced and Vault-verified (main.rs:179-184: blocking sync_once at
+boot plus a spawned watch_forever), but its ONLY consumer is list_active() for
+GET /v1/models (ingress.rs:243-248). Version resolution happens in data-plane.
+
+Phase-05 Step K implemented canary-weighted resolve() in BOTH languages with unit
+tests in both. The Rust tests pass, but they exercise a path that never runs in
+production. Consequences: false assurance about canary parity, and a future change
+to canary semantics must be made in two places, one of which no live proof can
+validate.
+
+SEVERITY: silent correctness (misleading test signal), not incorrect behavior.
+
+SUGGESTED FIX: delete the Rust resolve()/pick_version()/ManifestError and their
+tests, OR mark with #[allow(dead_code)] plus a comment stating it is staged for
+future use. Do not leave it silently dead.
+
+NOT FINDINGS, checked and cleared in the same pass:
+  - pb_generated/gateway.v1.rs "never constructed" warnings are generated
+    protobuf types. Normal.
+  - normalize_embeddings being dead is CONSISTENT with /v1/embeddings honestly
+    returning HTTP 501 via not_wired() (ingress.rs:113-126). Correct behavior.
+
+--------------------------------------------------------------------------------
+S1-8  [LOW]  Phase-00-Complete.txt is untracked.
+--------------------------------------------------------------------------------
+891 lines on disk; `git ls-files` returns 0 for it. Every other completion record
+(01 through 05) is committed. The foundational phase's record — referenced by
+CLAUDE.md as authoritative — is not in version control and would be lost with the
+working tree.
+
+SUGGESTED FIX: git add and commit it.
+
+--------------------------------------------------------------------------------
+S1-9  [LOW]  Two Dockerfiles name a single .go file instead of globbing.
+--------------------------------------------------------------------------------
+    services/control-plane/Dockerfile:20      COPY main.go ./
+    services/provider-gateway/Dockerfile:5    COPY main.go ./
+
+Correct today — each service has exactly one top-level .go file. But admin-api hit
+this exact bug at Phase-05 Step H when server.go was added (build failed with
+`undefined: server`) and fixed it with `COPY *.go ./`. These two are the same
+trap, currently unsprung.
+
+SUGGESTED FIX: change both to `COPY *.go ./`.
+
+VERIFIED CLEAN IN THE SAME PASS: services/data-plane/Dockerfile copies all nine
+module directories (generated, planner, scheduler, working_memory, request_log,
+usage_event, identity, aggregator, vault_client, model_registry). The Phase-03
+Step F bug class does NOT exist anywhere in the repo now. services/provider-fake
+has no go.sum, which is CORRECT — its go.mod declares zero dependencies (pure
+stdlib HTTP service).
+
+--------------------------------------------------------------------------------
+S1-10 [LOW]  The google adapter reads its key from env, not Vault.
+--------------------------------------------------------------------------------
+services/provider-gateway/main.go:604
+
+    registeredAdapters = append(registeredAdapters, google.New(os.Getenv("GOOGLE_API_KEY"), ""))
+
+The five active providers fetch credentials from Vault. Inert today (key unset ->
+adapter not registered, which is correct per F13), but if Gemini is re-activated
+it would re-introduce env-var provider credentials, contradicting F9's "Vault is
+the single home for provider keys".
+
+SUGGESTED FIX: route google through the same Vault credential resolver before any
+re-activation.
+
+--------------------------------------------------------------------------------
+CHECKED AND GENUINELY CLEAN (recorded so the absence of findings is legible)
+--------------------------------------------------------------------------------
+  go vet          clean across control-plane, admin-api, provider-gateway,
+                  provider-fake
+  ruff            clean across data-plane
+  buf lint        clean
+  buf breaking    clean (against git main)
+  RPC coverage    all 9 control-plane and all 6 admin-api RPCs implemented;
+                  zero panic("not implemented") GraphQL resolvers remain
+  Cilium          all 7 policies report Valid: True
+  Argo CD         all 7 Applications Synced / Healthy
+  npm audit       0 vulnerabilities (admin-panel, production deps)
+  error handling  data-plane /readyz except-blocks call log.exception and flip
+                  the readiness flag — proper handling, not swallowing
+  secret scan     no live-looking provider keys (sk-, xai-, AIza-) in any tracked
+                  file; no credential-shaped strings anywhere in git history
+  dataplane-stub  source tree genuinely pruned as Phase-03 claimed; only stale
+                  untracked __pycache__ remains on disk
+
+================================================================================
+SECTION 2: KNOWN ISSUES, DEFERRALS, AND TRACKED ITEMS
+================================================================================
+Each item reconciled against the current codebase. "OPEN" means still deferred as
+intended; a deferral is not a bug.
+
+F2 — token-aware KEDA autoscaling (defined P02/P03, finalized P13)
+    STATUS: OPEN, but the INTERIM MEASURE IS NOT IN PLACE.
+    Dependencies.txt specifies "Basic HPA now (connections/RPS)". There is no HPA
+    and no KEDA ScaledObject anywhere in the cluster or in platform/. All replica
+    counts are static: edge-gateway 1, data-plane 1, provider-gateway 3,
+    control-plane 2, admin-api 2, admin-panel 1.
+    NOTE: data-plane at replicas: 1 is also a single point of failure on the
+    serving path.
+
+F11 — admin panel data panels (scaffolded P05, populated P12/P13)
+    STATUS: OPEN, correctly inert.
+    traces, cost and playground each contain ZERO data-fetching calls (no
+    query(), no fetch(), no adminApi.*). There is no code that could fail against
+    a missing source. Verified live: all three render "Not implemented yet" with
+    zero <table> elements.
+
+F13 — Gemini content-delta verification (defined P02, deferred to cloud phase)
+    STATUS: SUSPENDED; cannot accidentally activate.
+    services/provider-gateway/main.go:600-606 registers the google adapter only
+    if GOOGLE_API_KEY is present; absent -> logs "GOOGLE_API_KEY not set, google
+    adapter not registered". Re-activation remains a one-key operation as
+    documented. See S1-10 for the env-vs-Vault caveat that applies on re-add.
+
+BOOT-TIME REGISTRATION RETRY (hit P04-U and P05-P)
+    STATUS: OPEN — still one-shot for VERIFICATION failures.
+    See S1-6 for the precise mechanism: watch_forever retries on watch failure,
+    but a signature-verification failure is sticky until an etcd event or a
+    process restart. Recurring: 2 occurrences.
+
+AUDIT CHOKEPOINT (success/failure audit hand-wired)
+    STATUS: OPEN — still hand-wired.
+    services/admin-api/main.go:172-175 chains exactly two interceptors (authn,
+    authz). services/admin-api/server.go contains 13 hand-written s.audit.Write
+    call sites. Denial audit IS chokepointed and unit-tested; success/failure
+    audit is not. A newly added mutating RPC can still ship without it, and
+    nothing would fail at compile time.
+
+LEAK-SAFE VERIFICATION HELPER (rated the #1 tracked finding at P05 close-out)
+    STATUS: OPEN — does not exist.
+    No scripts/*verify*, *assert*, or *check* helper is present. S1-4 is this
+    same gap firing for the fourth time.
+
+STATEFUL-LAYER GITOPS ADOPTION (deferred to a cloud phase)
+    STATUS: OPEN as intended.
+    7 Argo Applications = onezox-stubs + 6 observability operators. CockroachDB,
+    etcd, Redis, MinIO, Vault and argo-rollouts remain hand-managed via Helm.
+
+PANEL /metrics
+    STATUS: OPEN. No admin-panel/app/metrics route exists. Correspondingly, and
+    consistently, admin-panel-mtls has no Prometheus ingress rule.
+
+provider-gateway BASIC HPA — STATUS: OPEN. Static replicas: 3.
+data-plane BASIC HPA      — STATUS: OPEN. Static replicas: 1.
+
+REDIS WORKING-MEMORY ISOLATION MODEL
+    STATUS: OPEN as documented — still unguessable-request_id based, not ACL.
+    services/data-plane/working_memory/__init__.py:30-31 keys entries as
+    workingmem:{request_id} with a per-request TTL.
+
+VAULT ROOT TOKEN REVOCATION
+    STATUS: CLOSED — confirmed revoked.
+    `vault token lookup` presented with the root token returns
+    "Error looking up token: Error making API request." All four consumers use
+    K8s-auth, as documented.
+
+usd_cost WIRING (pricing data exists from P04; computation deferred to P06)
+    STATUS: OPEN, correctly NULL.
+    services/data-plane/main.py:236 sets usd_cost = None and passes it through to
+    the usage_event insert. No code attempts a computation.
+
+OVERALL RECONCILIATION: no code anywhere assumes a deferred capability is
+already done. The single deferral whose INTERIM MEASURE was never implemented is
+F2 (basic HPA).
+
+================================================================================
+SECTION 3: RECOMMENDATIONS AND HARDENING
+================================================================================
+
+--------------------------------------------------------------------------------
+CRITICAL — fix before Phase-06
+--------------------------------------------------------------------------------
+C1. Stop connecting to CockroachDB as root.                        [medium]
+    Add edge_gateway and data_plane roles in a new migration with real
+    least-privilege grants (edge_gateway: SELECT on api_keys and
+    rate_limit_policy; data_plane: INSERT on request_log and usage_event, SELECT
+    on tenants). Change services/edge-gateway/src/auth/store.rs:18 and
+    services/data-plane/main.py:567.
+    WHY: without this, EC3's audit_log immutability and EC4's no-bypass property
+    are false for any workload holding those connections.
+
+C2. Add CiliumNetworkPolicies for the datastores.                  [medium]
+    crdb, etcd, vault, redis and minio currently have no policy and are therefore
+    default-ALLOW. Restrict each to the services that genuinely need it.
+    WHY: C1 alone is insufficient — CockroachDB runs --insecure, so anyone who
+    can reach port 26257 is root regardless of what the application uses. etcd is
+    a second, independent bypass of the rollout system.
+
+C3. Re-scope the EC4 proof to match its own wording.               [small]
+    Re-run Step T's DB-layer probe as each non-root role, and add a direct etcd
+    write attempt against /onezox/active/* to the proof set.
+    WHY: the existing proof tested admin_api only; the claim was general.
+
+C4. Add a CI test job.                                             [small]
+    go test ./... for the four Go modules, cargo test, pytest, tsc --noEmit; make
+    build-sign depend on it.
+    WHY: without this, none of M2's evidence is protected against regression.
+
+--------------------------------------------------------------------------------
+HIGH — fix soon, before it compounds
+--------------------------------------------------------------------------------
+H1. Gitignore .claude/settings.json and untrack it.                [trivial]
+    .gitignore entry plus `git rm --cached`. Fixes S1-4 and stops the recurrence
+    mechanism at its source.
+
+H2. Build the leak-safe verification helper.                       [small]
+    scripts/assert-credential.sh <response-file> <attribute>... printing only
+    pass/fail per attribute, with NO code path that can emit the underlying
+    value.
+    WHY: this is the #1 tracked finding, and S1-4 is its fourth occurrence. The
+    argument that it belongs in structure rather than discipline is now
+    empirical, not theoretical.
+
+H3. Add admin-api and admin-panel to the CI build matrix.          [trivial]
+    .github/workflows/ci.yml:69.
+    WHY: both currently ship with no SBOM and no signature while four older
+    services have both.
+
+H4. Fix edge-gateway's lockfile.                                   [small]
+    Build from repo root, or commit a service-local Cargo.lock.
+    WHY: restores reproducible builds for the only service currently lacking
+    them.
+
+H5. Convert success/failure audit to a chokepoint.                 [medium]
+    A response-side gRPC interceptor keyed off the method name, replacing the 13
+    hand-wired call sites in server.go.
+    WHY: the Step R CreateApiKey gap was an INSTANCE of this class, not a
+    one-off, and the surface grows with every RPC P06/P07 adds.
+
+--------------------------------------------------------------------------------
+MEDIUM — improve when convenient
+--------------------------------------------------------------------------------
+M1. Make verification failures self-heal.                          [small]
+    Periodic re-sync timer or backoff re-verification in
+    services/data-plane/model_registry/__init__.py.
+    WHY: closes a 2x-recurring gap and removes a manual-restart dependency from
+    the serving path.
+
+M2. Resolve edge-gateway's dead resolve().                         [trivial]
+    Delete it, or mark and document it.
+    WHY: removes a false parity signal from the test suite.
+
+M3. Commit Phase-00-Complete.txt.                                  [trivial]
+
+M4. COPY *.go ./ in control-plane and provider-gateway Dockerfiles. [trivial]
+    WHY: pre-empts a bug this repo has already hit once.
+
+M5. Deliver F2's interim HPA.                                      [small]
+    At minimum for data-plane, currently replicas: 1 and a single point of
+    failure on the serving path.
+
+--------------------------------------------------------------------------------
+LOW — nice to have
+--------------------------------------------------------------------------------
+L1. Set PROMETHEUS_ADDR and PROVIDER_GATEWAY_ADDR explicitly in admin-api's
+    deployment manifest for consistency with control-plane.         [trivial]
+    Both default correctly today (verified live), so this is clarity only.
+
+L2. Move the google adapter's key to Vault before any Gemini re-activation.
+                                                                    [small]
+
+L3. Add a panel /metrics endpoint, or record the gap in the manifest next to the
+    deliberately-absent Prometheus policy.                          [small]
+
+L4. Clean services/dataplane-stub/ — stale untracked __pycache__ only; the source
+    tree was genuinely pruned as Phase-03 claimed.                  [trivial]
+
+================================================================================
+OVERALL ASSESSMENT
+================================================================================
+Application code quality is high, and the completion records are accurate about
+what they claim — every exit-criteria proof re-tested during this audit
+reproduced exactly as recorded.
+
+The dominant risk is not in the application logic but in the LAYER BENEATH IT.
+The datastores were never brought into the security model that the services were:
+they hold the state that EC3 and EC4 are about, and they are reachable by any pod
+with superuser credentials. Separately, CI never enforced the tests that back the
+milestone.
+
+Both are inexpensive to fix now and materially more expensive after Phase-06 and
+Phase-07 build on top of the current foundation.
+
+================================================================================
+END OF AUDIT.TXT
+================================================================================
