@@ -511,3 +511,21 @@ def test_untrusted_set_does_not_retain_deleted_keys() -> None:
     etcd.store.pop(f"/onezox/manifests/{model_ref}/{version_id}".encode(), None)
     asyncio.run(cache.sync_once())
     assert cache.is_degraded() is False
+
+
+def test_delete_event_clears_untrusted_state() -> None:
+    """A manifest that failed verification and was then deleted from etcd
+    must not keep the cache reported as degraded (and pinned to the fast
+    retry cadence) over something that no longer exists — the watch's
+    delete path clears it, not only a full re-sync."""
+    etcd = FakeEtcdReader()
+    version_id, model_ref = "v1", "openai"
+    spec_json = '{"worker_ref":"openai:gpt-4o-mini"}'
+    _put_manifest(etcd, version_id, model_ref, spec_json, "fake:v1:not-a-real-signature")
+
+    cache = Cache(etcd, FakeVerifier(), _null_logger())
+    asyncio.run(cache.sync_once())
+    assert cache.is_degraded() is True
+
+    cache._handle_delete(f"/onezox/manifests/{model_ref}/{version_id}")
+    assert cache.is_degraded() is False

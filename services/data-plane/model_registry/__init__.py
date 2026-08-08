@@ -423,6 +423,12 @@ class Cache:
             rest = key[len(MANIFESTS_PREFIX):]
             model_ref, _, version_id = rest.partition("/")
             self._manifests.pop((model_ref, version_id), None)
+            # Also clear it from the untrusted set (audit fix M1): a
+            # manifest that failed verification and has since been DELETED
+            # from etcd is no longer a problem to retry, and leaving it
+            # here would report the cache as degraded — and hold it on the
+            # fast retry cadence — over something that no longer exists.
+            self._untrusted.discard((model_ref, version_id))
         elif key.startswith(ACTIVE_PREFIX):
             model_ref = key[len(ACTIVE_PREFIX):]
             self._active.pop(model_ref, None)
