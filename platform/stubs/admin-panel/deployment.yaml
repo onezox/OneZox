@@ -1,0 +1,97 @@
+# Phase-05 Step U2/V: admin-panel — the Next.js RSC operator console
+# (Architecture Part R). First TypeScript/web service in the fleet,
+# deployed on the same terms as every backend service here: dedicated
+# ServiceAccount for mesh identity, immutable short-SHA image tag,
+# health/readiness probes, resource bounds, and GitOps-only delivery
+# through the onezox-stubs Argo CD Application.
+#
+# 1 replica, not 2: this is an internal operator console with a handful
+# of users, and unlike admin-api it holds no shared state that a second
+# replica would help with. Sized to what it is rather than copied from
+# a service with different traffic.
+#
+# Dedicated ServiceAccount for the same reason admin-api's own Step E
+# comment documents: the panel has no Vault role and no database access
+# at all, but a distinct ServiceAccount is what gives it its own
+# Cilium/SPIFFE mesh identity — which is exactly what admin-api-mtls's
+# new admin-panel ingress rule (added this same step) keys off.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-panel
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-panel
+  namespace: default
+  labels:
+    app: admin-panel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: admin-panel
+  template:
+    metadata:
+      labels:
+        app: admin-panel
+    spec:
+      serviceAccountName: admin-panel
+      containers:
+        - name: admin-panel
+          image: onezox/admin-panel:a019489
+          imagePullPolicy: IfNotPresent
+          env:
+            # Reads go to admin-api's GraphQL surface, mutations to its
+            # gRPC surface — the same service, two ports, matching the
+            # commands-vs-queries split (Step D).
+            - name: ADMIN_API_GRAPHQL_URL
+              value: http://admin-api.default.svc.cluster.local:8080/graphql
+            - name: ADMIN_API_GRPC_ADDR
+              value: admin-api.default.svc.cluster.local:50051
+            # PANEL_INSECURE_COOKIES is deliberately NOT set here. Unset
+            # means Secure cookies (lib/session.ts defaults to secure),
+            # which is what we want the moment this is served over TLS.
+            # It exists only as a local `next dev` escape hatch.
+          ports:
+            - containerPort: 3000
+              name: http
+          readinessProbe:
+            # /readyz checks admin-api reachability — a panel that can't
+            # reach it has nothing to serve and should leave the Service's
+            # endpoint list rather than serve error pages.
+            httpGet: { path: /readyz, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            # /healthz makes NO downstream call, so an admin-api blip can
+            # never cause Kubernetes to restart a healthy panel.
+            httpGet: { path: /healthz, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          securityContext:
+            # The image already runs as the unprivileged `node` user;
+            # these make that non-negotiable at the pod level rather than
+            # a property of the image someone could rebuild away.
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-panel
+  namespace: default
+  labels:
+    app: admin-panel
+spec:
+  selector:
+    app: admin-panel
+  ports:
+    - { name: http, port: 3000, targetPort: 3000 }

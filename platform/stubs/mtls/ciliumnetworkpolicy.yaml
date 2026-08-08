@@ -299,3 +299,55 @@ spec:
         - ports:
             - port: "8080"
               protocol: TCP
+    # Phase-05 Step V: admin-panel's own peer rule — the rule this
+    # policy's own header (Step E) said would arrive "when THAT service
+    # first reaches live traffic". Both ports, because the panel
+    # genuinely uses both: 8080 for GraphQL reads, 50051 for gRPC
+    # mutations (the commands-vs-queries split).
+    #
+    # This is a NETWORK rule, not an authorization one. It says
+    # admin-panel's mesh identity may reach admin-api; it says nothing
+    # about WHICH admin may do WHAT, which remains admin-api's own authn
+    # + RBAC interceptors on every single request. A panel session with a
+    # viewer role reaches admin-api through this rule and is still
+    # refused there — proven live at Step J.
+    - fromEndpoints:
+        - matchLabels:
+            app: admin-panel
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+            - port: "50051"
+              protocol: TCP
+      authentication:
+        mode: "required"
+---
+# Phase-05 Step V: admin-panel's own ingress policy.
+#
+# Deliberately narrow: only the host entity (kubectl port-forward, which
+# is how this console is reached in local dev, plus kubelet's own
+# probes) may reach it. No in-cluster service has any business calling
+# the panel — it is a leaf, an operator's browser is its only real
+# client, and nothing downstream ever calls back into it.
+#
+# There is no Prometheus rule here because the panel exposes no /metrics
+# endpoint. Naming that absence is more honest than inventing an empty
+# endpoint to look consistent with the backend services; panel request
+# metrics would be a real addition, not a formality.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: admin-panel-mtls
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: admin-panel
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "3000"
+              protocol: TCP
