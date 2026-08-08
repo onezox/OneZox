@@ -43,6 +43,24 @@ rules:
   - apiGroups: ["argoproj.io"]
     resources: ["analysisruns"]
     verbs: ["get", "list", "watch", "create"]
+  # Post-M2 CRITICAL fix: the reconciler is now a singleton across
+  # replicas, gated on a coordination.k8s.io Lease. Both replicas were
+  # previously running it concurrently against the same rollouts.
+  #
+  # Scoped as tightly as leader election allows: create is needed once
+  # (the first candidate creates the Lease), get/update on every renew,
+  # and client-go's own leaderelection loop lists/watches to observe
+  # holder changes. No delete — a Lease is never removed by this code,
+  # it is released by clearing holderIdentity.
+  #
+  # resourceNames is deliberately NOT used: client-go creates the Lease
+  # via a namespaced create, which resourceNames cannot restrict (the
+  # name does not exist at admission time for a create), so pinning it
+  # would break bootstrap while providing no real narrowing given this
+  # Role is already namespace-scoped and bound only to control-plane.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -81,6 +99,16 @@ spec:
           image: onezox/control-plane:aa53e21
           imagePullPolicy: IfNotPresent
           env:
+            # POD_NAME becomes the reconciler Lease's holderIdentity, so
+            # `kubectl get lease control-plane-reconciler` names the pod
+            # that is actually driving rollouts. Without it the code falls
+            # back to the hostname; in Kubernetes those happen to match,
+            # but relying on that coincidence would make the identity
+            # silently wrong anywhere else.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: COCKROACH_HOST
               value: onezox-crdb-public.default.svc.cluster.local
             - name: COCKROACH_PORT

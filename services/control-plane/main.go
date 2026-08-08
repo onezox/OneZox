@@ -346,9 +346,27 @@ func main() {
 	analysisClient := analysis.NewK8sClient(dynClient, analysisNamespace, promAddr)
 	reconciler := analysis.NewReconciler(rolloutSvc, analysisClient, log)
 
+	// Post-M2 CRITICAL fix: the reconciler is a SINGLETON across replicas,
+	// gated on a coordination.k8s.io Lease. Every replica used to start it
+	// unconditionally, so both ran concurrently against the same rollouts.
+	// See internal/analysis/leader.go for why a Lease and not etcd, and
+	// for what leader election closes that the compare-and-swap cannot
+	// (duplicate AnalysisRuns reaching opposite verdicts).
+	//
+	// A failure to elect is fatal, matching how every other hard boot
+	// dependency in this file is treated. Running unelected would silently
+	// restore the exact concurrency bug this fixes; refusing to start is
+	// the honest failure, and the OTHER replica keeps driving rollouts.
 	reconcilerCtx, cancelReconciler := context.WithCancel(context.Background())
 	defer cancelReconciler()
-	go reconciler.Run(reconcilerCtx)
+	go func() {
+		if err := analysis.RunWithLeaderElection(
+			reconcilerCtx, k8sConfig, analysisNamespace, log, reconciler.Run,
+		); err != nil && reconcilerCtx.Err() == nil {
+			log.Error("reconciler leader election failed", "error", err)
+			os.Exit(1)
+		}
+	}()
 
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
