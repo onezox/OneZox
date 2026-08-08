@@ -10,7 +10,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/onezox/OneZox/services/admin-api/internal/apikeys"
-	"github.com/onezox/OneZox/services/admin-api/internal/audit"
 	"github.com/onezox/OneZox/services/admin-api/internal/authn"
 	pb "github.com/onezox/OneZox/services/admin-api/internal/pb/admin/v1"
 	controlpb "github.com/onezox/OneZox/services/admin-api/internal/pb/control/v1"
@@ -44,7 +43,6 @@ type server struct {
 	db      *sql.DB
 	control controlPublisher
 	keys    apikeys.Store
-	audit   audit.Writer
 	log     *slog.Logger
 }
 
@@ -81,8 +79,6 @@ func (s *server) PublishModelVersion(ctx context.Context, req *pb.PublishModelVe
 		return nil, status.Error(codes.Internal, "no verified identity")
 	}
 
-	const action = "publish_model_version"
-
 	resp, err := s.control.RegisterModelManifest(ctx, &controlpb.RegisterModelManifestRequest{
 		ModelRef: req.GetModelRef(),
 		SpecJson: req.GetSpecJson(),
@@ -95,41 +91,9 @@ func (s *server) PublishModelVersion(ctx context.Context, req *pb.PublishModelVe
 		CreatedBy: id.UserID,
 	})
 
-	// A control-plane call failure means NOTHING was published — still
-	// worth an audit_log row (Phase-05.txt's own completion checklist:
-	// "audit_log captures every admin action," not only successful ones),
-	// with after_json left nil since there is no real content to record.
 	if err != nil {
 		s.log.Error("PublishModelVersion: control-plane call failed", "model_ref", req.GetModelRef(), "user_id", id.UserID, "error", err)
-		if auditErr := s.audit.Write(ctx, audit.Entry{
-			Actor:  id.UserID,
-			Action: action + "_failed",
-			Target: req.GetModelRef(),
-		}); auditErr != nil {
-			s.log.Error("PublishModelVersion: failed to audit a failed publish attempt", "model_ref", req.GetModelRef(), "user_id", id.UserID, "error", auditErr)
-		}
 		return nil, status.Error(codes.Internal, "failed to publish model version")
-	}
-
-	// Success: before_json is nil — publishing a new version never edits
-	// or overwrites anything (model_manifest is insert-only), so there is
-	// no genuine "before" state for THIS row, matching Step D's own
-	// admin.proto header reasoning for why createModelDraft is a query,
-	// not a command, in the first place.
-	auditErr := s.audit.Write(ctx, audit.Entry{
-		Actor:  id.UserID,
-		Action: action,
-		Target: req.GetModelRef(),
-		After: map[string]string{
-			"version_id": resp.GetVersionId(),
-			"model_ref":  req.GetModelRef(),
-			"spec_json":  req.GetSpecJson(),
-		},
-	})
-	if auditErr != nil {
-		s.log.Error("PublishModelVersion: manifest published but audit write failed — reporting as failed",
-			"model_ref", req.GetModelRef(), "version_id", resp.GetVersionId(), "user_id", id.UserID, "error", auditErr)
-		return nil, status.Error(codes.Internal, "publish may have succeeded but could not be recorded; treat as failed and verify with an operator")
 	}
 
 	s.log.Info("published model version", "model_ref", req.GetModelRef(), "version_id", resp.GetVersionId(), "user_id", id.UserID)
@@ -150,7 +114,6 @@ func (s *server) StartRollout(ctx context.Context, req *pb.StartRolloutRequest) 
 	if !ok {
 		return nil, status.Error(codes.Internal, "no verified identity")
 	}
-	const action = "start_rollout"
 
 	resp, err := s.control.CreateRollout(ctx, &controlpb.CreateRolloutRequest{
 		ModelRef:     req.GetModelRef(),
@@ -159,27 +122,7 @@ func (s *server) StartRollout(ctx context.Context, req *pb.StartRolloutRequest) 
 	})
 	if err != nil {
 		s.log.Error("StartRollout: control-plane call failed", "model_ref", req.GetModelRef(), "version_id", req.GetVersionId(), "user_id", id.UserID, "error", err)
-		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetModelRef()}); auditErr != nil {
-			s.log.Error("StartRollout: failed to audit a failed attempt", "model_ref", req.GetModelRef(), "user_id", id.UserID, "error", auditErr)
-		}
 		return nil, status.Error(codes.Internal, "failed to start rollout")
-	}
-
-	auditErr := s.audit.Write(ctx, audit.Entry{
-		Actor:  id.UserID,
-		Action: action,
-		Target: req.GetModelRef(),
-		After: map[string]string{
-			"rollout_id":    resp.GetRolloutId(),
-			"model_ref":     req.GetModelRef(),
-			"version_id":    req.GetVersionId(),
-			"strategy_json": req.GetStrategyJson(),
-		},
-	})
-	if auditErr != nil {
-		s.log.Error("StartRollout: rollout started but audit write failed — reporting as failed",
-			"rollout_id", resp.GetRolloutId(), "model_ref", req.GetModelRef(), "user_id", id.UserID, "error", auditErr)
-		return nil, status.Error(codes.Internal, "rollout may have started but could not be recorded; treat as failed and verify with an operator")
 	}
 
 	s.log.Info("started rollout", "rollout_id", resp.GetRolloutId(), "model_ref", req.GetModelRef(), "version_id", req.GetVersionId(), "user_id", id.UserID)
@@ -191,35 +134,18 @@ func (s *server) PromoteRollout(ctx context.Context, req *pb.PromoteRolloutReque
 	if !ok {
 		return nil, status.Error(codes.Internal, "no verified identity")
 	}
-	const action = "promote_rollout"
 
 	resp, err := s.control.PromoteRollout(ctx, &controlpb.PromoteRolloutRequest{RolloutId: req.GetRolloutId()})
 	if err != nil {
 		s.log.Error("PromoteRollout: control-plane call failed", "rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", err)
-		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetRolloutId()}); auditErr != nil {
-			s.log.Error("PromoteRollout: failed to audit a failed attempt", "rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", auditErr)
-		}
 		return nil, status.Error(codes.Internal, "failed to promote rollout")
 	}
 
-	// before_json is nil here deliberately, not fetched via an extra
-	// GetRolloutStatus call purely for the audit record's own sake — the
-	// PRIOR stage is already whatever the previous audit_log row for this
-	// same rollout_id recorded as its own "after" (this row's own
-	// creation, or the previous promote), so the full sequence is
-	// reconstructable from audit_log alone without a redundant read here.
-	auditErr := s.audit.Write(ctx, audit.Entry{
-		Actor:  id.UserID,
-		Action: action,
-		Target: req.GetRolloutId(),
-		After:  map[string]string{"new_stage": resp.GetNewStage()},
-	})
-	if auditErr != nil {
-		s.log.Error("PromoteRollout: rollout advanced but audit write failed — reporting as failed",
-			"rollout_id", req.GetRolloutId(), "new_stage", resp.GetNewStage(), "user_id", id.UserID, "error", auditErr)
-		return nil, status.Error(codes.Internal, "promotion may have succeeded but could not be recorded; treat as failed and verify with an operator")
-	}
-
+	// The audit row's before_json stays nil deliberately (see the
+	// interceptor's own table): the PRIOR stage is already whatever the
+	// previous audit_log row for this same rollout_id recorded as its
+	// "after", so the full sequence is reconstructable from audit_log
+	// alone without a redundant GetRolloutStatus read here.
 	s.log.Info("promoted rollout", "rollout_id", req.GetRolloutId(), "new_stage", resp.GetNewStage(), "user_id", id.UserID)
 	return &pb.PromoteRolloutResponse{NewStage: resp.GetNewStage()}, nil
 }
@@ -229,27 +155,11 @@ func (s *server) AbortRollout(ctx context.Context, req *pb.AbortRolloutRequest) 
 	if !ok {
 		return nil, status.Error(codes.Internal, "no verified identity")
 	}
-	const action = "abort_rollout"
 
 	_, err := s.control.AbortRollout(ctx, &controlpb.AbortRolloutRequest{RolloutId: req.GetRolloutId()})
 	if err != nil {
 		s.log.Error("AbortRollout: control-plane call failed", "rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", err)
-		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetRolloutId()}); auditErr != nil {
-			s.log.Error("AbortRollout: failed to audit a failed attempt", "rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", auditErr)
-		}
 		return nil, status.Error(codes.Internal, "failed to abort rollout")
-	}
-
-	auditErr := s.audit.Write(ctx, audit.Entry{
-		Actor:  id.UserID,
-		Action: action,
-		Target: req.GetRolloutId(),
-		After:  map[string]string{"status": "aborted"},
-	})
-	if auditErr != nil {
-		s.log.Error("AbortRollout: rollout aborted but audit write failed — reporting as failed",
-			"rollout_id", req.GetRolloutId(), "user_id", id.UserID, "error", auditErr)
-		return nil, status.Error(codes.Internal, "abort may have succeeded but could not be recorded; treat as failed and verify with an operator")
 	}
 
 	s.log.Info("aborted rollout", "rollout_id", req.GetRolloutId(), "user_id", id.UserID)
@@ -268,22 +178,15 @@ func (s *server) CreateApiKey(ctx context.Context, req *pb.CreateApiKeyRequest) 
 	if !ok {
 		return nil, status.Error(codes.Internal, "no verified identity")
 	}
-	const action = "create_api_key"
 
+	// Step R found this exact branch missing its audit call — the one
+	// failure path here with a real, already-resolved actor that skipped
+	// it. Under the chokepoint (audit_interceptor.go) that omission is no
+	// longer possible: EVERY return from this handler, including this
+	// one, is audited by the interceptor wrapping it.
 	rawKey, err := apikeys.GenerateRawKey()
 	if err != nil {
-		// Unlike the no-identity branch above, THIS failure has a real,
-		// already-resolved actor (id.UserID) — an authenticated admin
-		// genuinely attempted CreateApiKey and it genuinely failed, which
-		// is exactly what Step R's audit-coverage sweep exists to catch:
-		// a real attempt by a real actor must never complete (success OR
-		// failure) without an audit_log row, no matter how narrow the
-		// failure mode (crypto/rand exhaustion is effectively unreachable
-		// in practice, but the code path is real).
 		s.log.Error("CreateApiKey: failed to generate raw key material", "user_id", id.UserID, "error", err)
-		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetOrgId()}); auditErr != nil {
-			s.log.Error("CreateApiKey: failed to audit a failed attempt", "org_id", req.GetOrgId(), "user_id", id.UserID, "error", auditErr)
-		}
 		return nil, status.Error(codes.Internal, "failed to create api key")
 	}
 	hash := apikeys.HashRawKey(rawKey)
@@ -291,33 +194,7 @@ func (s *server) CreateApiKey(ctx context.Context, req *pb.CreateApiKeyRequest) 
 	keyID, err := s.keys.Create(ctx, req.GetOrgId(), hash, req.GetScopes())
 	if err != nil {
 		s.log.Error("CreateApiKey: store call failed", "org_id", req.GetOrgId(), "user_id", id.UserID, "error", err)
-		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetOrgId()}); auditErr != nil {
-			s.log.Error("CreateApiKey: failed to audit a failed attempt", "org_id", req.GetOrgId(), "user_id", id.UserID, "error", auditErr)
-		}
 		return nil, status.Error(codes.Internal, "failed to create api key")
-	}
-
-	// after_json deliberately carries key_id/org_id/scopes only — NEVER
-	// raw_key, and not even hash: audit_log exists to be queried and
-	// displayed (this file's own migration 0017 header comment), and a
-	// hash with no legitimate read-path use sitting in a second table is
-	// needless duplication of sensitive material, not a security
-	// requirement. raw_key is returned to the caller exactly once, in the
-	// RPC response below, and nowhere else, ever.
-	auditErr := s.audit.Write(ctx, audit.Entry{
-		Actor:  id.UserID,
-		Action: action,
-		Target: req.GetOrgId(),
-		After: map[string]any{
-			"key_id": keyID,
-			"org_id": req.GetOrgId(),
-			"scopes": req.GetScopes(),
-		},
-	})
-	if auditErr != nil {
-		s.log.Error("CreateApiKey: key created but audit write failed — reporting as failed",
-			"key_id", keyID, "org_id", req.GetOrgId(), "user_id", id.UserID, "error", auditErr)
-		return nil, status.Error(codes.Internal, "key may have been created but could not be recorded; treat as failed and verify with an operator")
 	}
 
 	s.log.Info("created api key", "key_id", keyID, "org_id", req.GetOrgId(), "user_id", id.UserID)
@@ -329,7 +206,6 @@ func (s *server) RevokeApiKey(ctx context.Context, req *pb.RevokeApiKeyRequest) 
 	if !ok {
 		return nil, status.Error(codes.Internal, "no verified identity")
 	}
-	const action = "revoke_api_key"
 
 	found, err := s.keys.Revoke(ctx, req.GetKeyId())
 	// found=false (no such key_id, or already revoked) is treated the
@@ -343,22 +219,7 @@ func (s *server) RevokeApiKey(ctx context.Context, req *pb.RevokeApiKeyRequest) 
 		} else {
 			s.log.Warn("RevokeApiKey: no active key found", "key_id", req.GetKeyId(), "user_id", id.UserID)
 		}
-		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetKeyId()}); auditErr != nil {
-			s.log.Error("RevokeApiKey: failed to audit a failed attempt", "key_id", req.GetKeyId(), "user_id", id.UserID, "error", auditErr)
-		}
 		return nil, status.Error(codes.Internal, "failed to revoke api key")
-	}
-
-	auditErr := s.audit.Write(ctx, audit.Entry{
-		Actor:  id.UserID,
-		Action: action,
-		Target: req.GetKeyId(),
-		After:  map[string]string{"status": "revoked"},
-	})
-	if auditErr != nil {
-		s.log.Error("RevokeApiKey: key revoked but audit write failed — reporting as failed",
-			"key_id", req.GetKeyId(), "user_id", id.UserID, "error", auditErr)
-		return nil, status.Error(codes.Internal, "revoke may have succeeded but could not be recorded; treat as failed and verify with an operator")
 	}
 
 	s.log.Info("revoked api key", "key_id", req.GetKeyId(), "user_id", id.UserID)

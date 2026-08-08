@@ -172,8 +172,16 @@ func main() {
 	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(
 		authn.UnaryInterceptor(authnStore, log),
 		authz.UnaryInterceptor(auditWriter, log),
+		// Audit fix H5: the success/failure audit CHOKEPOINT. Runs LAST in
+		// the chain so it wraps the handler itself and sees its real
+		// outcome. Denial audit stays in authz (it must run BEFORE the
+		// handler, and returns without ever reaching one); this covers
+		// every mutating RPC that actually executes. See
+		// audit_interceptor.go for why the 13 hand-wired call sites this
+		// replaces were a reintroducible gap rather than merely verbose.
+		AuditUnaryInterceptor(auditWriter, log),
 	))
-	pb.RegisterAdminServiceServer(grpcServer, &server{db: db, control: controlClient, keys: keyStore, audit: auditWriter, log: log})
+	pb.RegisterAdminServiceServer(grpcServer, &server{db: db, control: controlClient, keys: keyStore, log: log})
 
 	go func() {
 		log.Info("admin-api gRPC listening", "port", grpcPort)
