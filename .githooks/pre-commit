@@ -31,7 +31,26 @@ set -uo pipefail
 # Each entry: <label>|<extended-regex>
 PATTERNS=(
   'Authorization: Bearer token|Authorization:[[:space:]]*[Bb]earer[[:space:]]+[A-Za-z0-9._~+/=-]{16,}'
-  'OneZox tenant/admin key (oz_)|oz_(test|admin|live)[A-Za-z0-9_]*_[a-f0-9]{32,}'
+  # H1 follow-up: this pattern was originally
+  #   oz_(test|admin|live)[A-Za-z0-9_]*_[a-f0-9]{32,}
+  # which required a literal test/admin/live SEGMENT after "oz_". That
+  # matched scripts/seed-admin-user.sh's RAW_TOKEN="oz_admin_${ROLE}_..."
+  # and NOTHING ELSE — in particular it did not match the keys the
+  # product actually mints at runtime. apikeys.GenerateRawKey() returns
+  # "oz_" + hex(32 random bytes), i.e. oz_ followed directly by 64 hex
+  # chars with no segment and no second underscore.
+  #
+  # So the hook built to stop credential leaks did not recognise this
+  # repo's OWN primary credential format. Verified empirically, not by
+  # reading: a generated real-shape key was staged and the hook ALLOWED
+  # the commit. That is the same silent-no-op failure as the `-----BEGIN`
+  # grep-options bug this file's own comment below records — a pattern
+  # that looks correct and never fires.
+  #
+  # Widened to "oz_ followed by 24+ key characters", which covers both
+  # the runtime format and every seeded variant without enumerating
+  # segment names that can drift again.
+  'OneZox tenant/admin key (oz_)|oz_[A-Za-z0-9_-]{24,}'
   'OpenAI-style key (sk-)|sk-[A-Za-z0-9_-]{20,}'
   'xAI key (xai-)|xai-[A-Za-z0-9_-]{20,}'
   'Google API key (AIza)|AIza[A-Za-z0-9_-]{30,}'
