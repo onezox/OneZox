@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Post-M2 audit fix H1 — block any commit whose STAGED content contains
+# something credential-shaped.
+#
+# Why this exists. Four credential exposures happened in this build:
+#   1. `kubectl get secret -o yaml` printed base64-encoded provider keys
+#   2. grpcurl on IssueProviderToken printed the Vault-issued token
+#   3. curl printed a full Set-Cookie header containing an admin session
+#   4. .claude/settings.json accumulated a real tenant API key
+# In every case the rule was known and the sensitivity was understood. The
+# rule failed anyway, because it was enforced by attention at exactly the
+# moment attention was elsewhere. Gitignoring settings.json fixes the
+# mechanism behind #4; this hook is the layer that does not care which
+# mechanism a credential arrives through.
+#
+# Scope: STAGED content only (`git diff --cached`). It cannot see, and does
+# not try to police, the working tree or shell transcripts — that is
+# scripts/assert-credential.sh's job (audit fix H2). Between them: this
+# stops credentials entering HISTORY, that one stops them entering OUTPUT.
+#
+# Install: git config core.hooksPath .githooks
+# Bypass (deliberate, e.g. a documented test fixture):
+#   git commit --no-verify
+# Bypassing is intentionally a conscious act with an audit trail, not a
+# default.
+
+set -uo pipefail
+
+# Patterns are anchored on shapes that are credentials by construction,
+# not on words like "password" that produce noise in prose and comments.
+# Each entry: <label>|<extended-regex>
+PATTERNS=(
+  'Authorization: Bearer token|Authorization:[[:space:]]*[Bb]earer[[:space:]]+[A-Za-z0-9._~+/=-]{16,}'
+  'OneZox tenant/admin key (oz_)|oz_(test|admin|live)[A-Za-z0-9_]*_[a-f0-9]{32,}'
+  'OpenAI-style key (sk-)|sk-[A-Za-z0-9_-]{20,}'
+  'xAI key (xai-)|xai-[A-Za-z0-9_-]{20,}'
+  'Google API key (AIza)|AIza[A-Za-z0-9_-]{30,}'
+  'Anthropic key (sk-ant-)|sk-ant-[A-Za-z0-9_-]{20,}'
+  'GitHub token (ghp_/gho_/ghs_)|gh[pos]_[A-Za-z0-9]{30,}'
+  'Vault token (hvs./hvb.)|hv[sb]\.[A-Za-z0-9_-]{20,}'
+  'private key block|-----BEGIN[[:space:]]+[A-Z ]*PRIVATE KEY-----'
+  'k8s Secret data: (base64 values)|^\+[[:space:]]*data:[[:space:]]*$'
+)
+
+# Files that legitimately contain credential-SHAPED strings which are not
+# credentials: the pre-commit hook's own pattern list, and the audit
+# document that records the shapes it searched for.
+ALLOWLIST_REGEX='^(\.githooks/pre-commit|Audit\.txt)$'
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+violations=0
+
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  if printf '%s' "$file" | grep -qE "$ALLOWLIST_REGEX"; then
+    continue
+  fi
+  # Added lines only ("+" prefix, excluding the "+++" file header) — a
+  # credential already in history is a separate (worse) problem this hook
+  # cannot solve, and flagging unchanged context lines forever would train
+  # people to --no-verify by reflex.
+  added=$(git diff --cached -U0 -- "$file" | grep -E '^\+' | grep -vE '^\+\+\+' || true)
+  [ -z "$added" ] && continue
+
+  for entry in "${PATTERNS[@]}"; do
+    label=${entry%%|*}
+    regex=${entry#*|}
+    # `--` before the pattern is load-bearing: the private-key regex begins
+    # with "-----", which grep would otherwise parse as options. Caught by
+    # this hook's own adversarial test, where that one pattern silently
+    # never matched — the exact class of no-op the hook exists to catch.
+    if printf '%s\n' "$added" | grep -qE -- "$regex"; then
+      # Report the FILE and the PATTERN NAME. Never the matched text —
+      # a hook that echoed the offending line to the terminal would leak
+      # the very thing it exists to stop, and would land it in shell
+      # history too.
+      echo "  BLOCKED  $file  — matches: $label"
+      violations=$((violations + 1))
+    fi
+  done
+done <<< "$staged"
+
+if [ "$violations" -gt 0 ]; then
+  cat <<'MSG'
+
+commit rejected: staged content looks like it contains a credential.
+
+The matching file and pattern are named above; the matched VALUE is
+deliberately not printed — echoing it would leak it to the terminal and
+into shell history, which is the failure this hook exists to prevent.
+
+If it is a real credential:
+  - remove it from the staged content, and
+  - treat it as compromised: revoke/rotate it, do not just unstage it.
+
+If it is a false positive (a fixture, a documented example):
+  git commit --no-verify
+
+MSG
+  exit 1
+fi
+
+exit 0

@@ -13,6 +13,14 @@
 # =========================
 .claude/worktrees
 .claude/settings.local.json
+# settings.json is a permission ALLOWLIST that records approved commands
+# verbatim — including any that carried an `Authorization: Bearer <token>`
+# header. The post-M2 audit found a real (already-revoked) tenant API key
+# sitting in it. That was not a one-off mistake: the file accumulates
+# credentials automatically as commands are approved, so it must never be
+# tracked. Untracked here; .githooks/pre-commit is the second layer that
+# catches a credential arriving through any other path.
+.claude/settings.json
 
 # =========================
 # Rust
