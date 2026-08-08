@@ -96,7 +96,7 @@ spec:
       serviceAccountName: control-plane
       containers:
         - name: control-plane
-          image: onezox/control-plane:aa53e21
+          image: onezox/control-plane:ee5da39
           imagePullPolicy: IfNotPresent
           env:
             # POD_NAME becomes the reconciler Lease's holderIdentity, so
