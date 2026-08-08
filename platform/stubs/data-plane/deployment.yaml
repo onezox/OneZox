@@ -41,7 +41,12 @@ metadata:
   labels:
     app: data-plane
 spec:
-  replicas: 1
+  # Post-M2 audit M5: .spec.replicas is INTENTIONALLY ABSENT — the
+  # HorizontalPodAutoscaler in hpa.yaml owns it. Committing a value here
+  # while onezox-stubs runs selfHeal:true would make Argo reset every
+  # scale decision the HPA makes, leaving an HPA that looks installed and
+  # does nothing. See the ignoreDifferences block in
+  # platform/argocd/applications/onezox-stubs.yaml for the other half.
   selector:
     matchLabels:
       app: data-plane

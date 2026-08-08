@@ -1,0 +1,70 @@
+# Post-M2 audit M5 — F2's INTERIM autoscaler for edge-gateway.
+#
+# Same reasoning as data-plane's hpa.yaml (read that one for the full F2
+# framing); this file records only what is specific to edge-gateway.
+#
+# The audit asked to "consider edge-gateway" rather than assuming it.
+# It qualifies for the stronger of the two reasons: edge-gateway is the
+# FRONT DOOR. Every tenant request enters here, so at replicas:1 a single
+# pod restart — a rollout, a node drain, an OOM — is a total outage of the
+# public surface, not a degraded one. data-plane at least sits behind it.
+#
+# WHY edge-gateway IS SAFE TO SCALE HORIZONTALLY (checked, not assumed).
+# Its only spawned task is `watch_cache.watch_forever()` in main.rs — the
+# per-replica model_registry watch, which independently re-verifies every
+# manifest signature against edge-gateway's own Vault client. Everything
+# that must be consistent ACROSS replicas is already externalized:
+#   - rate limiting          -> Redis (RedisRateLimitCounter)
+#   - admission gauge        -> Redis (RedisAdmissionGauge)
+#   - api-key / policy reads -> CockroachDB (Cockroach*Store)
+# There is no in-process request affinity and no sticky session; the JWT
+# secret and stores are cloned into shared Arc state at boot and only
+# read. Two replicas are indistinguishable from one, from a caller's
+# perspective — which is precisely why the rate limiter had to be
+# Redis-backed in Phase-01 rather than in-process.
+#
+# minReplicas: 2 for availability, as above.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: edge-gateway
+  namespace: default
+  labels:
+    app: edge-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: edge-gateway
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # Longer than data-plane's: edge-gateway holds STREAMING responses
+      # open (SSE relay, stream.rs). Scaling down aggressively would cut
+      # live streams on pod termination, so capacity is given a wide
+      # margin to drain before it is reclaimed.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

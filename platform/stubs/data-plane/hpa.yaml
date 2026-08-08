@@ -1,0 +1,89 @@
+# Post-M2 audit M5 — F2's INTERIM autoscaler for data-plane.
+#
+# F2 defers real autoscaling to KEDA in Phase-13, where scaling will key
+# off queue depth / in-flight admissions (the signals that actually
+# describe data-plane's load). That deferral is unchanged. What the audit
+# flagged is that "deferred to P13" had quietly come to mean "no scaling
+# response of any kind, and exactly one replica" — a single point of
+# failure on the request path, not just a missing optimization. This
+# closes that gap with the boring, built-in mechanism, and is explicitly
+# NOT a KEDA substitute.
+#
+# WHY data-plane IS SAFE TO SCALE HORIZONTALLY (checked, not assumed).
+# Its only long-lived in-process state is the model_registry cache plus
+# the watch_forever() and resync_forever() tasks spawned in main.py. All
+# three are PER-REPLICA by construction: each replica independently
+# lists/watches etcd and independently verifies every manifest signature
+# against Vault. Two replicas do the same work twice and converge on the
+# same answer; neither coordinates with nor depends on the other. There
+# is no leader, no shard assignment, and no in-process mutable state
+# shared across requests. Rate limiting and the admission gauge live in
+# Redis, so they are already correct across replicas (Phase-01/03).
+#
+# CONTRAST — control-plane deliberately gets NO HPA in this change, even
+# though it is the same "two replicas already" shape. Its rollout
+# reconciler is an in-process goroutine started unconditionally in every
+# replica (main.go: `go reconciler.Run(...)`) with no leader election,
+# and it writes rollout stage transitions with an UNCONDITIONAL
+# `UPDATE rollout SET stage = $2, status = $3 ...` — no expected-stage
+# guard, no transaction. Adding replicas there multiplies concurrent
+# reconcilers writing the same rows. That is reported as a separate
+# finding rather than papered over with an autoscaler.
+#
+# minReplicas: 2, not 1 — removing the SPOF is half the point, and a
+# floor of 1 would leave data-plane single-replica in exactly the steady
+# state it spends most of its time in.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: data-plane
+  namespace: default
+  labels:
+    app: data-plane
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: data-plane
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    # CPU is the honest signal for data-plane's actual work (normalize,
+    # resolve, serialize, fan out to provider-gateway). Utilization is a
+    # percentage of the container's cpu REQUEST (50m), which is what makes
+    # requests:/limits: being set on the Deployment a hard prerequisite
+    # for this to function at all rather than sit in <unknown>.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Memory is a secondary guard, deliberately looser: data-plane's
+    # memory is dominated by the registry cache, which does NOT grow with
+    # load, so a memory rise here means something genuinely unusual.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      # React quickly — under-provisioning shows up as user-visible
+      # latency and admission rejections.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # Retreat slowly. A 5-minute window keeps a brief traffic lull from
+      # tearing down capacity that a canary analysis window may still be
+      # measuring against — an oscillating replica count would add noise
+      # to exactly the per-version SLO metric EC1/EC2 depend on.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

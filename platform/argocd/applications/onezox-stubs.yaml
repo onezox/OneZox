@@ -18,6 +18,36 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: default
+  # Post-M2 audit M5: .spec.replicas on the HPA-managed Deployments is
+  # owned by the HorizontalPodAutoscaler at RUNTIME, not by git. Without
+  # this, selfHeal:true above and the HPA fight each other on a loop —
+  # the HPA scales data-plane to 4, Argo sees drift from the committed
+  # manifest and scales it straight back, forever. The HPA would appear
+  # installed and healthy while accomplishing nothing, which is the exact
+  # silent-no-op failure shape this build has been bitten by repeatedly.
+  #
+  # Belt and braces, because either alone is fragile: the two Deployments
+  # below also OMIT .spec.replicas entirely, so git no longer asserts a
+  # value to be healed back to. This block additionally stops Argo from
+  # reporting the live replica count as permanent OutOfSync drift.
+  #
+  # Scoped to the two HPA-managed Deployments BY NAME. It is deliberately
+  # not a blanket kind:Deployment rule — control-plane, admin-api,
+  # provider-gateway and the rest still have git-pinned replica counts
+  # that SHOULD be healed if something changes them out of band.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: data-plane
+      namespace: default
+      jsonPointers:
+        - /spec/replicas
+    - group: apps
+      kind: Deployment
+      name: edge-gateway
+      namespace: default
+      jsonPointers:
+        - /spec/replicas
   syncPolicy:
     automated:
       prune: true

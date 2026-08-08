@@ -1,0 +1,45 @@
+# Argo CD Application for metrics-server — the metrics.k8s.io provider the
+# post-M2 audit's M5 HPAs read from. Unlike its sibling operator-* apps,
+# this one ADOPTS NOTHING: there is no pre-existing Helm release to take
+# over, because metrics-server was never installed (that absence is what
+# blocked M5). So this Application CREATES the release, and its first sync
+# is deliberately NOT a no-op — the opposite of the adoption apps added
+# alongside it in Phase-05, and called out here so the difference in
+# expected first-sync behaviour is not mistaken for drift.
+#
+# Same multi-source shape as operator-prometheus: source 1 is the upstream
+# chart, source 2 is this repo referenced only as $values, so the values
+# file stays the single reconciled source of truth and cannot drift the way
+# prometheus-values.yaml silently did before Phase-05 Step N closed it.
+#
+# namespace: kube-system, not default — metrics-server is a cluster addon
+# serving an aggregated APIService, not a OneZox workload, and every tool
+# that looks for it (kubectl top, HPA troubleshooting docs) looks there.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: operator-metrics-server
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://kubernetes-sigs.github.io/metrics-server/
+      chart: metrics-server
+      targetRevision: 3.13.1
+      helm:
+        releaseName: metrics-server
+        valueFiles:
+          - $values/platform/operators/metrics-server/metrics-server-values.yaml
+    - repoURL: https://github.com/onezox/OneZox.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - CreateNamespace=false

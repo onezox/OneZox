@@ -1,0 +1,55 @@
+# metrics-server — post-M2 audit M5's PREREQUISITE, not a goal of its own.
+#
+# F2 deferred autoscaling to KEDA in Phase-13. The audit's M5 asks for the
+# INTERIM: a plain HPA on the request-serving services, which today sit at
+# replicas:1 with no scaling response at all. A HorizontalPodAutoscaler
+# reading `type: Resource` (cpu/memory) requires the metrics.k8s.io API,
+# and kind ships no metrics-server — `kubectl get apiservice
+# v1beta1.metrics.k8s.io` returned NotFound before this file existed. So
+# the HPA is unbuildable without this.
+#
+# WHY --kubelet-insecure-tls IS SET AND WHY THAT IS ACCEPTABLE HERE.
+# metrics-server scrapes each kubelet's /metrics/resource over TLS and, by
+# default, verifies the kubelet's serving certificate against the cluster
+# CA. kind's kubelets serve a SELF-SIGNED cert that the cluster CA never
+# signed (kind does not enable the kubelet serving-cert CSR flow), so
+# verification fails and every scrape errors — the standard, documented
+# kind/minikube caveat, not a OneZox-specific workaround.
+#
+# This is a LOCAL-CLUSTER-ONLY concession and is called out here so it
+# cannot ride silently into a cloud phase: on a real cluster the kubelet
+# serving certs ARE properly signed, this flag MUST be removed, and
+# removing it is a one-line change to this file. It is scoped to
+# metrics-server's own kubelet scrape path — it does not weaken TLS for
+# any OneZox service, none of which metrics-server talks to.
+args:
+  - --kubelet-insecure-tls
+  # Prefer the node's InternalIP: kind nodes' hostnames do not resolve
+  # from inside the cluster, which is the other half of the same caveat.
+  - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+
+# Single replica: this is the local kind cluster, and metrics-server is a
+# scrape-and-serve cache with no durable state — a restart re-populates
+# within one scrape interval. HA metrics-server is a cloud-phase concern,
+# tracked with the rest of the cloud-provisioning deferral.
+replicas: 1
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    cpu: 100m
+    memory: 128Mi
+
+# Same hardening posture every OneZox workload already carries.
+podSecurityContext:
+  fsGroup: 10001
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
+  capabilities:
+    drop:
+      - ALL
