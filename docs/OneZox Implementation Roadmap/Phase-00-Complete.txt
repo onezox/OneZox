@@ -1,0 +1,891 @@
+================================================================================
+PHASE-00 — FOUNDATION — COMPLETION RECORD
+================================================================================
+This document records the work actually completed for Phase-00 on the local
+onezox-dev Kubernetes cluster (kind, WSL2 Ubuntu 24.04). It contains only
+work that was performed and verified. It does not contain Phase-01 work,
+future plans, recommendations, or opinions.
+
+--------------------------------------------------------------------------------
+PHASE-00 OBJECTIVE
+--------------------------------------------------------------------------------
+Stand up the repository, contracts, infrastructure-as-code, one running cell,
+the foundational data stores, and end-to-end telemetry, so that later phases
+plug into a reproducible, observable, typed foundation. No user-facing
+services were built. Only three throwaway health stubs were built to prove
+the toolchain, the service mesh, and telemetry end-to-end.
+
+--------------------------------------------------------------------------------
+COMPLETE INSTALLATION SEQUENCE (IN ORDER)
+--------------------------------------------------------------------------------
+1.  WSL2 baseline verification (systemd active).
+2.  Base OS packages (curl, ca-certificates, gnupg, build-essential,
+    apt-transport-https, software-properties-common).
+3.  Git identity configuration.
+4.  Docker Engine (native, systemd-managed).
+5.  kubectl.
+6.  kind CLI.
+7.  Helm CLI.
+8A. Terraform CLI.
+8B. onezox-dev kind cluster created via Terraform.
+9.  Cilium (eBPF CNI) with SPIRE-based mutual authentication capability.
+10. Karpenter reviewed and declared (not deployed) — cloud deferral.
+11. Argo CD installed (server + CLI).
+12. buf CLI installed; proto/ contract workspace scaffolded.
+13. Node.js installed; Nx workspace initialized.
+14. Rust toolchain installed (rustup); Cargo workspace initialized.
+15. Python 3.12+ toolchain verified/completed; virtual environment and
+    dev tooling installed.
+16. Go toolchain installed; Go workspace initialized.
+17. CockroachDB Operator installed; onezox-crdb cluster provisioned.
+18. Redis Cluster deployed.
+19. MinIO deployed; object-store buckets created.
+20. OpenTelemetry Collector deployed.
+21. Prometheus and Grafana deployed.
+22. Loki deployed.
+23. Tempo deployed.
+24. cosign installed; local development signing key pair generated.
+25. Syft installed; example SBOM generated.
+26. CockroachDB schema-bootstrap migrations created and applied
+    (schema_migrations, tenants, health_probe).
+27. Three stub services built (edge-stub, dataplane-stub, provider-stub),
+    containerized, deployed via Argo CD GitOps against the GitHub
+    repository, and verified end to end.
+28. Cilium mTLS enforcement (CiliumNetworkPolicy with SPIRE-based mutual
+    authentication) applied between the three stub services via GitOps
+    and verified.
+29. GitHub Actions CI pipeline created (.github/workflows/ci.yml): buf
+    lint, buf breaking-change detection, Docker builds of all three stub
+    services, Syft SBOM generation, and cosign signing and verification,
+    automated on every push and pull request, and verified by a real run
+    on GitHub's own Actions runners.
+
+--------------------------------------------------------------------------------
+WSL2 AND LOCAL DEVELOPMENT ENVIRONMENT
+--------------------------------------------------------------------------------
+Host: WSL2, Ubuntu 24.04.4 LTS, kernel 6.6.87.2-microsoft-standard-WSL2.
+systemd confirmed active as PID 1 and used as the init system throughout
+(required for the native Docker Engine service).
+
+A scoped passwordless sudo rule was created at /etc/sudoers.d/onezox-apt,
+limited to /usr/bin/apt, /usr/bin/apt-get, and /usr/bin/dpkg only. All other
+privileged actions during Phase-00 (Docker daemon configuration, sysctl
+changes) were performed as explicit one-time privileged commands, never a
+blanket sudo grant.
+
+All CLI tools installed during Phase-00 were placed under the user's own
+$HOME/.local (or a dedicated $HOME/.local/<tool> directory), not under
+/usr/local, except where installed via the apt package manager under the
+scoped sudo rule (kubectl, python3-pip, python3-venv, python3-dev,
+build-essential, apt-transport-https).
+
+--------------------------------------------------------------------------------
+GIT
+--------------------------------------------------------------------------------
+Git 2.43.0 (already present on the system).
+Global identity configured: user.name, user.email, init.defaultBranch=main.
+The global identity was changed once during Phase-00 after the original
+GitHub account was suspended; a new account and new global git identity
+were configured. The final identity used for all Phase-00 commits is
+user.name=onezox, user.email=myonezox@gmail.com.
+
+The repository is a git repository with a single remote, "origin", pointing
+to the existing GitHub repository https://github.com/onezox/OneZox (public
+visibility, unchanged from its prior state). All Phase-00 work was
+committed to the "main" branch and pushed to this remote.
+
+--------------------------------------------------------------------------------
+DOCKER
+--------------------------------------------------------------------------------
+Docker Engine 29.6.2 installed natively (not Docker Desktop) via Docker's
+official apt repository, managed by systemd (docker.service, enabled and
+active). The local user was added to the "docker" group.
+
+Docker's default per-container file-descriptor limit was later raised via
+/etc/docker/daemon.json (default-ulimits: nofile soft 65536, hard 1048576)
+during troubleshooting (see PROBLEMS ENCOUNTERED). This required Docker to
+be restarted and the onezox-dev cluster to be recreated.
+
+--------------------------------------------------------------------------------
+KUBECTL
+--------------------------------------------------------------------------------
+kubectl v1.36.3, installed from the official Kubernetes apt repository
+(pkgs.k8s.io, stable v1.36 channel).
+
+--------------------------------------------------------------------------------
+KIND
+--------------------------------------------------------------------------------
+kind v0.32.0, installed from the official GitHub release binary. Used to
+create and manage the onezox-dev local Kubernetes cluster (see below), with
+cluster lifecycle owned by Terraform rather than the bare kind CLI.
+
+--------------------------------------------------------------------------------
+HELM
+--------------------------------------------------------------------------------
+Helm v4.2.3, installed from the official release binary. Used to install
+Cilium, Argo CD, CockroachDB Operator, the OpenTelemetry Collector,
+Prometheus, Grafana, Loki, Tempo, and Promtail.
+
+--------------------------------------------------------------------------------
+TERRAFORM
+--------------------------------------------------------------------------------
+Terraform v1.15.8, installed from the official release binary. Used to
+create and manage the onezox-dev kind cluster via the tehcyx/kind provider
+(version ~> 0.11, resolved to 0.11.0). Terraform state is stored locally
+under platform/terraform/cells/local/.
+
+--------------------------------------------------------------------------------
+ONEZOX-DEV KUBERNETES CLUSTER
+--------------------------------------------------------------------------------
+Created via Terraform (platform/terraform/cells/local/main.tf) using the
+kind_cluster.onezox_dev resource: one control-plane node and two worker
+nodes (onezox-dev-control-plane, onezox-dev-worker, onezox-dev-worker2).
+The default CNI (kindnet) was disabled at cluster-creation time
+(networking.disable_default_cni = true) so that Cilium could be installed
+as the cluster's only CNI. wait_for_ready was set to false, since the
+control-plane cannot report Ready before a CNI is installed.
+
+The cluster was destroyed and recreated once during Phase-00 (see PROBLEMS
+ENCOUNTERED) to pick up a Docker daemon configuration change. Terraform
+state was confirmed to show zero drift against the live cluster at
+multiple points during Phase-00.
+
+--------------------------------------------------------------------------------
+CILIUM AND SPIRE MTLS
+--------------------------------------------------------------------------------
+Cilium v1.19.6 installed via the cilium CLI (v0.19.6), replacing kind's
+default CNI entirely. Installed with:
+  authentication.enabled=true
+  authentication.mutual.spire.enabled=true
+  authentication.mutual.spire.install.enabled=true
+  authentication.mutual.spire.install.server.dataStorage.enabled=false
+This deployed the Cilium agent DaemonSet, Cilium Envoy DaemonSet, the
+Cilium Operator, and a SPIRE server plus one SPIRE agent per node in the
+cilium-spire namespace.
+
+Cilium mTLS enforcement was completed later in Phase-00 (see below) once
+the three stub services existed to enforce it between.
+
+--------------------------------------------------------------------------------
+KARPENTER (CLOUD DEFERRAL)
+--------------------------------------------------------------------------------
+Karpenter was reviewed and declared in the Terraform structure but not
+installed or run. A variable enable_karpenter (default false) was added to
+platform/terraform/cells/local/karpenter.tf, with the corresponding
+helm_release resource present only as a code comment (not an active
+resource). Cloud-provider-specific Helm values for a future cloud
+deployment were documented in platform/karpenter/values-cloud.yaml. No
+Karpenter controller was run against the local cluster.
+
+--------------------------------------------------------------------------------
+ARGO CD AND GITOPS SETUP
+--------------------------------------------------------------------------------
+Argo CD v3.4.5 installed via the official Helm chart (argo-cd, version
+10.2.1) into the argocd namespace: argocd-server, argocd-repo-server,
+argocd-application-controller, argocd-applicationset-controller,
+argocd-dex-server, argocd-notifications-controller, and argocd-redis (an
+internal cache for Argo CD itself, unrelated to the Redis Cluster data
+store). The argocd CLI (v3.4.5) was installed separately.
+
+An Argo CD Application resource, "onezox-stubs", was created
+(platform/argocd/applications/onezox-stubs.yaml), sourced from the
+existing GitHub repository https://github.com/onezox/OneZox.git, branch
+main, path platform/stubs, with automated sync, prune, and self-heal
+enabled. This Application was used to deploy the three stub services and,
+later, the Cilium mTLS network policies, via GitOps rather than direct
+kubectl apply.
+
+--------------------------------------------------------------------------------
+BUF AND PROTO WORKSPACE
+--------------------------------------------------------------------------------
+buf v1.72.0 installed from the official release binary.
+
+proto/ workspace created with buf.yaml (version v2, module path ".",
+STANDARD lint ruleset, FILE-level breaking-change detection) and
+buf.gen.yaml (message-only code generation for Go, Python, and Rust via
+buf.build/protocolbuffers/go, buf.build/protocolbuffers/python, and
+buf.build/community/neoeinstein-prost; no gRPC service-stub plugins, since
+no RPCs were defined in Phase-00).
+
+Five placeholder proto packages were created: gateway/v1, dataplane/v1,
+provider/v1, admin/v1, and eval/v1, each containing a single placeholder
+message. Package names (gateway.v1, dataplane.v1, provider.v1, admin.v1,
+eval.v1) were chosen without a top-level "onezox" prefix so that the
+existing directory layout satisfies buf's PACKAGE_DIRECTORY_MATCH lint
+rule. buf lint passes cleanly against this workspace.
+
+--------------------------------------------------------------------------------
+NODE.JS AND NX WORKSPACE
+--------------------------------------------------------------------------------
+Node.js v24.18.0 and npm 11.16.0 installed from the official release
+tarball. Nx v23.1.0 initialized as a self-contained installation (Nx
+auto-detected the repository as non-JavaScript-primary and did not create
+a root package.json). Root nx.json created, pinning the installation
+version and marking build/test/lint as cacheable. No application projects
+were created (nx show projects returns an empty list).
+
+The Nx initialization also generated a CLAUDE.md file at the repository
+root, containing Nx-specific guidance for AI coding agents.
+
+--------------------------------------------------------------------------------
+RUST WORKSPACE
+--------------------------------------------------------------------------------
+Rust installed via rustup; rustc and cargo version 1.97.1. A root
+Cargo.toml was created as a workspace (resolver "2", edition "2024"),
+initially with zero members. The services/edge-stub crate was added to
+this workspace's members list once that service was built.
+
+--------------------------------------------------------------------------------
+PYTHON WORKSPACE
+--------------------------------------------------------------------------------
+System Python 3.12.3 (already present on the OS) verified. python3-pip,
+python3-venv, and python3-dev installed via apt. A root-level virtual
+environment (.venv) was created and populated with ruff 0.16.0, mypy
+2.3.0, and pytest 9.1.1. A root pyproject.toml was created containing
+[tool.ruff], [tool.mypy] (strict mode), [tool.pytest.ini_options], and a
+[dependency-groups] table; it contains no [project] table, since it is
+workspace-level tool configuration rather than an installable package.
+
+--------------------------------------------------------------------------------
+GO WORKSPACE
+--------------------------------------------------------------------------------
+Go installed from the official release tarball; go version go1.26.5. A
+root go.work file was created, initially with zero use directives. The
+services/provider-stub module was added to this workspace once that
+service was built.
+
+--------------------------------------------------------------------------------
+COCKROACHDB OPERATOR AND CLUSTER
+--------------------------------------------------------------------------------
+CockroachDB Operator v2.18.3 installed via its official CRD and operator
+manifests into the cockroach-operator-system namespace.
+
+A CrdbCluster custom resource named "onezox-crdb" was created
+(platform/operators/cockroachdb/crdb-local.yaml): 3 nodes, insecure mode,
+image cockroachdb/cockroach:v26.2.4, 4Gi persistent volume per node on the
+cluster's default StorageClass. All three CockroachDB pods reached Running
+state and were confirmed live and available via "cockroach node status".
+
+--------------------------------------------------------------------------------
+DATABASE MIGRATIONS
+--------------------------------------------------------------------------------
+Three idempotent SQL migration files were created under data/migrations/:
+  0001_create_schema_migrations.sql — creates schema_migrations
+    (migration_id STRING PRIMARY KEY, applied_at TIMESTAMPTZ).
+  0002_create_tenants.sql — creates tenants (org_id UUID PRIMARY KEY
+    DEFAULT gen_random_uuid(), name STRING NOT NULL, created_at
+    TIMESTAMPTZ, status STRING NOT NULL DEFAULT 'active').
+  0003_create_health_probe.sql — creates health_probe (probe_id UUID
+    PRIMARY KEY DEFAULT gen_random_uuid(), service STRING NOT NULL, ts
+    TIMESTAMPTZ).
+Each file uses CREATE TABLE IF NOT EXISTS and records its own application
+in schema_migrations via INSERT ... ON CONFLICT (migration_id) DO NOTHING.
+A run-migrations.sh script applies all three files in order via kubectl
+exec and cockroach sql, then runs SHOW TABLES.
+
+All three migrations were executed against the running onezox-crdb
+cluster. Idempotency was proven by running the script twice: the second
+run reported "already exists, skipping" for each table and "INSERT 0 0"
+for each ledger insert. SHOW TABLES confirmed all three tables exist.
+
+--------------------------------------------------------------------------------
+REDIS CLUSTER
+--------------------------------------------------------------------------------
+Deployed via hand-written Kubernetes manifests (not a Helm chart), because
+no actively maintained, freely usable official Redis Cluster Helm chart
+was available at the time (see PROBLEMS ENCOUNTERED).
+platform/operators/redis/redis-cluster.yaml defines a ConfigMap
+(cluster-enabled yes), a headless Service (redis-cluster-headless), and a
+6-replica StatefulSet using the official redis:8.2.3-alpine image with
+emptyDir storage (no persistent volumes, matching the ephemeral-only
+requirement). platform/operators/redis/redis-cluster-init-job.yaml is a
+Job that waits for all 6 pods to respond to PING and then runs
+"redis-cli --cluster create ... --cluster-replicas 1", forming 3 masters
+and 3 replicas covering all 16384 hash slots.
+
+Cluster formation was verified via "cluster info" (cluster_state:ok, all
+slots assigned) and "cluster nodes". Read/write correctness was verified
+by writing and reading namespaced keys across different hash slots, and by
+confirming a deliberate CROSSSLOT error when a multi-key command spanned
+two slots — proving genuine sharding rather than a single-node fallback.
+
+--------------------------------------------------------------------------------
+MINIO AND CREATED BUCKETS
+--------------------------------------------------------------------------------
+MinIO deployed as a standalone single-node Deployment
+(platform/operators/minio/minio.yaml): a Secret holding root credentials
+and a static SSE-S3 encryption key, a 4Gi PersistentVolumeClaim, the
+Deployment itself, and a Service exposing the API (9000) and console
+(9001) ports.
+
+Buckets created:
+  onezox-artifacts  — versioning ON, SSE-S3 encryption enabled as default,
+                       private.
+  onezox-traces     — versioning ON, SSE-S3 encryption enabled as default,
+                       private.
+  onezox-backups    — versioning ON, SSE-S3 encryption enabled as default,
+                       private.
+  onezox-loki-chunks   — created to serve as Loki's chunk storage backend.
+  onezox-tempo-traces  — created to serve as Tempo's trace storage backend.
+
+Default encryption was verified directly on a freshly written object
+("Encryption: SSE-S3" reported by "mc stat") after correcting an initial
+gap where the encryption key was configured but not yet set as each
+bucket's default (see PROBLEMS ENCOUNTERED). Versioning was verified by
+overwriting an object and confirming both versions remained retrievable.
+Console reachability was confirmed (HTTP 200).
+
+--------------------------------------------------------------------------------
+OPENTELEMETRY COLLECTOR
+--------------------------------------------------------------------------------
+Deployed via the official opentelemetry-collector Helm chart (version
+0.165.0, contrib image v0.156.0). Configured with OTLP gRPC (4317) and
+OTLP HTTP (4318) receivers, a batch processor, and three exporters: a pull
+based "prometheus" exporter (port 8889), an "otlp/tempo" exporter, and an
+"otlphttp/loki" exporter.
+
+Verified by sending a real trace and a real metric through the Collector
+using telemetrygen and confirming both were processed (visible in the
+debug exporter's output and in the prometheus exporter's live output).
+
+--------------------------------------------------------------------------------
+PROMETHEUS
+--------------------------------------------------------------------------------
+Deployed via the official prometheus-community/prometheus Helm chart
+(version 29.19.0), standalone (alertmanager, kube-state-metrics,
+prometheus-node-exporter, and prometheus-pushgateway all disabled). A 4Gi
+persistent volume was configured for the server.
+
+Scrape configuration includes:
+  - the OpenTelemetry Collector's prometheus exporter (port 8889).
+  - the three stub services' own /metrics endpoints (added once the stub
+    services existed).
+
+Verified via the scrape-targets API (all targets reporting "up") and via
+PromQL queries returning real values for both the OTel-forwarded test
+metric and each stub service's own boot counter.
+
+--------------------------------------------------------------------------------
+GRAFANA
+--------------------------------------------------------------------------------
+Deployed via the official grafana/grafana Helm chart (version 10.5.15).
+No persistent storage configured. Admin credentials stored in a Kubernetes
+Secret. Three data sources were auto-provisioned at install time:
+Prometheus (default), Loki, and Tempo.
+
+Verified via the Grafana API: all three data sources report healthy, and
+queries proxied through Grafana (not sent directly to the backing store)
+successfully returned real metric, log, and trace data.
+
+--------------------------------------------------------------------------------
+LOKI
+--------------------------------------------------------------------------------
+Deployed via the official grafana/loki Helm chart (version 7.1.0) in
+SingleBinary deployment mode. Object storage for chunks and the ruler was
+configured against the existing MinIO instance (bucket onezox-loki-chunks)
+rather than the chart's own bundled MinIO. auth_enabled was set to false
+(overriding the chart's default of true, which would otherwise require an
+X-Scope-OrgID header on every request).
+
+Verified by sending a real log line through the OpenTelemetry Collector's
+OTLP log path and confirming it was queryable both directly against Loki
+and through Grafana's Loki data source proxy.
+
+A Promtail DaemonSet (grafana/promtail Helm chart, version 6.17.1) was
+installed later in Phase-00, once it was found that no agent was shipping
+container standard-output logs into Loki. Promtail runs one pod per node
+and pushes to Loki's push API. Verified by confirming the "app" and
+"container" labels populated in Loki and by querying the actual structured
+log lines written by the three stub services.
+
+--------------------------------------------------------------------------------
+TEMPO
+--------------------------------------------------------------------------------
+Deployed via the official grafana/tempo Helm chart (version 1.24.4) in
+single-binary mode. Trace storage was configured against the existing
+MinIO instance (bucket onezox-tempo-traces).
+
+Verified by sending a real trace through the OpenTelemetry Collector and
+retrieving it by trace ID both directly against Tempo's API and through
+Grafana's Tempo data source proxy.
+
+--------------------------------------------------------------------------------
+COSIGN
+--------------------------------------------------------------------------------
+cosign v3.1.2 installed from the official release binary. A local
+development signing key pair was generated (cosign generate-key-pair),
+password-protected. The private key and its password are stored under
+.tooling/cosign/ and are excluded from git via .gitignore; the public key
+is tracked at platform/security/cosign/cosign.pub.
+
+A test container image was built and pushed to a temporary local OCI
+registry, signed with the local private key, and verified against the
+public key. Verification was also confirmed to fail (non-zero exit code)
+when checked against an unrelated public key, demonstrating that
+verification is genuinely cryptographic. Upload to the public Rekor
+transparency log was disabled for this local signing (a signing
+configuration file with the Rekor URL removed was used), since a real CI
+identity to bind a keyless signature to did not exist in Phase-00.
+
+--------------------------------------------------------------------------------
+SYFT
+--------------------------------------------------------------------------------
+Syft v1.49.0 installed from the official install script. An SPDX 2.3 JSON
+SBOM was generated for the same test image used for the cosign
+verification. The SBOM was checked directly: it contains 15 catalogued
+packages with real version numbers (including musl 1.2.5-r3, busybox
+1.36.1-r31, apk-tools 2.14.4-r1, and alpine-baselayout 3.6.5-r0). A
+reusable generation script and the example SBOM are stored under
+platform/security/sbom/.
+
+--------------------------------------------------------------------------------
+STUB SERVICES (RUST, PYTHON, GO)
+--------------------------------------------------------------------------------
+Three throwaway health-check services were built, one per required
+language:
+
+edge-stub (services/edge-stub) — Rust, using axum and tokio. Connects to
+CockroachDB via tokio-postgres, Redis via a cluster-aware
+redis::cluster::ClusterClient, and MinIO via the rust-s3 crate. Emits an
+OpenTelemetry trace span over OTLP, exposes Prometheus metrics via the
+prometheus crate, and logs structured JSON via tracing and
+tracing-subscriber, bridged to OpenTelemetry via tracing-opentelemetry.
+
+dataplane-stub (services/dataplane-stub) — Python, using FastAPI and
+uvicorn. Connects to CockroachDB via asyncpg, Redis via
+redis.asyncio.cluster.RedisCluster, and MinIO via the official minio
+client. Emits an OpenTelemetry trace span, exposes Prometheus metrics via
+prometheus-client, and logs structured JSON via a custom logging
+formatter.
+
+provider-stub (services/provider-stub) — Go, using the standard library
+net/http. Connects to CockroachDB via pgx, Redis via a cluster-aware
+redis.NewClusterClient, and MinIO via minio-go. Emits an OpenTelemetry
+trace span, exposes Prometheus metrics via client_golang, and logs
+structured JSON via the standard library log/slog package.
+
+Each service exposes GET /healthz, GET /readyz (checking CockroachDB and
+Redis connectivity), and GET /metrics. On boot, each service writes one
+row to health_probe, performs a namespaced Redis SET and GET
+({tenant}:{service}:boot), and uploads one test object to the
+onezox-artifacts bucket in MinIO.
+
+--------------------------------------------------------------------------------
+DOCKER IMAGES
+--------------------------------------------------------------------------------
+Three images were built via multi-stage Dockerfiles:
+  onezox/edge-stub:phase00       — builder stage rust:1.97.1-slim-bookworm,
+                                    runtime stage debian:bookworm-slim.
+  onezox/dataplane-stub:phase00  — python:3.12-slim.
+  onezox/provider-stub:phase00   — builder stage golang:1.26-bookworm,
+                                    runtime stage debian:bookworm-slim.
+All three images were loaded into all three onezox-dev nodes by saving
+each image to a tar file and importing it directly into each node's
+containerd content store (kind's own image-loading command was found not
+to work with these images; see PROBLEMS ENCOUNTERED).
+
+--------------------------------------------------------------------------------
+KUBERNETES MANIFESTS
+--------------------------------------------------------------------------------
+A Deployment and a Service were created for each stub service under
+platform/stubs/: platform/stubs/edge-stub/deployment.yaml,
+platform/stubs/dataplane-stub/deployment.yaml, and
+platform/stubs/provider-stub/deployment.yaml. Each Deployment defines a
+readiness probe against /readyz and a liveness probe against /healthz.
+
+--------------------------------------------------------------------------------
+ARGO CD DEPLOYMENT
+--------------------------------------------------------------------------------
+The three stub services were deployed by committing and pushing their
+manifests to the GitHub repository and syncing the existing "onezox-stubs"
+Argo CD Application (see ARGO CD AND GITOPS SETUP). The Application
+reported Synced and Healthy after each sync performed during Phase-00.
+Deployment, and later the Cilium mTLS network policies, were applied
+exclusively through this Application; no CiliumNetworkPolicy or stub
+Deployment/Service manifest was applied directly with kubectl.
+
+--------------------------------------------------------------------------------
+GITHUB REPOSITORY INTEGRATION
+--------------------------------------------------------------------------------
+The existing GitHub repository https://github.com/onezox/OneZox was used
+as the git remote ("origin") for the entire project, as the GitOps
+source for Argo CD, and as the trigger source for the GitHub Actions CI
+pipeline (see GITHUB ACTIONS CI below). All Phase-00 source files,
+Terraform configuration, Helm values, Kubernetes manifests, and
+documentation were committed to this repository's main branch and
+pushed.
+
+--------------------------------------------------------------------------------
+END-TO-END VERIFICATION
+--------------------------------------------------------------------------------
+The following was verified for each of the three stub services after
+deployment:
+  - GET /healthz returned HTTP 200.
+  - GET /readyz returned HTTP 200.
+  - Exactly one health_probe row existed per service under normal
+    operation (additional rows recorded during earlier failed boot
+    attempts while troubleshooting were also present, confirming the
+    database-write step ran on every boot attempt).
+  - The namespaced Redis key {tenant}:{service}:boot was present with a
+    real timestamp value.
+  - A test object was present in the onezox-artifacts bucket under
+    health-checks/.
+  - A trace named "<service>.boot" (or the language-appropriate
+    equivalent) was present in Tempo, both directly and via Grafana.
+  - The "<service>_boot_total" Prometheus metric was present with value 1,
+    and the corresponding scrape target reported "up".
+  - The service's structured JSON log lines were present in Loki, both
+    directly and via Grafana.
+
+The Argo CD Application "onezox-stubs" reported Synced and Healthy.
+
+--------------------------------------------------------------------------------
+CILIUM MTLS ENFORCEMENT
+--------------------------------------------------------------------------------
+Three CiliumNetworkPolicy resources were created
+(platform/stubs/mtls/ciliumnetworkpolicy.yaml): edge-stub-mtls,
+dataplane-stub-mtls, and provider-stub-mtls. Each policy defines ingress
+only rules for its corresponding stub service:
+  - traffic from the "host" entity (kubelet health probes) is allowed
+    without authentication.
+  - traffic from the Prometheus pod (matched by label
+    app.kubernetes.io/name=prometheus) is allowed without authentication.
+  - traffic from the other two stub services is allowed only with
+    authentication.mode: "required".
+No egress rules were defined in any of the three policies.
+
+These policies were committed and pushed to the GitHub repository and
+applied by syncing the existing "onezox-stubs" Argo CD Application.
+
+The following was verified against the live cluster after the sync:
+  - All three CiliumNetworkPolicy resources show VALID: true.
+  - Existing pod health, kubelet probe results, and Prometheus scrape
+    target health were unchanged before and after the policies were
+    applied (0 restarts on all three stub pods; all scrape targets
+    remained "up").
+  - Requests between each pair of stub services (edge-stub to
+    dataplane-stub, edge-stub to provider-stub, dataplane-stub to
+    provider-stub) succeeded (HTTP 200) after the policies were applied.
+  - A request from a pod matching none of the allowed identities was
+    rejected: the client observed a connection timeout, and Cilium's own
+    monitor showed the exact events "action deny, auth: disabled, match
+    none" followed by "drop (Policy denied)" for that pod's identity.
+  - SPIRE's registered entries include a distinct SPIFFE ID for each of
+    the three stub services' Cilium identities
+    (spiffe://spiffe.cilium/identity/<id>).
+  - Cilium's own authenticated-connections table ("cilium-dbg bpf auth
+    list") showed authenticated entries with AUTH TYPE "spire" for all
+    three pairs of stub services, each with a future expiration
+    timestamp.
+  - A live capture of a first connection attempt between a previously
+    unauthenticated pair showed Cilium's own transition from "action
+    deny, auth: spire" (authentication required, not yet established) to
+    "action allow, auth: spire" (authentication completed) for the same
+    connection.
+
+--------------------------------------------------------------------------------
+GITHUB ACTIONS CI (BUF, BUILD, SBOM & SIGNING AUTOMATION)
+--------------------------------------------------------------------------------
+A single workflow, .github/workflows/ci.yml, was created and committed to
+the existing GitHub repository. It triggers on every "push" and every
+"pull_request", with no branch or path filters, and defines two jobs.
+
+Job "proto":
+  - Installs buf 1.72.0 from the official release binary.
+  - Runs "buf lint" against proto/.
+  - Runs "buf breaking" against the previous commit (on a push event) or
+    the pull request's base commit (on a pull_request event), comparing
+    directly against the live GitHub remote via buf's own git-reference
+    input syntax. The check is skipped only when there is no prior
+    reference to compare against (a brand-new branch with no push
+    history).
+
+Job "build-sign" (matrix over edge-stub, dataplane-stub, and
+provider-stub, with fail-fast disabled so one language's failure does not
+hide the other two's results; depends on the "proto" job succeeding
+first). For each of the three services:
+  - Builds its Docker image with "docker build --provenance=false
+    --sbom=false", which keeps the image a plain single manifest. This
+    was a deliberate choice: BuildKit's default OCI attestation manifests
+    produce the same multi-manifest shape that had earlier broken
+    "kind load docker-image" during local deployment (see PROBLEMS
+    ENCOUNTERED, item 13).
+  - Installs Syft 1.49.0 from the official install script and generates
+    an SPDX-JSON SBOM of the built image, uploaded as a workflow
+    artifact.
+  - Starts a temporary "registry:2" container inside the job as an
+    ephemeral local OCI registry, mirroring the same approach used to
+    prove cosign signing in Step 24 — no image is published anywhere
+    outside the job. Pushes the built image to it and captures its
+    digest.
+  - Installs cosign 3.1.2 from the official release binary and signs the
+    pushed image digest using the existing development key pair, and the
+    existing no-Rekor signing configuration
+    (.tooling/cosign/signing_config_no_tlog.json, already tracked in the
+    repository from Step 24).
+  - Verifies the signature against the already-tracked public key
+    (platform/security/cosign/cosign.pub).
+  - Removes the ephemeral registry container.
+
+The private signing key and its password are not committed to git — this
+matches the existing, already-established Phase-00 policy that
+.tooling/cosign/cosign.key and cosign.password stay local-only and
+gitignored. To make signing possible in CI without violating that policy,
+they were instead stored as encrypted GitHub Actions repository secrets
+(COSIGN_KEY and COSIGN_PASSWORD) on the existing onezox/OneZox
+repository, sourced from the same local key-pair files, and referenced in
+the workflow only as "${{ secrets.COSIGN_KEY }}" /
+"${{ secrets.COSIGN_PASSWORD }}".
+
+The workflow file was committed and pushed to the main branch of the
+existing GitHub repository, which triggered a real run on GitHub's own
+Actions runners. That run was checked directly via the GitHub CLI and
+API: all four jobs (proto, and the three build-sign matrix jobs for
+edge-stub, dataplane-stub, and provider-stub) completed with conclusion
+"success", and all three SBOM artifacts (sbom-edge-stub, sbom-provider-
+stub, sbom-dataplane-stub) were confirmed present on the run.
+
+--------------------------------------------------------------------------------
+PROBLEMS ENCOUNTERED DURING PHASE-00 AND HOW EACH WAS RESOLVED
+--------------------------------------------------------------------------------
+1. The first Terraform apply of the kind cluster hung indefinitely because
+   wait_for_ready was set to true while the default CNI was disabled, so
+   the control-plane could never report Ready. Resolution: the apply was
+   stopped, the partially created containers were deleted with
+   "kind delete cluster", wait_for_ready was set to false, and the apply
+   was re-run, completing in 24 seconds.
+
+2. The Argo CD Helm chart's bundled Redis image could not be pulled: the
+   chart's default image registry (an AWS ECR Public mirror) was
+   unreachable from this network, confirmed by testing both the mirror
+   domain and AWS's canonical ECR Public domain. Resolution: the Redis
+   image was overridden to the equivalent Docker Hub image via
+   "helm upgrade --set redis.image.repository=redis
+   --set redis.image.tag=8.2.3-alpine".
+
+3. buf lint failed with a PACKAGE_DIRECTORY_MATCH violation because the
+   initial proto package names included an "onezox." prefix that did not
+   match the existing directory layout. Resolution: the prefix was
+   removed from all five package declarations.
+
+4. "cargo check" reported an error on the intentionally empty Cargo
+   workspace (a workspace with zero members has nothing to check).
+   Resolution: "cargo metadata" was used instead to verify the workspace
+   file is valid, which is the correct verification method for an empty
+   workspace.
+
+5. The CockroachDB Operator crash-looped with "too many open files". The
+   first cause identified was that kind's node containers inherited
+   Docker's default 1024 soft file-descriptor limit. Resolution: Docker's
+   default-ulimits were raised in /etc/docker/daemon.json, which required
+   restarting Docker and recreating the onezox-dev cluster (ulimits are
+   fixed at container-creation time), after which Cilium and Argo CD were
+   reinstalled.
+
+6. After the file-descriptor fix, the same CockroachDB Operator crash-loop
+   persisted. The actual cause was identified as
+   fs.inotify.max_user_instances, a Linux kernel limit (128) shared across
+   the entire host, not per container; the sum of inotify instances in use
+   across the host and all three nodes was 123 of 128. Resolution: the
+   limit was raised via a sysctl configuration file
+   (/etc/sysctl.d/99-onezox-inotify.conf), applied live with no restart
+   required, and the crash-looping pod was deleted to force a clean retry.
+
+7. No actively maintained, freely usable official Helm chart for Redis
+   Cluster was available: the long-standing default chart's images had
+   been moved behind a paid catalog, and the remaining free community
+   chart had not been updated in over two years. Resolution: Redis
+   Cluster was deployed using hand-written Kubernetes manifests (a
+   ConfigMap, headless Service, StatefulSet, and a Job to run
+   "redis-cli --cluster create") against the official redis image
+   directly.
+
+8. MinIO's server-side encryption was configured (a KMS key was set) but
+   was not yet the default for new objects, so a freshly written object
+   showed no encryption metadata. Resolution: "mc encrypt set sse-s3" was
+   run against each bucket and added to the bucket-initialization Job so
+   the fix is reproducible, and a fresh object was confirmed to show
+   "Encryption: SSE-S3".
+
+9. Loki's chart defaults to auth_enabled: true, which would have required
+   an X-Scope-OrgID header on every request, silently breaking the OTel
+   Collector's log exporter and Grafana's Loki data source. Resolution:
+   auth_enabled was set to false before this caused a failure.
+
+10. After Tempo was installed, the OpenTelemetry Collector's Tempo
+    exporter continued to fail with a gRPC "no children to pick from"
+    error even though Tempo was healthy and DNS resolution was confirmed
+    working. The cause was a stale, cached negative resolver state in the
+    Collector's gRPC client from the period before Tempo existed.
+    Resolution: the Collector pod was deleted and allowed to restart,
+    establishing a fresh connection.
+
+11. cosign's default signing behavior attempted to upload to the public
+    Rekor transparency log, which failed with a TLS certificate error; the
+    certificate returned for rekor.sigstore.dev identified itself as
+    belonging to an unrelated domain, indicating a TLS-intercepting proxy
+    on the network. Resolution: a signing configuration file with the
+    Rekor transparency-log URL removed was generated and used, and the
+    test image was signed without a transparency-log entry.
+
+12. Copying files into a kind node's /tmp directory via "docker cp"
+    completed without error but the file did not appear, because /tmp
+    inside the node is mounted as tmpfs with the noexec option, which the
+    container runtime silently refused to copy into. Resolution: the
+    target path was changed to /root/ inside the node, which succeeded.
+
+13. "kind load docker-image" failed for the locally built stub-service
+    images with an error importing a multi-platform manifest, because the
+    images were built with Docker Buildx's default attestation manifests
+    attached, which kind's importer could not resolve. Resolution: each
+    image was saved with "docker save", copied into each node with
+    "docker cp", and imported directly with
+    "ctr --namespace=k8s.io images import", bypassing kind's own loader.
+
+14. All three stub services crash-looped on first deployment with Redis
+    "MOVED" errors, because each service used a plain, non-cluster-aware
+    Redis client against the Redis Cluster, and plain clients do not
+    follow cluster redirect responses. Resolution: each service was
+    changed to use a cluster-aware client
+    (redis::cluster::ClusterClient in Rust,
+    redis.asyncio.cluster.RedisCluster in Python, and
+    redis.NewClusterClient in Go).
+
+15. edge-stub's exported trace did not contain its intended
+    "edge_stub.boot" span; instead, unrelated internal spans from the
+    gRPC/HTTP2 transport library used by the OTLP exporter appeared in
+    Tempo. The cause was holding a synchronous tracing span guard across
+    multiple ".await" points, which is documented to break span-context
+    propagation for asynchronous code. Resolution: the boot sequence was
+    rewritten as its own async function and wrapped with ".instrument()"
+    instead of a manual "enter()" guard, and a log-level filter was added
+    to reduce unrelated transport-library tracing output. After the fix,
+    the correctly named "edge_stub.boot" span was confirmed present in
+    Tempo.
+
+16. provider-stub failed at startup with an OpenTelemetry error reporting
+    conflicting resource schema URLs, caused by merging the SDK's default
+    resource with a resource built against a specific, differently
+    versioned semantic-conventions package. Resolution: the merge was
+    removed and the resource was built directly from the pinned semantic
+    conventions package only.
+
+17. Prometheus was not scraping the three stub services' own /metrics
+    endpoints; only the OpenTelemetry Collector was configured as a
+    scrape target. Resolution: a second scrape job listing all three stub
+    services was added to Prometheus's configuration.
+
+18. No agent was shipping the stub services' container standard-output
+    logs into Loki; Loki's ingestion had previously only been proven via
+    its OTLP endpoint, not via container log collection. Resolution: a
+    Promtail DaemonSet was installed and configured to push to Loki, and
+    each stub service's structured JSON logs were confirmed present in
+    Loki afterward.
+
+19. When testing traffic between stub pods directly, "kubectl debug"
+    initially failed because the pod's own name was passed as the
+    "--target" value instead of the container's name inside the pod.
+    Resolution: the correct container name was used, after which the
+    ephemeral debug container correctly shared the pod's network identity.
+
+20. An initial attempt to observe a denied connection using
+    "cilium-dbg monitor -t policy-verdict" filtered to a single endpoint
+    ID produced no output for the denied traffic. Resolution: the monitor
+    was re-run with both "-t drop" and "-t policy-verdict" and without an
+    endpoint filter, which correctly surfaced the "action deny" and
+    "drop (Policy denied)" events for the rejected connection.
+
+--------------------------------------------------------------------------------
+FINAL VERIFICATION RESULTS FOR EVERY COMPONENT
+--------------------------------------------------------------------------------
+onezox-dev cluster        — 3 nodes, all Ready. Terraform plan shows no
+                             drift against the live cluster.
+Cilium                     — cilium status reports Cilium: OK,
+                             Operator: OK, Envoy DaemonSet: OK.
+SPIRE                       — server and all node agents Running.
+Argo CD                     — all components Running; CLI login and
+                             "app list" succeeded; "onezox-stubs"
+                             Application Synced and Healthy.
+buf / proto                 — buf lint passes with no errors.
+Nx workspace                 — initializes cleanly; zero projects, as
+                             expected for Phase-00.
+Cargo workspace               — valid; contains the edge-stub member.
+Python virtual environment     — ruff, mypy, and pytest all run
+                             successfully against the workspace
+                             configuration.
+Go workspace                    — valid; contains the provider-stub
+                             module.
+CockroachDB                      — all 3 nodes reported is_available=true,
+                             is_live=true; SQL queries executed
+                             successfully.
+Database migrations               — schema_migrations, tenants, and
+                             health_probe all present; migrations are
+                             idempotent (proven by a second run).
+Redis Cluster                      — cluster_state:ok; all 16384 slots
+                             assigned across 3 masters with 3 replicas.
+MinIO                              — all 5 buckets present; versioning and
+                             default encryption confirmed on the 3
+                             roadmap-named buckets; console reachable.
+OpenTelemetry Collector             — a real trace and metric were
+                             received and processed.
+Prometheus                          — all scrape targets "up"; PromQL
+                             queries return real data.
+Grafana                              — all 3 data sources healthy;
+                             proxied queries to each succeeded.
+Loki                                  — real log lines confirmed present,
+                             both via direct query and via Grafana.
+Tempo                                  — real traces confirmed present by
+                             trace ID, both via direct query and via
+                             Grafana.
+cosign                                  — signing and verification
+                             succeeded against the correct key;
+                             verification correctly failed against an
+                             incorrect key.
+Syft                                     — SBOM generated with 15
+                             correctly identified packages and real
+                             version numbers.
+edge-stub, dataplane-stub,
+provider-stub                             — all 3 report HTTP 200 on
+                             /healthz and /readyz; each has written a
+                             health_probe row, a Redis key, and a MinIO
+                             object; each has an OTel trace, a Prometheus
+                             metric, and structured logs in Loki.
+Cilium mTLS enforcement                    — allowed traffic between all
+                             three stub services succeeds; unauthorized
+                             traffic is rejected; SPIFFE identities are
+                             registered for all three services; Cilium's
+                             own authenticated-connections table lists
+                             all three pairs with AUTH TYPE spire.
+GitHub Actions CI                           — a real run on GitHub's own
+                             Actions runners completed with all 4 jobs
+                             (proto, and build-sign for edge-stub,
+                             dataplane-stub, and provider-stub) reporting
+                             conclusion "success"; all 3 SBOM artifacts
+                             confirmed present on the run.
+
+--------------------------------------------------------------------------------
+FINAL PHASE-00 COMPLETION SUMMARY
+--------------------------------------------------------------------------------
+Phase-00 is complete. The onezox-dev Kubernetes cluster is running with
+Cilium (eBPF CNI) and SPIRE-based mutual authentication, GitOps delivery
+via Argo CD against the existing GitHub repository, the CockroachDB,
+Redis, and MinIO data stores, a full observability stack (OpenTelemetry
+Collector, Prometheus, Grafana, Loki, Tempo, and Promtail), and
+supply-chain tooling (cosign and Syft). CockroachDB's schema-bootstrap
+tables have been created. All three required stub services (edge-stub in
+Rust, dataplane-stub in Python, provider-stub in Go) have been built,
+containerized, deployed through GitOps, and verified end to end against
+every data store and observability backend. Cilium mTLS enforcement
+between the three stub services has been applied through GitOps and
+verified: authenticated traffic succeeds, unauthenticated traffic is
+rejected, SPIFFE identities are in use, and Cilium reports authentication
+success. A GitHub Actions CI pipeline has been added to the existing
+repository, gating every push and pull request on buf lint and buf
+breaking-change checks before building all three stub service images,
+generating an SPDX SBOM for each with Syft, and signing and verifying
+each with the existing cosign development key pair; a real run of this
+pipeline on GitHub's own Actions runners completed successfully end to
+end.
+================================================================================
+END OF PHASE-00-COMPLETE.TXT
+================================================================================
