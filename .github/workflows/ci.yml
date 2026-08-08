@@ -56,12 +56,183 @@ jobs:
         run: |
           buf breaking --against "https://github.com/${{ github.repository }}.git#ref=${{ steps.base.outputs.ref }},subdir=proto"
 
-  # Gate 2: build every stub service image, generate its SBOM, and sign it.
+  # Gate 2: the test suites. Added by post-M2 audit fix C4 — until then CI
+  # ran ZERO tests: its only two jobs were the proto gate and build-sign, so
+  # every test in the repo ran by hand or not at all, and a regression in the
+  # RBAC allow-list, the rollout state machine or the audit fail-loud path
+  # would have gone straight through a green pipeline.
+  #
+  # One job per language rather than a matrix: setup differs substantially
+  # (Go toolchain vs. Rust + protoc vs. Python venv vs. npm), and separate
+  # jobs mean one language's failure doesn't hide another's — the same
+  # reasoning build-sign's own fail-fast:false already applies.
+  #
+  # EVERY job below asserts a MINIMUM TEST COUNT and fails if it is not met.
+  # That guard is the point, not decoration: the failure this project keeps
+  # hitting is not a test that breaks loudly, it is a step that silently
+  # matches zero test files (a wrong working directory, a moved path, a bad
+  # filter) and exits 0. `go test ./...` on a package with no tests exits 0.
+  # `pytest` collecting nothing exits 5 but is easy to swallow. A green tick
+  # that proves nothing is worse than a red one. Floors are set below current
+  # counts so ordinary churn does not trip them, but far enough above zero
+  # that a collapse cannot pass.
+  test-go:
+    name: Tests — Go (provider-gateway, control-plane, admin-api, provider-fake)
+    needs: proto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          # Sourced from go.work so the toolchain can never drift from what
+          # the workspace itself declares.
+          go-version-file: go.work
+
+      - name: go vet
+        run: |
+          for m in provider-gateway control-plane admin-api provider-fake; do
+            echo "::group::go vet $m"
+            (cd "services/$m" && go vet ./...)
+            echo "::endgroup::"
+          done
+
+      - name: go test
+        run: |
+          set -euo pipefail
+          total=0
+          # provider-fake is deliberately absent from the floor check: it is a
+          # test-only HTTP stand-in with no test files of its own. It is still
+          # vetted and compiled above, so a break in it still fails this job.
+          declare -A FLOOR=( [provider-gateway]=50 [control-plane]=40 [admin-api]=44 )
+          for m in provider-gateway control-plane admin-api provider-fake; do
+            echo "::group::go test $m"
+            (cd "services/$m" && go test ./... -v 2>&1 | tee "/tmp/$m.log") || exit 1
+            n=$(grep -c '^--- PASS' "/tmp/$m.log" || true)
+            echo "$m: $n tests passed"
+            echo "::endgroup::"
+            floor=${FLOOR[$m]:-0}
+            if [ "$n" -lt "$floor" ]; then
+              echo "::error::$m ran $n tests, expected at least $floor — a suite that silently matches zero tests must fail, not pass"
+              exit 1
+            fi
+            total=$((total + n))
+          done
+          echo "Go tests passed: $total"
+
+  test-rust:
+    name: Tests — Rust (edge-gateway)
+    needs: proto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # edge-gateway's build.rs compiles proto/ via prost, exactly as its own
+      # Dockerfile does — without protoc the build fails before any test runs.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: cargo test
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path services/edge-gateway/Cargo.toml 2>&1 | tee /tmp/rust.log
+          n=$(grep -oE '^test result: ok\. [0-9]+ passed' /tmp/rust.log | awk '{s+=$4} END {print s+0}')
+          echo "Rust tests passed: $n"
+          if [ "$n" -lt 55 ]; then
+            echo "::error::edge-gateway ran $n tests, expected at least 55"
+            exit 1
+          fi
+
+  test-python:
+    name: Tests — Python (data-plane)
+    needs: proto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          # Matches [tool.ruff] target-version / [tool.mypy] python_version
+          # in the workspace pyproject.toml.
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r services/data-plane/requirements.txt
+          # pytest and ruff live in the workspace pyproject's dev dependency
+          # group, not in the service's runtime requirements.txt — pinned
+          # here to the same versions that file declares.
+          pip install "pytest==9.1.1" "ruff==0.16.0"
+
+      - name: ruff
+        working-directory: services/data-plane
+        run: ruff check . --exclude generated
+
+      - name: pytest
+        working-directory: services/data-plane
+        run: |
+          set -euo pipefail
+          pytest . -q 2>&1 | tee /tmp/py.log
+          n=$(grep -oE '[0-9]+ passed' /tmp/py.log | head -1 | awk '{print $1}')
+          n=${n:-0}
+          echo "Python tests passed: $n"
+          if [ "$n" -lt 55 ]; then
+            echo "::error::data-plane ran $n tests, expected at least 55"
+            exit 1
+          fi
+
+  test-typescript:
+    name: Typecheck — TypeScript (admin-panel)
+    needs: proto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          # Matches admin-panel's own Dockerfile base image.
+          node-version: "24"
+
+      - name: Install dependencies
+        working-directory: admin-panel
+        run: npm ci
+
+      # admin-panel has no unit-test suite yet — this is a TYPECHECK, and is
+      # labelled as one rather than dressed up as tests. It still catches the
+      # class of break that matters most here: a resolver or Server Action
+      # whose types stop matching the GraphQL/proto contract. The guard below
+      # is correspondingly different in kind: it asserts tsc actually had
+      # source files to check, so a wrong working directory cannot pass as a
+      # clean typecheck.
+      - name: tsc --noEmit
+        working-directory: admin-panel
+        run: |
+          set -euo pipefail
+          n=$(find app components lib -name '*.ts' -o -name '*.tsx' | wc -l)
+          echo "TypeScript source files: $n"
+          if [ "$n" -lt 20 ]; then
+            echo "::error::found only $n TS sources, expected at least 20 — typecheck would be vacuous"
+            exit 1
+          fi
+          npx tsc --noEmit
+
+  # Gate 3: build every stub service image, generate its SBOM, and sign it.
   # Each service builds and is verified independently (fail-fast disabled)
   # so one language's failure doesn't hide the other two's results.
+  #
+  # Gated behind every test job (audit fix C4): nothing is built, SBOM'd or
+  # signed until the suites that back M2's exit criteria have passed.
   build-sign:
     name: Build, SBOM & sign — ${{ matrix.service }}
-    needs: proto
+    needs: [proto, test-go, test-rust, test-python, test-typescript]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
