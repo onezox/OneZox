@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -16,8 +17,12 @@ import (
 // automatic path, never a second one.
 type RolloutDriver interface {
 	ListRunningRollouts(ctx context.Context) ([]rollout.Rollout, error)
-	AutoAdvance(ctx context.Context, rolloutID string) (string, error)
-	AutoRollback(ctx context.Context, rolloutID string) error
+	// fromStage is the CONCURRENCY PRECONDITION: the stage this
+	// reconciler observed the AnalysisRun for. The rollout only moves if
+	// it is still at that stage, so a verdict about canary_10 can never
+	// advance a rollout another writer has already taken to canary_50.
+	AutoAdvance(ctx context.Context, rolloutID, fromStage string) (string, error)
+	AutoRollback(ctx context.Context, rolloutID, fromStage string) error
 }
 
 // Reconciler is control-plane's in-process, network-UNREACHABLE
@@ -148,7 +153,17 @@ func (r *Reconciler) reconcileOne(ctx context.Context, ro rollout.Rollout) {
 
 	switch run.Phase {
 	case PhaseSuccessful:
-		newStage, err := r.driver.AutoAdvance(ctx, ro.RolloutID)
+		newStage, err := r.driver.AutoAdvance(ctx, ro.RolloutID, ro.Stage)
+		if errors.Is(err, rollout.ErrConcurrentUpdate) {
+			// Someone else advanced this rollout between our list and our
+			// write. Expected under concurrency, NOT an error: the winner
+			// already did exactly what we were about to do, and the next
+			// tick re-reads fresh state. Logged at Info so the race is
+			// observable without looking like a fault.
+			r.log.Info("reconciler: skipped advance, rollout already moved",
+				"rollout_id", ro.RolloutID, "observed_stage", ro.Stage)
+			return
+		}
 		if err != nil {
 			r.log.Error("reconciler: AutoAdvance failed", "rollout_id", ro.RolloutID, "stage", ro.Stage, "error", err)
 			return
@@ -177,7 +192,16 @@ func (r *Reconciler) reconcileOne(ctx context.Context, ro rollout.Rollout) {
 		// can't get data at all: don't promote an unvetted canary to more
 		// live traffic on an uncertain signal, and don't hang forever
 		// either — revert to known-good stable.
-		if err := r.driver.AutoRollback(ctx, ro.RolloutID); err != nil {
+		if err := r.driver.AutoRollback(ctx, ro.RolloutID, ro.Stage); err != nil {
+			if errors.Is(err, rollout.ErrConcurrentUpdate) || errors.Is(err, rollout.ErrNotRunning) {
+				// The rollout moved or was terminalized under us — most
+				// importantly, an operator may have ABORTED it while this
+				// analysis was resolving. Refusing here is the correct
+				// outcome: never resurrect a rollout a human stopped.
+				r.log.Info("reconciler: skipped rollback, rollout already moved or terminalized",
+					"rollout_id", ro.RolloutID, "observed_stage", ro.Stage)
+				return
+			}
 			r.log.Error("reconciler: AutoRollback failed", "rollout_id", ro.RolloutID, "stage", ro.Stage, "error", err)
 			return
 		}

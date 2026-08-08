@@ -49,6 +49,31 @@ var (
 	ErrAlreadyRunning       = errors.New("model_ref already has a running rollout")
 	ErrNoActiveVersion      = errors.New("model_ref has no active version to roll out against")
 	ErrAlreadyFullyPromoted = errors.New("rollout is already fully promoted")
+
+	// ErrConcurrentUpdate means the rollout MOVED between the moment this
+	// call read it and the moment it tried to write — someone else (the
+	// other control-plane replica's reconciler, or a human RPC racing the
+	// automatic path) got there first. The caller's decision was made
+	// against state that no longer holds, so the write was refused and
+	// NOTHING happened.
+	//
+	// Post-M2 CRITICAL fix. Before this existed, UpdateRollout was an
+	// unconditional `UPDATE rollout SET stage=$2, status=$3`, and the
+	// decision-to-write sequence was not atomic with respect to the stage:
+	// advanceStage re-read the rollout itself and advanced from WHATEVER
+	// stage it found, with nothing tying that to the stage the caller had
+	// actually observed an AnalysisRun for. Two reconcilers (control-plane
+	// runs 2 replicas) could therefore turn ONE Successful analysis at
+	// canary_10 into canary_10 -> canary_50 -> canary_100, with the 50%
+	// stage never analysed at all — the staged gate that EC1/EC2 certify,
+	// bypassed. Reachable with a single replica too, via a human
+	// PromoteRollout interleaving with the reconciler.
+	//
+	// This is deliberately NOT a failure the caller should surface as an
+	// error to a user or retry blindly: the correct response is to no-op
+	// and re-observe on the next tick, because the winning writer already
+	// did the right thing. See the reconciler's own handling.
+	ErrConcurrentUpdate = errors.New("rollout changed concurrently; write refused")
 )
 
 // stageOrder is the ENTIRE staged sequence, fixed — matching
@@ -126,7 +151,22 @@ type Store interface {
 	// modelRef empty means every model; limit is always non-zero by the
 	// time it reaches here (Service.ListRollouts applies the default).
 	ListRollouts(ctx context.Context, modelRef string, limit int) ([]Rollout, error)
-	UpdateRollout(ctx context.Context, rolloutID, stage, status string, endedAt *time.Time) error
+	// UpdateRollout is a COMPARE-AND-SWAP, not a blind write: it applies
+	// only if the row is STILL at expectedStage and status='running'.
+	// Returns ErrConcurrentUpdate if it is not, having changed nothing.
+	//
+	// Both halves of the predicate earn their place:
+	//   - expectedStage stops a stale decision from advancing a stage it
+	//     was never made for (the double-advance described on
+	//     ErrConcurrentUpdate).
+	//   - status='running' stops a write from resurrecting a rollout that
+	//     was terminalized (aborted / rolled_back / promoted) after the
+	//     caller read it — the human-abort-vs-reconciler-advance race.
+	//
+	// Every caller reaches this through advanceStage/revertCanary, which
+	// pass the stage THEY read in the same operation, so the window being
+	// closed is exactly read-decide-write.
+	UpdateRollout(ctx context.Context, rolloutID, expectedStage, stage, status string, endedAt *time.Time) error
 }
 
 // CanaryPublisher is the ONLY etcd write this package issues directly —
@@ -207,7 +247,7 @@ func (s *Service) CreateRollout(ctx context.Context, modelRef, versionID, strate
 		return "", fmt.Errorf("inserting rollout: %w", err)
 	}
 
-	if _, err := s.advanceStage(ctx, rolloutID); err != nil {
+	if _, err := s.advanceStage(ctx, rolloutID, ""); err != nil {
 		return "", fmt.Errorf("starting canary: %w", err)
 	}
 
@@ -222,14 +262,14 @@ func (s *Service) CreateRollout(ctx context.Context, modelRef, versionID, strate
 // (Step M) — there is no parameter here or anywhere upstream (admin.proto)
 // that could request a different stage.
 func (s *Service) PromoteRollout(ctx context.Context, rolloutID string) (string, error) {
-	return s.advanceStage(ctx, rolloutID)
+	return s.advanceStage(ctx, rolloutID, "")
 }
 
 // AbortRollout is the human manual-rollback override. Reverts to
 // whatever was stable before this rollout began — never re-derived,
 // always r.StableVersionID (data/migrations/0019).
 func (s *Service) AbortRollout(ctx context.Context, rolloutID string) error {
-	return s.revertCanary(ctx, rolloutID, "aborted")
+	return s.revertCanary(ctx, rolloutID, "aborted", "")
 }
 
 // AutoAdvance is the in-process reconciler's own trigger (Step M) —
@@ -240,8 +280,8 @@ func (s *Service) AbortRollout(ctx context.Context, rolloutID string) error {
 // advanced this," not "a human promoted this"), never a second
 // implementation. See the package doc's own "one implementation, two
 // triggers" framing.
-func (s *Service) AutoAdvance(ctx context.Context, rolloutID string) (string, error) {
-	return s.advanceStage(ctx, rolloutID)
+func (s *Service) AutoAdvance(ctx context.Context, rolloutID, fromStage string) (string, error) {
+	return s.advanceStage(ctx, rolloutID, fromStage)
 }
 
 // AutoRollback is the in-process reconciler's own trigger — called when
@@ -251,8 +291,8 @@ func (s *Service) AutoAdvance(ctx context.Context, rolloutID string) (string, er
 // audit_log — though this path itself is NEVER audited, see the
 // reconciler's own doc comment) can tell "the system caught a regression
 // and reverted" apart from "a human cancelled this."
-func (s *Service) AutoRollback(ctx context.Context, rolloutID string) error {
-	return s.revertCanary(ctx, rolloutID, "rolled_back")
+func (s *Service) AutoRollback(ctx context.Context, rolloutID, fromStage string) error {
+	return s.revertCanary(ctx, rolloutID, "rolled_back", fromStage)
 }
 
 // ListRunningRollouts backs the reconciler's own reconcile-everything
@@ -319,13 +359,42 @@ func (s *Service) ListRollouts(ctx context.Context, modelRef string, limit int) 
 // next staged step" — see the package doc for why both the human
 // (PromoteRollout) and automatic (Step M reconciler) triggers share it
 // rather than each having their own.
-func (s *Service) advanceStage(ctx context.Context, rolloutID string) (string, error) {
+// advanceStage moves a rollout exactly one staged step.
+//
+// requireStage is the CONCURRENCY PRECONDITION, and the whole point of
+// the post-M2 CAS fix. It means "only advance if the rollout is still at
+// this stage." The automatic path passes the stage it observed an
+// AnalysisRun for, so a verdict about canary_10 can only ever advance
+// FROM canary_10 — never from whatever stage another writer has since
+// moved the rollout to.
+//
+// An EMPTY requireStage means "no expectation about which stage we start
+// from," used by the two callers that genuinely have none:
+//   - CreateRollout, which just inserted the row at stage="pending" and
+//     is starting the canary in the same call
+//   - PromoteRollout, the human override
+//
+// PromoteRollout deliberately does NOT take a stage from its caller.
+// admin.proto's PromoteRolloutRequest has no stage field and must not
+// grow one: a client-supplied target stage would make "skip straight to
+// 100%" representable, which is exactly the invariant EC4's
+// API-parameter proof rests on. It is still protected — the CAS below
+// always pins on r.Stage, the stage THIS call read moments earlier, so a
+// human promote racing the reconciler still cannot double-advance. The
+// precondition is server-derived in both paths; only its source differs.
+func (s *Service) advanceStage(ctx context.Context, rolloutID, requireStage string) (string, error) {
 	r, err := s.store.GetRollout(ctx, rolloutID)
 	if err != nil {
 		return "", err
 	}
 	if r == nil {
 		return "", ErrNotFound
+	}
+	if requireStage != "" && r.Stage != requireStage {
+		// The caller's decision was made about a stage this rollout has
+		// already left. Refuse before touching etcd — publishing a canary
+		// percent derived from stale state is worse than doing nothing.
+		return "", ErrConcurrentUpdate
 	}
 	if r.Status != "running" {
 		// This is the error a caller actually observes for "already fully
@@ -357,7 +426,7 @@ func (s *Service) advanceStage(ctx context.Context, rolloutID string) (string, e
 			return "", fmt.Errorf("activating promoted version: %w", err)
 		}
 		endedAt := time.Now().UTC()
-		if err := s.store.UpdateRollout(ctx, rolloutID, next, "promoted", &endedAt); err != nil {
+		if err := s.store.UpdateRollout(ctx, rolloutID, r.Stage, next, "promoted", &endedAt); err != nil {
 			return "", fmt.Errorf("recording promotion: %w", err)
 		}
 		s.log.Info("rollout promoted to stable", "rollout_id", rolloutID,
@@ -370,7 +439,7 @@ func (s *Service) advanceStage(ctx context.Context, rolloutID string) (string, e
 	if err := s.publisher.PublishCanaryState(ctx, r.ModelRef, r.StableVersionID, r.VersionID, stagePercent[next]); err != nil {
 		return "", fmt.Errorf("publishing canary state: %w", err)
 	}
-	if err := s.store.UpdateRollout(ctx, rolloutID, next, "running", nil); err != nil {
+	if err := s.store.UpdateRollout(ctx, rolloutID, r.Stage, next, "running", nil); err != nil {
 		return "", fmt.Errorf("recording stage advance: %w", err)
 	}
 	s.log.Info("rollout advanced", "rollout_id", rolloutID, "model_ref", r.ModelRef,
@@ -384,13 +453,18 @@ func (s *Service) advanceStage(ctx context.Context, rolloutID string) (string, e
 // (Step M/P, on a failed AnalysisRun, resultStatus="rolled_back") both
 // call this; only the recorded outcome differs, the etcd write is
 // identical either way.
-func (s *Service) revertCanary(ctx context.Context, rolloutID, resultStatus string) error {
+func (s *Service) revertCanary(ctx context.Context, rolloutID, resultStatus, requireStage string) error {
 	r, err := s.store.GetRollout(ctx, rolloutID)
 	if err != nil {
 		return err
 	}
 	if r == nil {
 		return ErrNotFound
+	}
+	if requireStage != "" && r.Stage != requireStage {
+		// Same precondition as advanceStage: a rollback decided from one
+		// stage's analysis must not act on a rollout that has since moved.
+		return ErrConcurrentUpdate
 	}
 	if r.Status != "running" {
 		return ErrNotRunning
@@ -400,7 +474,7 @@ func (s *Service) revertCanary(ctx context.Context, rolloutID, resultStatus stri
 		return fmt.Errorf("reverting canary state: %w", err)
 	}
 	endedAt := time.Now().UTC()
-	if err := s.store.UpdateRollout(ctx, rolloutID, r.Stage, resultStatus, &endedAt); err != nil {
+	if err := s.store.UpdateRollout(ctx, rolloutID, r.Stage, r.Stage, resultStatus, &endedAt); err != nil {
 		return fmt.Errorf("recording revert: %w", err)
 	}
 	s.log.Info("rollout reverted", "rollout_id", rolloutID, "model_ref", r.ModelRef, "result_status", resultStatus)

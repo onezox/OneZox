@@ -108,12 +108,21 @@ func (f *FakeStore) GetMostRecentRolloutByModelRef(ctx context.Context, modelRef
 	return &cp, nil
 }
 
-func (f *FakeStore) UpdateRollout(ctx context.Context, rolloutID, stage, status string, endedAt *time.Time) error {
+// UpdateRollout enforces the SAME compare-and-swap predicate the real
+// CockroachStore's WHERE clause does. This matters more than it looks:
+// a fake that accepted every write would let the concurrency tests pass
+// against a store that cannot actually arbitrate, which is precisely the
+// bug being fixed. The mutex makes each call atomic, standing in for the
+// single-statement atomicity of the real UPDATE.
+func (f *FakeStore) UpdateRollout(ctx context.Context, rolloutID, expectedStage, stage, status string, endedAt *time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, ok := f.rollouts[rolloutID]
 	if !ok {
 		return nil
+	}
+	if r.Stage != expectedStage || r.Status != "running" {
+		return ErrConcurrentUpdate
 	}
 	r.Stage = stage
 	r.Status = status

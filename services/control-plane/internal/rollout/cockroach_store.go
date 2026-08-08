@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -107,11 +108,45 @@ func (c *CockroachStore) GetMostRecentRolloutByModelRef(ctx context.Context, mod
 // the rollout (revertCanary, which the reconciler never reconciles again
 // since ListRunningRollouts only returns status='running'), so there is
 // no call site where refreshing it unconditionally is wrong.
-func (c *CockroachStore) UpdateRollout(ctx context.Context, rolloutID, stage, status string, endedAt *time.Time) error {
-	_, err := c.db.ExecContext(ctx, `
-		UPDATE rollout SET stage = $2, status = $3, ended_at = $4, stage_entered_at = now() WHERE rollout_id = $1
-	`, rolloutID, stage, status, endedAt)
-	return err
+//
+// Post-M2 CRITICAL fix — this is now a COMPARE-AND-SWAP. The WHERE
+// clause carries the caller's read-time expectation, so the database
+// itself arbitrates concurrent writers instead of last-write-wins:
+//
+//	AND stage = $2       the rollout has not moved since the caller read it
+//	AND status = 'running'  it has not been terminalized since either
+//
+// A losing writer changes ZERO rows and gets ErrConcurrentUpdate. This
+// is a single atomic statement, not a read-then-write in a transaction:
+// there is no window between the check and the update for anything to
+// interleave into, and it needs no retry loop or isolation-level
+// reasoning to be correct.
+//
+// status='running' is what makes the human-abort race safe. If an
+// operator aborts a canary while a reconciler is mid-advance, the abort
+// sets status='aborted' and the reconciler's UPDATE then matches no row
+// — it cannot resurrect a rollout an operator deliberately stopped.
+// revertCanary passes r.Stage as its own expectation, so terminalizing
+// writes are equally guarded.
+func (c *CockroachStore) UpdateRollout(ctx context.Context, rolloutID, expectedStage, stage, status string, endedAt *time.Time) error {
+	res, err := c.db.ExecContext(ctx, `
+		UPDATE rollout SET stage = $3, status = $4, ended_at = $5, stage_entered_at = now()
+		WHERE rollout_id = $1 AND stage = $2 AND status = 'running'
+	`, rolloutID, expectedStage, stage, status, endedAt)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("reading rows affected for rollout %s: %w", rolloutID, err)
+	}
+	if n == 0 {
+		// Zero rows means the predicate did not hold — another writer got
+		// here first. Not a database error, and deliberately not silent:
+		// the caller must be able to tell "I did nothing" from "I did it."
+		return ErrConcurrentUpdate
+	}
+	return nil
 }
 
 // scanRow is satisfied by both *sql.Row and *sql.Rows — lets this one

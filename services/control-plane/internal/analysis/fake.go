@@ -102,16 +102,16 @@ func (f *FakeDriver) ListRunningRollouts(ctx context.Context) ([]rollout.Rollout
 	return f.svc.ListRunningRollouts(ctx)
 }
 
-func (f *FakeDriver) AutoAdvance(ctx context.Context, rolloutID string) (string, error) {
+func (f *FakeDriver) AutoAdvance(ctx context.Context, rolloutID, fromStage string) (string, error) {
 	f.mu.Lock()
 	f.AutoAdvanceCalls = append(f.AutoAdvanceCalls, rolloutID)
 	f.mu.Unlock()
-	return f.svc.AutoAdvance(ctx, rolloutID)
+	return f.svc.AutoAdvance(ctx, rolloutID, fromStage)
 }
 
-func (f *FakeDriver) AutoRollback(ctx context.Context, rolloutID string) error {
+func (f *FakeDriver) AutoRollback(ctx context.Context, rolloutID, fromStage string) error {
 	f.mu.Lock()
 	f.AutoRollbackCalls = append(f.AutoRollbackCalls, rolloutID)
 	f.mu.Unlock()
-	return f.svc.AutoRollback(ctx, rolloutID)
+	return f.svc.AutoRollback(ctx, rolloutID, fromStage)
 }
