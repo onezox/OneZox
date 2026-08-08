@@ -1,0 +1,10 @@
+# Never ship the host's install or build output into the image — the
+# builder stage runs its own npm ci and next build. Copying a
+# host-populated node_modules would also risk platform-specific
+# binaries (@grpc/grpc-js ships native bindings) baked for the wrong
+# architecture.
+node_modules
+.next
+npm-debug.log*
+.env
+.env.*

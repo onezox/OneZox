@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package admin.v1;
+
+option go_package = "github.com/onezox/OneZox/services/admin-api/internal/pb/admin/v1;adminv1";
+
+// Phase-05's admin-api contract (Architecture Part R). This is the panel's
+// COMMAND surface only — every RPC here is a mutation with a real side
+// effect and a corresponding audit_log row. Reads (dashboard, model list,
+// rollout status, audit history, key list) are GraphQL instead (see
+// proto/admin/v1/admin.graphql) — the deliberate split: GraphQL's flexible
+// field-selection suits Next.js RSC's varying per-page read shapes, while
+// every mutation here is a single fixed command better served by a typed
+// RPC with no shape ambiguity, matching every other command-style RPC in
+// this project (e.g. dataplane.v1.Submit).
+//
+// Every RPC requires an authenticated admin_user, carried as gRPC metadata
+// ("authorization: bearer <admin-token>"), not a message field — the same
+// separation Vault's own Kubernetes-auth login uses (identity is a
+// transport-level concern, never something a request message carries and
+// a caller could spoof). RBAC (viewer vs admin, Step G) is enforced
+// per-RPC server-side before any handler body runs.
+//
+// EC4 is enforced by this file's own shape, not just by server-side
+// checks: there is no RPC here that sets model_active directly, no
+// "instant activate" verb, and no field on StartRollout/PromoteRollout
+// that accepts a target stage or percentage. PromoteRollout advances
+// EXACTLY one staged step (skipping only the current pause), the same
+// single-step rule the automatic timer-driven advance uses internally —
+// it cannot jump ahead. If a bypass verb isn't in this file, no caller,
+// however privileged, can invoke one.
+//
+// createModelDraft (Phase-05.txt's own APIS CREATED wording) is
+// deliberately NOT an RPC here: it never mutates anything (it reads the
+// currently active manifest as the Model Studio editor's starting point),
+// so it is the GraphQL query `modelDraft` instead — Phase-05.txt's own
+// "createModelDraft/publishModelVersion -> control-plane
+// RegisterModelManifest" line groups the two adjacent UX steps together,
+// but only publish should ever produce a new signed version; a draft that
+// silently persisted a manifest would defeat the whole point of staging
+// an edit before committing it.
+service AdminService {
+  // -> control.v1.ControlService/RegisterModelManifest (unchanged, P04).
+  // created_by is never a request field — derived server-side from the
+  // authenticated caller (Step F), so a client can never attribute a
+  // publish to someone else.
+  rpc PublishModelVersion(PublishModelVersionRequest) returns (PublishModelVersionResponse);
+
+  // -> control.v1.ControlService/CreateRollout (new this phase). Always
+  // begins at the first staged step; there is no field to start
+  // elsewhere or at a given percentage.
+  rpc StartRollout(StartRolloutRequest) returns (StartRolloutResponse);
+
+  // -> control.v1.ControlService/PromoteRollout. Manual "don't wait out
+  // the pause" control (Architecture Part R: "live promote/rollback
+  // controls") — advances exactly one step, identical in effect to the
+  // automatic timer-driven advance, just human-triggered.
+  rpc PromoteRollout(PromoteRolloutRequest) returns (PromoteRolloutResponse);
+
+  // -> control.v1.ControlService/AbortRollout. Manual rollback — zeroes
+  // canary traffic, identical in effect to an automatic AnalysisRun-
+  // triggered rollback, just human-triggered.
+  rpc AbortRollout(AbortRolloutRequest) returns (AbortRolloutResponse);
+
+  // Local to admin-api's own api_keys grant (P01's table, reused) — does
+  // not reach control-plane at all. raw_key is returned exactly once and
+  // never persisted (mirrors data/seed/seed-test-tenant.sh's own
+  // discipline); only its hash is stored.
+  rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse);
+  rpc RevokeApiKey(RevokeApiKeyRequest) returns (RevokeApiKeyResponse);
+}
+
+message PublishModelVersionRequest {
+  string model_ref = 1;
+  string spec_json = 2;
+}
+
+message PublishModelVersionResponse {
+  string version_id = 1;
+}
+
+// strategy_json describes the INTENDED step plan (e.g. staged percentages
+// and pause durations) that control-plane uses to configure the
+// underlying Argo Rollouts Rollout resource (Step M) — it configures how
+// staging will proceed, it is not itself a live traffic-percent command.
+message StartRolloutRequest {
+  string model_ref = 1;
+  string version_id = 2;
+  string strategy_json = 3;
+}
+
+message StartRolloutResponse {
+  string rollout_id = 1;
+}
+
+message PromoteRolloutRequest {
+  string rollout_id = 1;
+}
+
+message PromoteRolloutResponse {
+  string new_stage = 1;
+}
+
+message AbortRolloutRequest {
+  string rollout_id = 1;
+}
+
+message AbortRolloutResponse {}
+
+message CreateApiKeyRequest {
+  string org_id = 1;
+  repeated string scopes = 2;
+}
+
+message CreateApiKeyResponse {
+  string key_id = 1;
+  string raw_key = 2;
+}
+
+message RevokeApiKeyRequest {
+  string key_id = 1;
+}
+
+message RevokeApiKeyResponse {}

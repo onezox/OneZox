@@ -1,0 +1,60 @@
+.shell {
+  display: grid;
+  grid-template-columns: 232px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  min-width: 0;
+}
+
+.content {
+  padding: var(--sp-5) var(--sp-6) var(--sp-7);
+  min-width: 0;
+  max-width: 1200px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-5);
+}
+
+.user {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.signout {
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.signout:hover {
+  background: var(--surface-2);
+}
+
+/* Single column on narrow viewports — an operator on a laptop split
+   screen shouldn't lose the content area to the nav. */
+@media (max-width: 720px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    position: static;
+  }
+  .content {
+    padding: var(--sp-4);
+  }
+}

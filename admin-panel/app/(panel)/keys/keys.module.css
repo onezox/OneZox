@@ -1,0 +1,128 @@
+.form {
+  display: flex;
+  flex-direction: column;
+}
+
+.row {
+  display: flex;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-4);
+}
+
+.field {
+  flex: 1;
+  min-width: 260px;
+  display: flex;
+  flex-direction: column;
+}
+
+.label {
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  margin-bottom: var(--sp-2);
+}
+
+.input {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.primary,
+.danger {
+  font: inherit;
+  font-weight: 600;
+  border-radius: var(--radius);
+  cursor: pointer;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.primary {
+  align-self: flex-start;
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--accent);
+  color: var(--text-inverse);
+}
+
+.danger {
+  padding: var(--sp-1) var(--sp-3);
+  font-size: var(--fs-sm);
+  background: var(--surface);
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.danger:hover:not(:disabled) {
+  background: var(--danger-fill);
+}
+.primary:disabled,
+.danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* The one-time raw-key reveal. Deliberately loud: this is the only
+   moment this value will ever be visible. */
+.reveal {
+  border: 1px solid var(--warn);
+  background: var(--warn-fill);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-4);
+  margin-bottom: var(--sp-4);
+}
+
+.revealTitle {
+  margin: 0 0 var(--sp-3);
+  font-weight: 700;
+  color: var(--warn);
+}
+
+.rawKey {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.revealMeta {
+  margin: var(--sp-3) 0 0;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.error {
+  background: var(--danger-fill);
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-sm);
+}
+
+.inlineError {
+  display: block;
+  color: var(--danger);
+  font-size: var(--fs-xs);
+  margin-top: var(--sp-1);
+}
+
+.note {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  margin: var(--sp-3) 0 0;
+}
