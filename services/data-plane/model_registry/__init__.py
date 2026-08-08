@@ -49,6 +49,38 @@ SIGNING_KEY_NAME = "model-manifest-signing"
 # would need. Step R's own reconnect test exercises this path directly.
 _RECONNECT_BACKOFF_SECONDS = 2.0
 
+# Post-M2 audit fix M1 — self-healing re-verification.
+#
+# THE BUG THIS FIXES. A manifest that fails signature verification is
+# never cached (_handle_manifest_kv returns without storing it), and
+# nothing re-verified it afterwards. sync_once() only ran again when the
+# WATCH failed — but a Vault outage does not break the etcd watch, so
+# with etcd healthy no re-sync was ever triggered. The result: every
+# manifest untrusted, resolve() raising ManifestNotFound for every
+# request, boot logged as "initial sync complete", readiness passing, and
+# the only recovery a manual `kubectl rollout restart`.
+#
+# Not theoretical, and not once: this is the mechanism behind the
+# 2x-recurring boot-retry gap (Phase-04 Step U, Phase-05 Step P). In P05-P
+# data-plane booted during a WSL2-restart DNS/Vault window and served
+# model_not_found until restarted by hand — discovered only because it
+# broke a live proof.
+#
+# THE FIX. A background re-sync task with two cadences. When something is
+# untrusted the service is DEGRADED — it is failing real requests — so it
+# retries quickly, backing off so a genuinely-bad signature (which will
+# never verify) does not hammer Vault forever. When everything verifies
+# it still re-syncs on a slow cadence, which doubles as a safety net for
+# any etcd event the watch might have missed.
+#
+# Fail-closed behaviour is UNCHANGED: an unverified manifest is still
+# never trusted, never served, and never overwrites last-known-good. The
+# only thing that changes is that the service can now recover on its own
+# once the dependency comes back.
+_RESYNC_DEGRADED_SECONDS = 10.0
+_RESYNC_DEGRADED_MAX_SECONDS = 60.0
+_RESYNC_HEALTHY_SECONDS = 300.0
+
 
 class ManifestNotFound(Exception):
     def __init__(self, model_ref: str) -> None:
@@ -184,6 +216,11 @@ class Cache:
         self._manifests: dict[tuple[str, str], Manifest] = {}
         # model_ref -> ActivePointer (stable/canary/canary_percent).
         self._active: dict[str, ActivePointer] = {}
+        # (model_ref, version_id) seen in etcd but NOT currently trusted —
+        # audit fix M1. Non-empty means this cache is DEGRADED: those
+        # model_refs cannot be served, and resync_forever() retries them
+        # on the fast cadence until they verify or disappear.
+        self._untrusted: set[tuple[str, str]] = set()
 
     async def _verify(self, m: Manifest) -> bool:
         """Returns False for BOTH a well-formed "no" from the verifier
@@ -227,30 +264,56 @@ class Cache:
             status=envelope.get("status", ""),
         )
 
+        key = (model_ref, version_id)
         valid = await self._verify(m)
         if not valid:
             # Last-known-good: a failed verification NEVER overwrites or
             # removes whatever this (model_ref, version_id) already held
             # (if anything) — it just refuses to let the bad update in.
+            #
+            # Recording it as untrusted (audit fix M1) is what makes the
+            # refusal RECOVERABLE rather than permanent: resync_forever()
+            # sees a non-empty set and retries on the fast cadence, so a
+            # manifest that failed only because Vault was briefly away
+            # verifies on its own once Vault returns.
+            self._untrusted.add(key)
             self._log.warning(
                 f"model_registry: signature verification FAILED, refusing to trust "
                 f"model_ref={model_ref} version_id={version_id}"
             )
             return
 
-        self._manifests[(model_ref, version_id)] = m
-        self._log.info(
-            f"model_registry: verified and cached model_ref={model_ref} version_id={version_id}"
-        )
+        was_untrusted = key in self._untrusted
+        self._untrusted.discard(key)
+        self._manifests[key] = m
+        if was_untrusted:
+            # Distinct message from the ordinary first-time cache line —
+            # this one means the service just healed itself, which is
+            # exactly the event an operator wants to see without having
+            # to diff two log lines.
+            self._log.info(
+                f"model_registry: RECOVERED — previously untrusted manifest now verifies "
+                f"model_ref={model_ref} version_id={version_id}"
+            )
+        else:
+            self._log.info(
+                f"model_registry: verified and cached model_ref={model_ref} version_id={version_id}"
+            )
 
     def _handle_active_kv(self, model_ref: str, value: bytes) -> None:
         self._active[model_ref] = _parse_active_envelope(value)
 
     async def sync_once(self) -> None:
-        """Full re-list from etcd — the initial load, and also what a
-        reconnect after a watch failure falls back to (simpler and safer
-        than reasoning about resuming from a specific revision)."""
+        """Full re-list from etcd — the initial load, what a reconnect
+        after a watch failure falls back to (simpler and safer than
+        reasoning about resuming from a specific revision), and what
+        resync_forever() calls on its timer (audit fix M1)."""
         result = await self._etcd.get_prefix(ETCD_PREFIX.encode())
+        # Rebuilt from scratch on every full re-list rather than mutated
+        # incrementally: this IS the complete current picture, so a key
+        # that has since been deleted from etcd must not linger as
+        # untrusted and hold the cache in a degraded state forever.
+        self._untrusted.clear()
         for kv in result:
             key = kv.key.decode()
             if key.startswith(MANIFESTS_PREFIX):
@@ -262,6 +325,54 @@ class Cache:
                 model_ref = key[len(ACTIVE_PREFIX):]
                 if model_ref:
                     self._handle_active_kv(model_ref, kv.value)
+
+    def is_degraded(self) -> bool:
+        """True when at least one manifest present in etcd is not
+        currently trusted — i.e. some model_ref cannot be served."""
+        return bool(self._untrusted)
+
+    async def resync_forever(self) -> None:
+        """Background self-healing loop (audit fix M1). main.py spawns
+        this once at startup alongside watch_forever().
+
+        Never raises: a re-sync that itself fails is logged and retried,
+        because the whole point of this task is to survive exactly the
+        dependency outages that make a re-sync fail in the first place.
+        """
+        backoff = _RESYNC_DEGRADED_SECONDS
+        while True:
+            degraded = self.is_degraded()
+            if degraded:
+                delay = backoff
+                # Grow toward the cap so a permanently-bad signature (one
+                # that will never verify no matter how often it is tried)
+                # settles into a slow retry instead of hammering Vault.
+                backoff = min(backoff * 2, _RESYNC_DEGRADED_MAX_SECONDS)
+            else:
+                delay = _RESYNC_HEALTHY_SECONDS
+                backoff = _RESYNC_DEGRADED_SECONDS
+
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+
+            try:
+                before = len(self._untrusted)
+                await self.sync_once()
+                after = len(self._untrusted)
+                if before and not after:
+                    self._log.info(
+                        "model_registry: re-sync healed the cache — all manifests verify again"
+                    )
+                elif after:
+                    self._log.warning(
+                        f"model_registry: re-sync still degraded, {after} manifest(s) untrusted"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log.warning(f"model_registry: periodic re-sync failed error={e}")
 
     async def watch_forever(self) -> None:
         """Long-running background task (main.py spawns this once at

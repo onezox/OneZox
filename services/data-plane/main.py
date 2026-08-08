@@ -178,6 +178,13 @@ vault_http_client: httpx.AsyncClient | None = None
 etcd_client: aetcd.Client | None = None
 registry_cache: model_registry.Cache | None = None
 registry_watch_task: asyncio.Task | None = None
+# Audit fix M1: the self-healing re-verification loop. Separate from the
+# watch task because they recover from DIFFERENT failures — the watch
+# recovers from etcd going away, this one from Vault going away, and a
+# Vault outage leaves the etcd watch perfectly healthy (which is exactly
+# why the sticky-verification bug survived: nothing ever re-triggered a
+# sync).
+registry_resync_task: asyncio.Task | None = None
 
 
 async def _finish_request(
@@ -555,6 +562,7 @@ async def init_model_registry() -> tuple[httpx.AsyncClient, aetcd.Client, model_
 async def lifespan(app: FastAPI):
     global pg_pool, redis_client, provider_channel, provider_stub, grpc_server
     global vault_http_client, etcd_client, registry_cache, registry_watch_task
+    global registry_resync_task
 
     with tracer.start_as_current_span("data_plane.boot"):
         log.info("starting boot sequence")
@@ -601,6 +609,15 @@ async def lifespan(app: FastAPI):
     # the process's life, unlike everything inside data_plane.boot which
     # completes once.
     registry_watch_task = asyncio.create_task(registry_cache.watch_forever())
+    registry_resync_task = asyncio.create_task(registry_cache.resync_forever())
+    if registry_cache.is_degraded():
+        # Boot completed but some manifest did not verify — say so plainly
+        # rather than letting "boot sequence complete" imply everything is
+        # servable. The re-sync loop will keep retrying; no restart needed.
+        log.warning(
+            "model_registry: booted DEGRADED — one or more manifests did not verify; "
+            "the re-sync loop will retry until they do"
+        )
 
     grpc_server = grpc.aio.server()
     dataplane_pb2_grpc.add_DataplaneServiceServicer_to_server(DataplaneServicer(), grpc_server)
@@ -613,6 +630,8 @@ async def lifespan(app: FastAPI):
     await grpc_server.stop(grace=5)
     if registry_watch_task:
         registry_watch_task.cancel()
+    if registry_resync_task:
+        registry_resync_task.cancel()
     if provider_channel:
         await provider_channel.close()
     if etcd_client:

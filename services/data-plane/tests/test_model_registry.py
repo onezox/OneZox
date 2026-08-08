@@ -425,3 +425,89 @@ def test_unverified_canary_fails_closed_not_silent_stable_fallback() -> None:
         raise AssertionError("expected ManifestNotFound, not a silent fallback to stable")
     except ManifestNotFound:
         pass
+
+
+class OutageVerifier:
+    """A verifier that FAILS while `down` is True and works afterwards —
+    the shape of a real Vault outage: unreachable for a while, then back,
+    with the manifests themselves never having changed."""
+
+    def __init__(self, real: FakeVerifier) -> None:
+        self._real = real
+        self.down = True
+
+    async def verify(self, key_name: str, payload: bytes, signature: str) -> bool:
+        if self.down:
+            raise RuntimeError("vault unreachable: All connection attempts failed")
+        return await self._real.verify(key_name, payload, signature)
+
+
+def test_verification_failure_marks_the_cache_degraded() -> None:
+    """Audit fix M1. A manifest that fails verification must be recorded
+    as untrusted, not merely dropped — being able to SEE the degraded
+    state is what makes recovery possible rather than permanent."""
+    real = FakeVerifier()
+    etcd = FakeEtcdReader()
+    version_id, model_ref = "v1", "openai"
+    spec_json = '{"worker_ref":"openai:gpt-4o-mini"}'
+    signature = real.sign(signed_payload(version_id, model_ref, spec_json))
+    _put_manifest(etcd, version_id, model_ref, spec_json, signature)
+
+    cache = Cache(etcd, OutageVerifier(real), _null_logger())
+    asyncio.run(cache.sync_once())
+
+    assert cache.is_degraded() is True
+    try:
+        cache.resolve("openai", "req-1")
+        raise AssertionError("expected ManifestNotFound while degraded")
+    except ManifestNotFound:
+        pass
+
+
+def test_cache_self_heals_when_the_verifier_recovers() -> None:
+    """Audit fix M1 — THE regression test for the 2x-recurring boot-retry
+    gap (P04-U, P05-P). A manifest that failed verification only because
+    Vault was briefly away must verify on its own once Vault returns, via
+    a plain re-sync and with NO process restart."""
+    real = FakeVerifier()
+    etcd = FakeEtcdReader()
+    version_id, model_ref = "v1", "openai"
+    spec_json = '{"worker_ref":"openai:gpt-4o-mini"}'
+    signature = real.sign(signed_payload(version_id, model_ref, spec_json))
+    _put_manifest(etcd, version_id, model_ref, spec_json, signature)
+
+    verifier = OutageVerifier(real)
+    cache = Cache(etcd, verifier, _null_logger())
+
+    # Boot during the outage: nothing trusted, nothing servable.
+    asyncio.run(cache.sync_once())
+    assert cache.is_degraded() is True
+
+    # Vault comes back. The manifests in etcd never changed, so no watch
+    # event fires — only a re-sync can notice, which is precisely why the
+    # old code stayed broken until someone restarted the pod.
+    verifier.down = False
+    asyncio.run(cache.sync_once())
+
+    assert cache.is_degraded() is False
+    resolved = cache.resolve("openai", "req-1")
+    assert resolved.worker_ref == "openai:gpt-4o-mini"
+
+
+def test_untrusted_set_does_not_retain_deleted_keys() -> None:
+    """A manifest that failed verification and was then REMOVED from etcd
+    must not hold the cache in a degraded state forever — sync_once
+    rebuilds the set from the current listing rather than accumulating."""
+    real = FakeVerifier()
+    etcd = FakeEtcdReader()
+    version_id, model_ref = "v1", "openai"
+    spec_json = '{"worker_ref":"openai:gpt-4o-mini"}'
+    _put_manifest(etcd, version_id, model_ref, spec_json, "fake:v1:not-a-real-signature")
+
+    cache = Cache(etcd, real, _null_logger())
+    asyncio.run(cache.sync_once())
+    assert cache.is_degraded() is True
+
+    etcd.store.pop(f"/onezox/manifests/{model_ref}/{version_id}".encode(), None)
+    asyncio.run(cache.sync_once())
+    assert cache.is_degraded() is False
