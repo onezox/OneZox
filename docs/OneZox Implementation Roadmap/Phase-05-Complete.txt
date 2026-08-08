@@ -722,5 +722,93 @@ with automatic rollback on real SLO regression — with every action audited, RB
 enforced, and no path to mutate live traffic outside that flow.
 
 ================================================================================
+ADDENDUM — POST-M2 AUDIT: EC3/EC4 PROOFS RE-SCOPED TO THE DATASTORE LAYER
+================================================================================
+Added after the post-M2 codebase audit (Audit.txt). This is an honest
+correction to the SCOPE of two proofs above, not a retraction of them.
+
+WHAT THE ORIGINAL PROOFS ACTUALLY COVERED. Step T's DB-layer bypass test was
+run as the admin_api role, and its network-layer test targeted control-plane.
+Both results are exactly as recorded and still reproduce. But EC3's "audit_log
+is immutable" and EC4's "no path exists to mutate a live model outside signed
+manifests + rollout" were written as GENERAL claims, and the evidence behind
+them was narrower than the wording.
+
+WHAT THE AUDIT FOUND. Two gaps the original proof set never considered:
+  1. edge-gateway and data-plane connected to CockroachDB as ROOT, a superuser
+     that bypasses GRANT/REVOKE entirely. Either connection could therefore
+     UPDATE model_active or UPDATE/DELETE audit_log.
+  2. NO CiliumNetworkPolicy existed for ANY datastore. In Cilium an endpoint is
+     default-deny only once a policy selects it, so CockroachDB, etcd, Vault,
+     Redis and MinIO were default-ALLOW. Demonstrated live: an unlabelled,
+     credential-less pod connected as root (rolsuper=t), read model_active and
+     audit_log, and opened TCP to etcd, Vault and Redis. etcd mattered
+     independently of the database — /onezox/active/{model_ref} lives there, so
+     a direct write changes what data-plane resolves without touching SQL at
+     all.
+
+WHAT WAS FIXED (audit items C1 and C2; neither is sufficient alone, because
+CockroachDB runs --insecure and anyone reaching 26257 is whatever user they
+name):
+  - Migration 0023 adds least-privilege edge_gateway and data_plane roles, and
+    both services now connect as those instead of root.
+  - platform/stubs/mtls/datastore-policies.yaml adds CiliumNetworkPolicies for
+    all five datastores, preserving peer/quorum traffic, the host entity, and
+    Prometheus's CockroachDB scrape.
+
+RE-SCOPED EC4 — DB LAYER, every non-root role (was: admin_api only):
+    role            UPDATE model_active
+    edge_gateway    REFUSED  42501 (no UPDATE privilege)
+    data_plane      REFUSED  42501 (no UPDATE privilege)
+    admin_api       REFUSED  42501 (no UPDATE privilege)
+    control_plane   REFUSED  23503 (foreign key violation)
+  control_plane is recorded honestly and differs in kind: it legitimately HOLDS
+  UPDATE on model_active — it is the sanctioned writer, and its constraint is
+  the application-layer rollout state machine, not a missing grant. Its attempt
+  was refused by model_active_active_version_id_fkey, which turns out to be a
+  stronger property than expected: the live pointer CANNOT reference a version
+  that was never published as a signed manifest, enforced by the schema itself.
+  Live pointer confirmed unchanged after all four attempts.
+
+RE-SCOPED EC3 — audit_log immutability, every non-root role:
+    role            UPDATE audit_log   DELETE audit_log
+    edge_gateway    REFUSED 42501      REFUSED 42501
+    data_plane      REFUSED 42501      REFUSED 42501
+    admin_api       REFUSED 42501      REFUSED 42501
+    control_plane   REFUSED 42501      REFUSED 42501
+  No role in the system can modify or delete a written audit row.
+
+NEW EC4 SUB-TEST — direct etcd write (the second bypass, never previously
+tested):
+  An unauthorized pod attempted
+    PUT /onezox/active/openai = {"stable":"ATTACKER-CONTROLLED",...}
+  via etcd's HTTP API. REFUSED — connection never established (curl exit 28,
+  HTTP 000). Live pointer verified byte-identical before and after.
+
+RE-RUN OF THE AUDIT'S OWN DATASTORE PROBE (the direct proof the finding is
+closed). Same unlabelled, credential-less pod, before vs. after:
+    CockroachDB 26257   was: connected as root, read 5 + 24 rows
+                        now: BLOCKED — "dial error: timeout"
+    etcd 2379           was: OPEN   ->  now: BLOCKED
+    vault 8200          was: OPEN   ->  now: BLOCKED
+    redis 6379          was: OPEN   ->  now: BLOCKED
+    minio 9000          was: OPEN   ->  now: BLOCKED
+
+POSITIVE CONTROLS (a policy that broke legitimate access would be worse than
+the gap it closed):
+    data-plane   -> CockroachDB   CONNECTED, current_user() = data_plane
+                                  (proves C1 and C2 simultaneously)
+    edge-gateway -> CockroachDB   HTTP 401 on a bad key (api_keys query ran)
+    control-plane-> etcd          no errors
+    data-plane   -> Vault         all manifests verified on a fresh boot
+    Redis cluster                 cluster_state: ok
+    Prometheus   -> CockroachDB   3 /_status/vars targets, all up
+    Argo CD                       onezox-stubs Synced / Healthy
+
+STATUS. EC3 and EC4 now hold as generally as they were worded. EC1 and EC2 are
+unaffected by this addendum. The M2 verdict stands; the evidence behind two of
+its four criteria is now as broad as the claims.
+
+================================================================================
 END OF PHASE-05-COMPLETE.TXT
 ================================================================================
