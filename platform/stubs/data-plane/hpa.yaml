@@ -59,15 +59,28 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
-    # Memory is a secondary guard, deliberately looser: data-plane's
-    # memory is dominated by the registry cache, which does NOT grow with
-    # load, so a memory rise here means something genuinely unusual.
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 80
+    # NO MEMORY METRIC — deliberately, and this was corrected AFTER the
+    # first live test rather than reasoned out in advance.
+    #
+    # The original version of this file carried a memory metric at 80%
+    # "as a secondary guard," with a comment noting that data-plane's
+    # memory is dominated by the registry cache and does NOT grow with
+    # load. That observation was right; the conclusion drawn from it was
+    # wrong. A per-pod metric that does not vary with replica count makes
+    # EVERY replica count self-consistent, because the HPA's formula is
+    #     desired = ceil(current * currentUtil / targetUtil)
+    # and currentUtil stays put as replicas change. Measured live: each
+    # pod sits at ~59Mi of its 96Mi request = 62% AT IDLE, so at 3
+    # replicas desired = ceil(3 * 62/80) = 3, and at 2 replicas desired =
+    # 2. Both "stable". The count therefore RATCHETS: any scale-up, for
+    # any reason, becomes permanent, and the HPA can never return to
+    # minReplicas.
+    #
+    # That was observed, not predicted — data-plane was manually pushed to
+    # 4, the HPA stepped it to 3, and then it held there indefinitely at
+    # 4% CPU. CPU alone is the honest signal, and memory keeps its proper
+    # role as a requests/limits concern (OOM protection), not a scaling
+    # trigger.
   behavior:
     scaleUp:
       # React quickly — under-provisioning shows up as user-visible

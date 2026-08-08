@@ -45,12 +45,13 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 80
+    # NO MEMORY METRIC — see data-plane/hpa.yaml for the full derivation.
+    # Short version: per-pod memory does not vary with replica count, so a
+    # memory target makes every replica count self-consistent and the
+    # count ratchets upward permanently. edge-gateway's idle memory is
+    # much lower than data-plane's (8% vs 62% of request), so it would
+    # ratchet more slowly rather than differently — same defect, removed
+    # from both for the same reason.
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30
