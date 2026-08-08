@@ -11,11 +11,21 @@ use tokio_postgres::NoTls;
 
 use super::{ApiKeyRow, ApiKeyStore, AuthError};
 
+/// Connects as the least-privilege `edge_gateway` role (migration 0023),
+/// never as root — root is a CockroachDB superuser and bypasses
+/// GRANT/REVOKE entirely, which is the same reasoning control-plane's
+/// and admin-api's own roles already document. That role holds SELECT on
+/// api_keys and rate_limit_policy and nothing else: this service issues
+/// no INSERT/UPDATE/DELETE anywhere, so it is granted none, and it
+/// cannot read or touch model_active, audit_log or any registry table.
+///
+/// Env-overridable with the same COCKROACH_USER name control-plane and
+/// admin-api use, so all four services are configured identically.
 pub fn build_pool(host: &str) -> Pool {
     let mut cfg = Config::new();
     cfg.host = Some(host.to_string());
     cfg.port = Some(26257);
-    cfg.user = Some("root".to_string());
+    cfg.user = Some(std::env::var("COCKROACH_USER").unwrap_or_else(|_| "edge_gateway".to_string()));
     cfg.dbname = Some("defaultdb".to_string());
     cfg.pool = Some(deadpool_postgres::PoolConfig::new(16));
     cfg.create_pool(Some(Runtime::Tokio1), NoTls)

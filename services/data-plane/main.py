@@ -563,8 +563,19 @@ async def lifespan(app: FastAPI):
         log.info(f"boot: all required modules present: {list(_REQUIRED_MODULES)}")
 
         pg_host = os.environ.get("COCKROACH_HOST", "onezox-crdb-public.default.svc.cluster.local")
+        # Least-privilege data_plane role (migration 0023), never root —
+        # root is a CockroachDB superuser and bypasses GRANT/REVOKE
+        # entirely, the same reasoning control-plane's and admin-api's own
+        # roles already document. This role holds INSERT on request_log,
+        # usage_event and health_probe, plus SELECT on tenants (needed
+        # only so CockroachDB can validate those two tables' org_id
+        # foreign keys on INSERT — this service never queries tenants
+        # itself). No UPDATE and no DELETE anywhere: every write it makes
+        # is an append. It cannot read or touch model_active, audit_log,
+        # or any registry table.
+        pg_user = os.environ.get("COCKROACH_USER", "data_plane")
         pg_pool = await asyncpg.create_pool(
-            host=pg_host, port=26257, user="root", database="defaultdb", ssl=False,
+            host=pg_host, port=26257, user=pg_user, database="defaultdb", ssl=False,
         )
         await write_health_probe(pg_pool)
 
