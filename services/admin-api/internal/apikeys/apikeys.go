@@ -21,6 +21,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // GenerateRawKey mints a new raw API key — 32 random bytes, hex-encoded,
@@ -83,11 +85,12 @@ type Store interface {
 }
 
 type CockroachStore struct {
-	db *sql.DB
+	db      *sql.DB
+	typeMap *pgtype.Map
 }
 
 func NewCockroachStore(db *sql.DB) *CockroachStore {
-	return &CockroachStore{db: db}
+	return &CockroachStore{db: db, typeMap: pgtype.NewMap()}
 }
 
 func (c *CockroachStore) Create(ctx context.Context, orgID, hash string, scopes []string) (string, error) {
@@ -126,6 +129,14 @@ func (c *CockroachStore) Revoke(ctx context.Context, keyID string) (bool, error)
 // ever reads api_keys.hash out of the database in the first place. A
 // future bug in this function's own body cannot leak a hash it never
 // fetched.
+//
+// scopes is scanned via pgtype.Map.SQLScanner, not a plain &s.Scopes —
+// pgx/v5's stdlib driver (database/sql, not pgx's own native pool)
+// returns an array column's raw value before Scan knows the destination
+// Go type, so a bare *[]string destination fails with "unsupported
+// Scan... storing driver.Value type string" (live-caught, Step T setup:
+// pgx's own documented workaround, stdlib package doc's "PostgreSQL
+// Specific Data Types" section).
 func (c *CockroachStore) List(ctx context.Context) ([]Summary, error) {
 	rows, err := c.db.QueryContext(ctx, `
 		SELECT key_id, org_id, scopes, created_at, revoked_at
@@ -142,7 +153,7 @@ func (c *CockroachStore) List(ctx context.Context) ([]Summary, error) {
 		var s Summary
 		var createdAt time.Time
 		var revokedAt sql.NullTime
-		if err := rows.Scan(&s.KeyID, &s.OrgID, &s.Scopes, &createdAt, &revokedAt); err != nil {
+		if err := rows.Scan(&s.KeyID, &s.OrgID, c.typeMap.SQLScanner(&s.Scopes), &createdAt, &revokedAt); err != nil {
 			return nil, err
 		}
 		s.CreatedAt = createdAt.Format(time.RFC3339)
