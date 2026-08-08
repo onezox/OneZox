@@ -4,9 +4,16 @@ package graph
 
 import (
 	"context"
+
+	"github.com/onezox/OneZox/services/admin-api/internal/apikeys"
 )
 
-type Resolver struct{}
+// Resolver's fields are added to as each query lands its own real
+// implementation (Step S: Keys) — every other field here stays a
+// gqlgen panic("not implemented") stub until its own step.
+type Resolver struct {
+	Keys apikeys.Store
+}
 
 // Me is the resolver for the me field.
 func (r *queryResolver) Me(ctx context.Context) (*AdminUser, error) {
@@ -43,9 +50,30 @@ func (r *queryResolver) Rollouts(ctx context.Context) ([]*Rollout, error) {
 	panic("not implemented")
 }
 
-// APIKeys is the resolver for the apiKeys field.
+// APIKeys is the resolver for the apiKeys field — Step S. Backed by
+// apikeys.Store.List, whose own SELECT never names the hash column at
+// all (apikeys.go's own doc comment) — this resolver has no hash value
+// available to leak even by mistake, and APIKeySummary (models_gen.go)
+// has no Hash/RawKey field to put one in regardless. Two independent
+// layers (the SQL query itself, and the GraphQL type shape) both make
+// "listApiKeys leaks a hash" structurally impossible, not just avoided
+// by this function's own care.
 func (r *queryResolver) APIKeys(ctx context.Context) ([]*APIKeySummary, error) {
-	panic("not implemented")
+	summaries, err := r.Keys.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*APIKeySummary, 0, len(summaries))
+	for _, s := range summaries {
+		out = append(out, &APIKeySummary{
+			KeyID:     s.KeyID,
+			OrgID:     s.OrgID,
+			Scopes:    s.Scopes,
+			CreatedAt: s.CreatedAt,
+			RevokedAt: s.RevokedAt,
+		})
+	}
+	return out, nil
 }
 
 // DashboardMetrics is the resolver for the dashboardMetrics field.

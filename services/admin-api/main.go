@@ -169,7 +169,7 @@ func main() {
 	// queries against a security-critical service — live verification
 	// uses a raw POST body instead, the same way every other RPC in this
 	// project has been verified via grpcurl.
-	graphqlSrv := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: &graph.Resolver{}}))
+	graphqlSrv := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: &graph.Resolver{Keys: keyStore}}))
 
 	mux := http.NewServeMux()
 	// Step F: every /graphql request requires a verified admin credential

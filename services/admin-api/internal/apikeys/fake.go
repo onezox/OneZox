@@ -4,17 +4,19 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // FakeStore is an in-memory Store for unit tests — no CockroachDB needed,
 // same discipline as audit.FakeWriter and rollout.FakeStore.
 type FakeStore struct {
-	mu   sync.Mutex
-	keys map[string]bool // key_id -> active (true) / revoked (false)
-	next int
+	mu      sync.Mutex
+	records map[string]*Summary // key_id -> its own Summary; RevokedAt nil means active
+	next    int
 
 	CreateErr error
 	RevokeErr error
+	ListErr   error
 
 	// ValidOrgIDs, when non-nil, makes Create fail for any org_id not
 	// listed — standing in for api_keys.org_id's own FK constraint
@@ -29,7 +31,7 @@ type FakeStore struct {
 }
 
 func NewFakeStore() *FakeStore {
-	return &FakeStore{keys: make(map[string]bool)}
+	return &FakeStore{records: make(map[string]*Summary)}
 }
 
 func (f *FakeStore) Create(ctx context.Context, orgID, hash string, scopes []string) (string, error) {
@@ -47,7 +49,12 @@ func (f *FakeStore) Create(ctx context.Context, orgID, hash string, scopes []str
 	}
 	f.next++
 	keyID := fmt.Sprintf("key-%d", f.next)
-	f.keys[keyID] = true
+	f.records[keyID] = &Summary{
+		KeyID:     keyID,
+		OrgID:     orgID,
+		Scopes:    scopes,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
 	return keyID, nil
 }
 
@@ -58,10 +65,25 @@ func (f *FakeStore) Revoke(ctx context.Context, keyID string) (bool, error) {
 	if f.RevokeErr != nil {
 		return false, f.RevokeErr
 	}
-	active, exists := f.keys[keyID]
-	if !exists || !active {
+	rec, exists := f.records[keyID]
+	if !exists || rec.RevokedAt != nil {
 		return false, nil
 	}
-	f.keys[keyID] = false
+	now := time.Now().UTC().Format(time.RFC3339)
+	rec.RevokedAt = &now
 	return true, nil
+}
+
+func (f *FakeStore) List(ctx context.Context) ([]Summary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ListErr != nil {
+		return nil, f.ListErr
+	}
+	out := make([]Summary, 0, len(f.records))
+	for _, rec := range f.records {
+		cp := *rec
+		out = append(out, cp)
+	}
+	return out, nil
 }

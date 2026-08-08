@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"time"
 )
 
 // GenerateRawKey mints a new raw API key — 32 random bytes, hex-encoded,
@@ -46,6 +47,20 @@ func HashRawKey(raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Summary is the ONLY shape List returns — no Hash field exists on this
+// struct at all (structurally, not by convention: there is nothing to
+// forget to omit). Mirrors admin.graphql's own ApiKeySummary type field
+// for field ("Never exposes hash or raw key — raw_key is returned
+// exactly once, by the createApiKey gRPC command's own response, never
+// by a query").
+type Summary struct {
+	KeyID     string
+	OrgID     string
+	Scopes    []string
+	CreatedAt string
+	RevokedAt *string
+}
+
 // Store is implemented by CockroachStore in production and FakeStore in
 // tests.
 type Store interface {
@@ -59,6 +74,12 @@ type Store interface {
 	// uniformly — a caller doesn't need to distinguish which, since
 	// either way there is no active key left to revoke a second time.
 	Revoke(ctx context.Context, keyID string) (found bool, err error)
+
+	// List — Step S, the GraphQL apiKeys query's own backing read. Most
+	// recent first, every key regardless of revoked status (the panel
+	// dims revoked ones, per admin.graphql's own listApiKeys comment
+	// history; nothing here filters them out).
+	List(ctx context.Context) ([]Summary, error)
 }
 
 type CockroachStore struct {
@@ -98,4 +119,38 @@ func (c *CockroachStore) Revoke(ctx context.Context, keyID string) (bool, error)
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// List's SELECT deliberately never names the hash column — not "select
+// it and drop it before returning," there is no code path here that
+// ever reads api_keys.hash out of the database in the first place. A
+// future bug in this function's own body cannot leak a hash it never
+// fetched.
+func (c *CockroachStore) List(ctx context.Context) ([]Summary, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT key_id, org_id, scopes, created_at, revoked_at
+		FROM api_keys
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Summary
+	for rows.Next() {
+		var s Summary
+		var createdAt time.Time
+		var revokedAt sql.NullTime
+		if err := rows.Scan(&s.KeyID, &s.OrgID, &s.Scopes, &createdAt, &revokedAt); err != nil {
+			return nil, err
+		}
+		s.CreatedAt = createdAt.Format(time.RFC3339)
+		if revokedAt.Valid {
+			v := revokedAt.Time.Format(time.RFC3339)
+			s.RevokedAt = &v
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
