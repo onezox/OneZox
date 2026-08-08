@@ -1,0 +1,31 @@
+# Argo CD Application ADOPTING the existing "grafana" Helm release
+# (grafana/grafana @10.5.15) — see operator-prometheus.yaml for the full
+# rationale (same Phase-05 Step-N-drift-driven GitOps gap, same
+# multi-source adoption pattern).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: operator-grafana
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://grafana.github.io/helm-charts
+      chart: grafana
+      targetRevision: 10.5.15
+      helm:
+        releaseName: grafana
+        valueFiles:
+          - $values/platform/operators/prometheus/grafana-values.yaml
+    - repoURL: https://github.com/onezox/OneZox.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

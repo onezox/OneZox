@@ -1,0 +1,42 @@
+# Argo CD Application ADOPTING the existing "prometheus" Helm release
+# (prometheus-community/prometheus @29.19.0, installed manually per
+# platform/operators/prometheus/prometheus-values.yaml) — closes the
+# observability-operators-GitOps gap found in Phase-05 Step N: this
+# release's scrape config drifted silently for months because nothing
+# reconciled the live Helm release against its own committed values file
+# (only platform/stubs/ had that guarantee, via onezox-stubs below).
+#
+# Multi-source Application: source 1 is the REMOTE Helm chart itself
+# (not a local chart copy); source 2 is this git repo, referenced only
+# as `$values` so the chart's own valueFiles can pull
+# prometheus-values.yaml from git without pulling in unrelated files —
+# same reasoning admin-api/control-plane keep their own config narrow.
+# helm.releaseName pins ADOPTION of the existing release name, not a
+# parallel "prometheus-2" — this must be a clean no-op on first sync.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: operator-prometheus
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: prometheus
+      targetRevision: 29.19.0
+      helm:
+        releaseName: prometheus
+        valueFiles:
+          - $values/platform/operators/prometheus/prometheus-values.yaml
+    - repoURL: https://github.com/onezox/OneZox.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

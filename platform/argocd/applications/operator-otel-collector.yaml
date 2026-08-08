@@ -1,0 +1,31 @@
+# Argo CD Application ADOPTING the existing "otel-collector" Helm release
+# (open-telemetry/opentelemetry-collector @0.165.0) — see
+# operator-prometheus.yaml for the full rationale (same Phase-05
+# Step-N-drift-driven GitOps gap, same multi-source adoption pattern).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: operator-otel-collector
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://open-telemetry.github.io/opentelemetry-helm-charts
+      chart: opentelemetry-collector
+      targetRevision: 0.165.0
+      helm:
+        releaseName: otel-collector
+        valueFiles:
+          - $values/platform/operators/otel/values.yaml
+    - repoURL: https://github.com/onezox/OneZox.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

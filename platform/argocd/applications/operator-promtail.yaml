@@ -1,0 +1,31 @@
+# Argo CD Application ADOPTING the existing "promtail" Helm release
+# (grafana/promtail @6.17.1) — see operator-prometheus.yaml for the full
+# rationale (same Phase-05 Step-N-drift-driven GitOps gap, same
+# multi-source adoption pattern).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: operator-promtail
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://grafana.github.io/helm-charts
+      chart: promtail
+      targetRevision: 6.17.1
+      helm:
+        releaseName: promtail
+        valueFiles:
+          - $values/platform/operators/loki/promtail-values.yaml
+    - repoURL: https://github.com/onezox/OneZox.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
