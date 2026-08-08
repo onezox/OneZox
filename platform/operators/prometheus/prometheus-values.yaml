@@ -66,11 +66,51 @@ extraScrapeConfigs: |
     scrape_interval: 15s
     static_configs:
       - targets: ['otel-collector-opentelemetry-collector.default.svc.cluster.local:8889']
+  # Post-M2 fix: PER-POD service discovery, not static Service DNS.
+  #
+  # This job used to list four Service DNS names as static targets. A
+  # Service name resolves to ONE pod per scrape (kube-proxy picks), so
+  # with more than one replica Prometheus samples a different, arbitrary
+  # pod each interval. Counters then appear to reset and vanish between
+  # scrapes, and rate() over them is meaningless.
+  #
+  # Harmless while every service ran a single replica. The M5 HPA took
+  # data-plane to 2-6 replicas and made it bite exactly where it hurts:
+  # data_plane_submit_total is the signal the canary AnalysisTemplate
+  # queries, so EC1/EC2's automatic advance and rollback lost their
+  # input. Caught live — with 4 data-plane pods, only ONE carried any
+  # samples (edge-gateway pins its gRPC connection to a single pod), so
+  # three of four scrapes returned nothing and the metric disappeared
+  # from Prometheus entirely.
+  #
+  # provider-gateway (3 replicas) and admin-api (2) were already affected
+  # before M5; their metrics have been sampled from one arbitrary pod all
+  # along. This fixes all four at once.
+  #
+  # role: endpoints yields one target PER POD behind each Service, so
+  # sum(rate(...)) in the AnalysisTemplate aggregates across replicas
+  # correctly and scaling changes nothing.
   - job_name: 'onezox-stubs'
     scrape_interval: 15s
-    static_configs:
-      - targets:
-          - 'data-plane.default.svc.cluster.local:8080'
-          - 'edge-gateway.default.svc.cluster.local:8080'
-          - 'provider-gateway.default.svc.cluster.local:8080'
-          - 'admin-api.default.svc.cluster.local:8080'
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names: ['default']
+    relabel_configs:
+      # Only the four OneZox services, and only their http (metrics)
+      # port — without the port filter every pod would also be scraped
+      # on its grpc port, which serves no /metrics.
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: 'data-plane|edge-gateway|provider-gateway|admin-api'
+        action: keep
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        regex: 'http'
+        action: keep
+      # Keep the service name queryable, and make `instance` the pod so
+      # a per-replica anomaly is attributable instead of averaged away.
+      - source_labels: [__meta_kubernetes_service_name]
+        target_label: service
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: instance
