@@ -21,7 +21,10 @@ type FakeStore struct {
 	// against tenants (migration 0004) without a real CockroachDB.
 	ValidOrgIDs map[string]bool
 
-	CreateCalls []struct{ OrgID, Hash string; Scopes []string }
+	CreateCalls []struct {
+		OrgID, Hash string
+		Scopes      []string
+	}
 	RevokeCalls []string
 }
 
@@ -32,7 +35,10 @@ func NewFakeStore() *FakeStore {
 func (f *FakeStore) Create(ctx context.Context, orgID, hash string, scopes []string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.CreateCalls = append(f.CreateCalls, struct{ OrgID, Hash string; Scopes []string }{orgID, hash, scopes})
+	f.CreateCalls = append(f.CreateCalls, struct {
+		OrgID, Hash string
+		Scopes      []string
+	}{orgID, hash, scopes})
 	if f.CreateErr != nil {
 		return "", f.CreateErr
 	}

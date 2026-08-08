@@ -272,12 +272,18 @@ func (s *server) CreateApiKey(ctx context.Context, req *pb.CreateApiKeyRequest) 
 
 	rawKey, err := apikeys.GenerateRawKey()
 	if err != nil {
-		// Random generation failing is a host/runtime problem, not a
-		// caller-attributable "attempt" — nothing was attempted against
-		// any store, so this is the one path here with no audit_log row,
-		// the same "no real actor/action to record yet" reasoning authz's
-		// own missing-identity branch already documents.
+		// Unlike the no-identity branch above, THIS failure has a real,
+		// already-resolved actor (id.UserID) — an authenticated admin
+		// genuinely attempted CreateApiKey and it genuinely failed, which
+		// is exactly what Step R's audit-coverage sweep exists to catch:
+		// a real attempt by a real actor must never complete (success OR
+		// failure) without an audit_log row, no matter how narrow the
+		// failure mode (crypto/rand exhaustion is effectively unreachable
+		// in practice, but the code path is real).
 		s.log.Error("CreateApiKey: failed to generate raw key material", "user_id", id.UserID, "error", err)
+		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetOrgId()}); auditErr != nil {
+			s.log.Error("CreateApiKey: failed to audit a failed attempt", "org_id", req.GetOrgId(), "user_id", id.UserID, "error", auditErr)
+		}
 		return nil, status.Error(codes.Internal, "failed to create api key")
 	}
 	hash := apikeys.HashRawKey(rawKey)
