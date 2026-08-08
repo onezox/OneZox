@@ -13,11 +13,20 @@
 # of gap. Confirmed live (Step D): `find /build/internal` inside the
 # builder stage shows all five module directories plus pb/ actually
 # present in the build context, not just the repo.
+#
+# Post-M2 audit M4: `COPY *.go ./`, not `COPY main.go ./`. The blanket
+# internal/ copy above closed this bug class for SUBDIRECTORIES but left
+# it open one level up — a second top-level .go file would simply not be
+# in the build context. That is not hypothetical: admin-api's Dockerfile
+# named main.go individually at Step E and broke at Step H the moment
+# server.go was added (`undefined: server`). control-plane has only
+# main.go today, so this is prophylactic — which is the point. The fix
+# costs nothing now and removes the trap before someone walks into it.
 FROM docker.io/library/golang:1.26-bookworm AS builder
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go ./
+COPY *.go ./
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -o /control-plane .
 
