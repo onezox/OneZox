@@ -78,8 +78,16 @@ spec:
             # The image already runs as the unprivileged `node` user;
             # these make that non-negotiable at the pod level rather than
             # a property of the image someone could rebuild away.
+            #
+            # runAsUser is the NUMERIC uid of that `node` user (1000 in
+            # the official node images), and it is required, not
+            # belt-and-braces: kubelet cannot verify a named USER against
+            # runAsNonRoot and refuses to start the container with
+            # "image has non-numeric user (node), cannot verify user is
+            # non-root". Caught on this Deployment's first rollout.
             allowPrivilegeEscalation: false
             runAsNonRoot: true
+            runAsUser: 1000
             capabilities:
               drop: ["ALL"]
 ---
