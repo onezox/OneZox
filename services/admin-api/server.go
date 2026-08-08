@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/onezox/OneZox/services/admin-api/internal/apikeys"
 	"github.com/onezox/OneZox/services/admin-api/internal/audit"
 	"github.com/onezox/OneZox/services/admin-api/internal/authn"
 	pb "github.com/onezox/OneZox/services/admin-api/internal/pb/admin/v1"
@@ -42,6 +43,7 @@ type server struct {
 	pb.UnimplementedAdminServiceServer
 	db      *sql.DB
 	control controlPublisher
+	keys    apikeys.Store
 	audit   audit.Writer
 	log     *slog.Logger
 }
@@ -252,4 +254,107 @@ func (s *server) AbortRollout(ctx context.Context, req *pb.AbortRolloutRequest) 
 
 	s.log.Info("aborted rollout", "rollout_id", req.GetRolloutId(), "user_id", id.UserID)
 	return &pb.AbortRolloutResponse{}, nil
+}
+
+// CreateApiKey/RevokeApiKey — Step S. Unlike every handler above, these
+// never reach control-plane at all (admin.proto's own header comment) —
+// api_keys is local to admin-api's own DB grant (migration 0018). Same
+// audit shape regardless: success and failure both write a row, and an
+// audit-write failure after a real DB mutation still fails the RPC
+// (Step H's fail-loud rule, unchanged by which backend the mutation
+// landed in).
+func (s *server) CreateApiKey(ctx context.Context, req *pb.CreateApiKeyRequest) (*pb.CreateApiKeyResponse, error) {
+	id, ok := authn.IdentityFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "no verified identity")
+	}
+	const action = "create_api_key"
+
+	rawKey, err := apikeys.GenerateRawKey()
+	if err != nil {
+		// Random generation failing is a host/runtime problem, not a
+		// caller-attributable "attempt" — nothing was attempted against
+		// any store, so this is the one path here with no audit_log row,
+		// the same "no real actor/action to record yet" reasoning authz's
+		// own missing-identity branch already documents.
+		s.log.Error("CreateApiKey: failed to generate raw key material", "user_id", id.UserID, "error", err)
+		return nil, status.Error(codes.Internal, "failed to create api key")
+	}
+	hash := apikeys.HashRawKey(rawKey)
+
+	keyID, err := s.keys.Create(ctx, req.GetOrgId(), hash, req.GetScopes())
+	if err != nil {
+		s.log.Error("CreateApiKey: store call failed", "org_id", req.GetOrgId(), "user_id", id.UserID, "error", err)
+		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetOrgId()}); auditErr != nil {
+			s.log.Error("CreateApiKey: failed to audit a failed attempt", "org_id", req.GetOrgId(), "user_id", id.UserID, "error", auditErr)
+		}
+		return nil, status.Error(codes.Internal, "failed to create api key")
+	}
+
+	// after_json deliberately carries key_id/org_id/scopes only — NEVER
+	// raw_key, and not even hash: audit_log exists to be queried and
+	// displayed (this file's own migration 0017 header comment), and a
+	// hash with no legitimate read-path use sitting in a second table is
+	// needless duplication of sensitive material, not a security
+	// requirement. raw_key is returned to the caller exactly once, in the
+	// RPC response below, and nowhere else, ever.
+	auditErr := s.audit.Write(ctx, audit.Entry{
+		Actor:  id.UserID,
+		Action: action,
+		Target: req.GetOrgId(),
+		After: map[string]any{
+			"key_id": keyID,
+			"org_id": req.GetOrgId(),
+			"scopes": req.GetScopes(),
+		},
+	})
+	if auditErr != nil {
+		s.log.Error("CreateApiKey: key created but audit write failed — reporting as failed",
+			"key_id", keyID, "org_id", req.GetOrgId(), "user_id", id.UserID, "error", auditErr)
+		return nil, status.Error(codes.Internal, "key may have been created but could not be recorded; treat as failed and verify with an operator")
+	}
+
+	s.log.Info("created api key", "key_id", keyID, "org_id", req.GetOrgId(), "user_id", id.UserID)
+	return &pb.CreateApiKeyResponse{KeyId: keyID, RawKey: rawKey}, nil
+}
+
+func (s *server) RevokeApiKey(ctx context.Context, req *pb.RevokeApiKeyRequest) (*pb.RevokeApiKeyResponse, error) {
+	id, ok := authn.IdentityFromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Internal, "no verified identity")
+	}
+	const action = "revoke_api_key"
+
+	found, err := s.keys.Revoke(ctx, req.GetKeyId())
+	// found=false (no such key_id, or already revoked) is treated the
+	// same as a store error here — both mean "nothing was revoked," and
+	// both are still a real admin action worth auditing as a failed
+	// attempt, the same uniform failure-is-still-audited shape every
+	// other RPC in this file already follows.
+	if err != nil || !found {
+		if err != nil {
+			s.log.Error("RevokeApiKey: store call failed", "key_id", req.GetKeyId(), "user_id", id.UserID, "error", err)
+		} else {
+			s.log.Warn("RevokeApiKey: no active key found", "key_id", req.GetKeyId(), "user_id", id.UserID)
+		}
+		if auditErr := s.audit.Write(ctx, audit.Entry{Actor: id.UserID, Action: action + "_failed", Target: req.GetKeyId()}); auditErr != nil {
+			s.log.Error("RevokeApiKey: failed to audit a failed attempt", "key_id", req.GetKeyId(), "user_id", id.UserID, "error", auditErr)
+		}
+		return nil, status.Error(codes.Internal, "failed to revoke api key")
+	}
+
+	auditErr := s.audit.Write(ctx, audit.Entry{
+		Actor:  id.UserID,
+		Action: action,
+		Target: req.GetKeyId(),
+		After:  map[string]string{"status": "revoked"},
+	})
+	if auditErr != nil {
+		s.log.Error("RevokeApiKey: key revoked but audit write failed — reporting as failed",
+			"key_id", req.GetKeyId(), "user_id", id.UserID, "error", auditErr)
+		return nil, status.Error(codes.Internal, "revoke may have succeeded but could not be recorded; treat as failed and verify with an operator")
+	}
+
+	s.log.Info("revoked api key", "key_id", req.GetKeyId(), "user_id", id.UserID)
+	return &pb.RevokeApiKeyResponse{}, nil
 }

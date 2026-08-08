@@ -49,6 +49,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/onezox/OneZox/services/admin-api/internal/apikeys"
 	"github.com/onezox/OneZox/services/admin-api/internal/audit"
 	"github.com/onezox/OneZox/services/admin-api/internal/authn"
 	"github.com/onezox/OneZox/services/admin-api/internal/authz"
@@ -127,6 +128,10 @@ func main() {
 	// (server.go) — one INSERT statement, one place that issues it.
 	auditWriter := audit.NewCockroachWriter(db)
 
+	// Step S: api_keys, local to admin-api's own DB grant — never reaches
+	// control-plane (admin.proto's own header comment).
+	keyStore := apikeys.NewCockroachStore(db)
+
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
@@ -141,7 +146,7 @@ func main() {
 		authn.UnaryInterceptor(authnStore, log),
 		authz.UnaryInterceptor(auditWriter, log),
 	))
-	pb.RegisterAdminServiceServer(grpcServer, &server{db: db, control: controlClient, audit: auditWriter, log: log})
+	pb.RegisterAdminServiceServer(grpcServer, &server{db: db, control: controlClient, keys: keyStore, audit: auditWriter, log: log})
 
 	go func() {
 		log.Info("admin-api gRPC listening", "port", grpcPort)
