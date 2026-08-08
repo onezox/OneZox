@@ -1,0 +1,726 @@
+================================================================================
+PHASE-05 — ADMIN PANEL, MODEL STUDIO, CANARY ROLLOUTS — COMPLETION RECORD
+                          [MILESTONE M2 — SAFE MODEL OPS]
+================================================================================
+This document records the work actually completed for Phase-05 on the local
+onezox-dev Kubernetes cluster (kind, WSL2 Ubuntu 24.04). It contains only work
+that was performed and verified. It does not contain Phase-06 work, future
+plans, recommendations, or opinions beyond the explicitly-labelled DEFERRALS
+and TRACKED FINDINGS sections. Same style as Phase-00/01/02/03/04-Complete.txt.
+
+Steps A-K (Argo Rollouts install, the admin_user/rollout/audit_log migrations
+and admin_api DB role, the admin proto/GraphQL contract, admin-api's skeleton
+and its authn/RBAC layers, publishModelVersion, the EC3 adversarial proof, and
+the etcd canary envelope) were built and verified earlier in this same build
+effort. Steps L-W (the rollout state machine, the in-process reconciler, the
+SLO metric, both live canary proofs, the audit/immutability/EC4 adversarial
+proofs, key management, the admin panel, its deployment, and this close-out)
+were performed directly within the sessions that produced this record and are
+described in full first-hand detail, including every bug hit and fixed live.
+
+--------------------------------------------------------------------------------
+PHASE-05 OBJECTIVE
+--------------------------------------------------------------------------------
+Build the operator control surface over Phase-04's signed model registry: an
+admin panel (Next.js RSC) with a Model Studio to author and version virtual-
+model manifests, and Argo Rollouts-driven canary deployment that promotes new
+manifest versions by staged traffic (1% -> 10% -> 50% -> 100%) with metric-based
+AUTOMATIC ROLLBACK on SLO regression. Implements Architecture Parts R, G.2, A,
+N.5, C. Completes build stage 3.
+
+This phase is a CONSUMER of Phase-04. It does not rebuild registry, signing, or
+etcd logic. The one exception — a genuine change to a Phase-04 service — is
+recorded in full under CROSS-PHASE TOUCH below.
+
+--------------------------------------------------------------------------------
+BUILD SEQUENCE (IN ORDER)
+--------------------------------------------------------------------------------
+A. Argo Rollouts controller installed (Helm, argo-rollouts namespace) plus the
+   kubectl-argo-rollouts plugin for local inspection.
+B. CockroachDB migrations 0015-0018: admin_user (identity + credential_hash),
+   rollout, audit_log (immutable append), and the admin_api DB role. The role
+   is what makes both audit_log's immutability and EC4's DB-layer boundary
+   REAL rather than nominal — same mechanism, and same reasoning, as Phase-04's
+   own control_plane role.
+C. scripts/seed-admin-user.sh — the ONLY way an admin_user row is ever created.
+   No self-service admin-minting RPC exists anywhere in the contract; this was
+   a deliberate decision to avoid an unscoped privilege-escalation surface.
+D. proto/admin/v1/admin.proto (six mutating RPCs) + admin.graphql (query-only).
+   Contract-first checkpoint: the commands-vs-queries split is decided here and
+   carried, unbroken, all the way into the Go interfaces (U1b) and the panel's
+   two separate client modules (U2).
+E. admin-api service skeleton (Go), mTLS client to control-plane, dedicated
+   ServiceAccount, structured logging from day one.
+F. Admin authn middleware: Bearer-hash lookup against admin_user.credential_hash,
+   structurally disjoint from api_keys.
+G. RBAC guard: allow-list (default-deny), table-driven tests across every RPC
+   x every role, plus an unknown-method-denied-to-every-role test.
+H. publishModelVersion -> control-plane RegisterModelManifest, with audit_log
+   written on success AND failure. Required the Phase-04 activation fix (see
+   CROSS-PHASE TOUCH).
+I. Live-verify H: a real new signed manifest version through admin-api, landing
+   in CockroachDB and etcd.
+J. EC3 adversarial proof (see EXIT CRITERIA).
+K. etcd active-pointer extended to the canary envelope
+   {stable, canary, canary_percent}; weighted resolve() added to BOTH
+   data-plane (Python) and edge-gateway (Rust), with the bare-string
+   backward-compatibility path preserved and unit-tested in both languages.
+L. control-plane rollout/ module: CreateRollout, PromoteRollout, AbortRollout,
+   GetRolloutStatus. advanceStage/revertCanary are ONE implementation shared by
+   the human RPC path and the automatic reconciler — two triggers, one
+   transition.
+M. In-process reconciler: a plain background goroutine (no gRPC/HTTP surface at
+   all — network-unreachable by construction, not by policy), polling running
+   rollouts and driving them from real AnalysisRun status. Restart re-attach
+   falls out of the loop's normal operation rather than a separate recovery
+   path, proven both by unit test and by three real pod restarts mid-canary.
+N. data-plane per-request outcome metric data_plane_submit_total
+   {model_ref, canary, status} — the SLO signal the AnalysisTemplate reads.
+O. EC1 live proof (see EXIT CRITERIA). Two real reconciler bugs found and fixed.
+P. EC2 live proof (see EXIT CRITERIA).
+   [Between O and P: the operators-GitOps gap closed — see that section.]
+Q. audit_log immutability adversarial proof, at the storage layer.
+R. Audit-coverage sweep across the entire mutating surface. One real gap found
+   and fixed.
+S. CreateApiKey/RevokeApiKey (gRPC commands) + listApiKeys (GraphQL read).
+T. EC4 adversarial proof at all three layers (see EXIT CRITERIA).
+U1a. control-plane ListRollouts read RPC — added because admin-api genuinely
+   CANNOT read the rollout table (migration 0020 revoked those grants, and
+   Step T proved it adversarially). The panel's history view and the dashboard's
+   active-rollout count route through control-plane rather than through a
+   re-granted DB path.
+U1b. Every remaining GraphQL read resolver implemented against real backends.
+U2. admin-panel (Next.js RSC) — the first TypeScript/web service in the fleet.
+V. admin-panel deployed via the onezox-stubs Argo CD Application, with its two
+   mesh policies.
+W. This record.
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA — EVIDENCE
+--------------------------------------------------------------------------------
+
+EC1. A NEW VIRTUAL-MODEL VERSION IS AUTHORED, PUBLISHED, AND CANARIED TO 100%.
+     MET — and met on a genuinely healthy SIGNAL, not a fail-open default.
+
+     Rollout 481c5d68-1080-4e89-a86b-27f49284709f, model_ref openai, version
+     0290afa3-62bd-446e-86cc-ace915771ef6. Under sustained real traffic
+     (~80 req/s via an async gRPC load generator against the real data plane),
+     the rollout progressed canary_1 -> canary_10 -> canary_50 -> stable with
+     ZERO human PromoteRollout calls. Terminal state stage=stable,
+     status=promoted.
+
+     Cross-store verification, all three agreeing on the new version:
+       rollout table          stage=stable, status=promoted
+       model_active           active_version_id = 0290afa3-...
+       etcd /onezox/active/openai  {"stable":"0290afa3-...","canary":"","canary_percent":0}
+
+     SIGNAL-DRIVEN, not fail-open — the part that matters. All three
+     intermediate AnalysisRuns were phase=Successful with a real measured
+     value of [0]:
+       onezox-canary-481c5d68-...-95fa9c75  stage=canary_1   value [0]
+       onezox-canary-481c5d68-...-1d18b916  stage=canary_10  value [0]
+       onezox-canary-481c5d68-...-06ce67e4  stage=canary_50  value [0]
+     A real numeric 0 error rate, not NaN, not an empty result, not a default.
+     A canary that promoted regardless of signal would be as broken as one that
+     rolled back regardless; this distinguishes them.
+
+     TWO REAL BUGS FOUND AND FIXED GETTING HERE (both live-caught, neither
+     hypothetical — see PROBLEMS ENCOUNTERED #1 and #2):
+       - The reconciler stalled forever on AnalysisRun phase=Inconclusive,
+         which is Argo Rollouts' own TERMINAL verdict for a count:1 run.
+       - Every stage's AnalysisRun evaluated within ~1 second of the stage
+         starting, before any canary-labelled request could exist, making the
+         query a deterministic 0/0 (NaN) regardless of true canary health.
+     Without the second fix EC1 was UNPROVABLE: every canary, healthy or not,
+     coin-flipped into rollback.
+
+EC2. AN INDUCED REGRESSION TRIGGERS AUTOMATIC ROLLBACK.
+     MET — and met on the REAL elevated-error signal, distinguishable from the
+     empty-data and Inconclusive fail-safes.
+
+     Rollout 28f39753-e4d3-4e84-b6d8-db4e86f29a37. A manifest version was
+     published pointing worker_ref at fake:fail (provider-fake's deterministic
+     failure mode — zero cost, zero risk, 100% reliable), then canaried under
+     the same sustained real traffic. After ~40s (past the 30s stage grace
+     period) the reconciler rolled it back automatically.
+
+     THE DISTINGUISHING EVIDENCE — this is what separates "EC2 proven" from
+     "a fail-safe happened to fire":
+       AnalysisRun phase = Failed        (NOT Error, NOT Inconclusive)
+       measured value    = [1]           (a real 100% canary error rate)
+       message: 'Metric "canary-error-rate" assessed Failed due to
+                 failed (1) > failureLimit (0)'
+     Failed is the verdict Argo returns only when the query genuinely
+     evaluated and genuinely breached failureCondition. Error is the
+     no-data/consecutiveErrorLimit path; Inconclusive is the NaN path. Both of
+     those also roll back (fail-safe, by design), which is exactly why the
+     phase had to be checked rather than assumed.
+
+     Live metric at the moment of rollback, showing the regression isolated to
+     the canary cohort and NOT contaminating stable:
+       canary=true,  status=error   27
+       canary=true,  status=ok       6      (~82% canary error rate)
+       canary=false, status=ok    4491
+       canary=false, status=error    1      (~0.02% stable error rate)
+
+     Revert verification — stable was never touched:
+       model_active            still 0290afa3-... (the EC1 version)
+       etcd envelope           canary="", canary_percent=0
+       rollout.stable_version_id  0290afa3-... preserved
+       rollout.status          rolled_back (automatic; distinct from the
+                               "aborted" a human AbortRollout records)
+
+     Also proven earlier at the mechanism level (Step M): a hand-crafted
+     Successful AnalysisRun advanced canary_1 -> canary_10 with real etcd/DB
+     state movement, and the auto-created run's own genuine no-data error
+     triggered AutoRollback — establishing that the AUTOMATIC trigger fires
+     the shared advanceStage/revertCanary functions, not merely that those
+     functions work when a human calls them.
+
+EC3. ALL ADMIN ACTIONS ARE AUDITED; RBAC ENFORCED.
+     MET, in three independently-verified parts.
+
+     (a) AUDITED — exhaustive sweep, not a sample (Step R).
+     The mutating surface was enumerated FROM THE CONTRACT, not from memory:
+     admin.proto declares exactly six RPCs and its own header states every one
+     is a mutation; admin.graphql was grepped and confirmed to contain zero
+     Mutation types. The complete surface is therefore PublishModelVersion,
+     StartRollout, PromoteRollout, AbortRollout, CreateApiKey, RevokeApiKey —
+     nothing more.
+
+     Every exit path of all six handlers was read. ONE REAL GAP WAS FOUND:
+     CreateApiKey's GenerateRawKey() failure path returned an error with no
+     audit write, unlike every other failure path in the file. It is the one
+     branch with an already-resolved real actor that nonetheless skipped the
+     audit call. Fixed (50cc1cb). This gap is the concrete justification for
+     the audit-chokepoint tracked finding below — it is exactly the class of
+     omission a chokepoint prevents and a hand-wired approach permits.
+
+     Live evidence (24 audit_log rows at close-out) includes successes,
+     failures, and denials:
+       create_api_key                                  (success)
+       create_api_key_failed                           (real failure, audited)
+       revoke_api_key / revoke_api_key_failed
+       publish_model_version / publish_model_version_failed
+       /admin.v1.AdminService/CreateApiKey_denied      (RBAC denial)
+       /admin.v1.AdminService/RevokeApiKey_denied
+       /admin.v1.AdminService/PublishModelVersion_denied
+
+     Fail-loud holds for every mutating RPC: an audit-write failure AFTER a
+     real successful mutation still fails the RPC. An unaudited success must
+     never reach a caller. Unit-tested per RPC.
+
+     (b) RBAC ENFORCED — dual boundary (Step J), positive-controlled.
+     Sequence run live, in this order deliberately:
+       1. admin publishes            -> succeeds, real model_manifest row
+       2. viewer publishes           -> PermissionDenied, ZERO new row,
+                                        audit_log denial row written
+       3. admin publishes again      -> succeeds
+     Step 3 is what makes step 2 meaningful: the gate demonstrably
+     distinguishes two identities rather than having failed once.
+     Re-confirmed at Step T for the key RPCs: viewer denied CreateApiKey AND
+     RevokeApiKey (both audited), while the same viewer's read-only
+     listApiKeys still succeeded — proving the denial is action-scoped, not a
+     blanket lockout.
+
+     CROSS-SYSTEM boundary, the second half: a REAL tenant api_keys raw value
+     presented to admin-api was refused with Unauthenticated. The two
+     credential spaces are structurally disjoint — different tables, different
+     services, no shared rows — DESPITE sharing the same SHA-256 hash
+     function, which is what makes TestApiKeyHashNeverAuthenticatesAsAdmin a
+     meaningful proof rather than a trivially-true one.
+
+     (c) IMMUTABLE — storage-layer, positive-controlled (Step Q).
+     Connected AS the admin_api role (not root, which bypasses GRANTs):
+       UPDATE audit_log SET action='tampered' WHERE audit_id=189fdc9a-...
+         -> ERROR: user admin_api does not have UPDATE privilege on relation
+            audit_log   SQLSTATE 42501
+       DELETE FROM audit_log WHERE audit_id=189fdc9a-...
+         -> ERROR: user admin_api does not have DELETE privilege on relation
+            audit_log   SQLSTATE 42501
+       Row re-read afterward: byte-for-byte unchanged.
+     POSITIVE CONTROL: the same role's INSERT succeeded (new row confirmed
+     present). This proves the restriction is specifically "no UPDATE/DELETE
+     of existing rows", not a blanket permissions failure — the same
+     targeted-restriction shape Phase-04 Step C/F used for
+     model_active-can-update-but-model_manifest-cannot.
+
+     An audit trail that can be silently mutated is not an audit trail. (c) is
+     what makes (a)'s evidence load-bearing.
+
+EC4. NO PATH EXISTS TO MUTATE A LIVE MODEL OUTSIDE SIGNED MANIFESTS + ROLLOUT.
+     MET — proven adversarially at all three layers a bypass could hide in
+     (Step T), on top of four structural properties that make most of the
+     surface unrepresentable rather than merely refused.
+
+     LAYER 1 — DATABASE. Connected as the admin_api role:
+       SELECT * FROM model_manifest              -> 42501 (no SELECT privilege)
+       UPDATE model_manifest SET status=...      -> 42501
+       DELETE FROM model_manifest WHERE ...      -> 42501
+       UPDATE model_active SET active_version_id -> 42501  (flip the live
+                                                            pointer directly)
+       UPDATE rollout SET stage='stable',
+              status='promoted'                  -> 42501  (jump to 100%)
+     All five refused. Note the BARE SELECT is refused too: admin_api has zero
+     grants on these tables, not merely restricted ones. State re-read after
+     the attempts and confirmed unchanged (active_version_id still
+     0290afa3-..., manifest status still published, rollout still
+     canary_1/rolled_back).
+
+     LAYER 2 — NETWORK. A throwaway pod with no matching Cilium identity was
+     created in the default namespace and attempted to reach control-plane:
+       nc control-plane.default.svc.cluster.local 50051  -> hung to timeout
+       nc control-plane.default.svc.cluster.local 8080   -> hung to timeout
+     POSITIVE CONTROL, from the SAME pod in the same session:
+       nc prometheus-server.default.svc.cluster.local 80 -> "succeeded!"
+     This is what proves the hangs are Cilium's default-deny silently
+     dropping, and not general network breakage or a bad DNS resolution.
+
+     LAYER 3 — API PARAMETER. Crafted requests attempting to skip staging:
+       CreateRollout   {..., "canary_percent":100, "target_stage":"stable"}
+         -> message type control.v1.CreateRolloutRequest has no known field
+            named canary_percent
+       PromoteRollout  {..., "target_stage":"stable", "new_percent":100}
+         -> message type admin.v1.PromoteRolloutRequest has no known field
+            named target_stage
+       StartRollout    {..., "initial_percent":100}
+         -> message type admin.v1.StartRolloutRequest has no known field
+            named initial_percent
+     The request could not even be CONSTRUCTED. This is stronger than a
+     server-side rejection: there is no field to send, so there is nothing for
+     a validation check to have to catch.
+
+     STRUCTURAL ENFORCEMENTS (why the above is a floor, not the whole story):
+       - NO BYPASS VERB. Neither admin.proto nor control.proto defines an RPC
+         that sets model_active directly, nor an "instant activate". A verb
+         that does not exist cannot be invoked by any caller, however
+         privileged.
+       - PARAMETERLESS PROMOTE. PromoteRolloutRequest carries only rollout_id.
+         Stage progression comes exclusively from control-plane's fixed
+         internal stageOrder slice; the next stage is computed, never
+         supplied. Unit-tested, and confirmed by reading advanceStage.
+       - TYPE-LEVEL READ/WRITE SPLIT. graph.controlReader (U1b) has no
+         RegisterModelManifest/CreateRollout/PromoteRollout/AbortRollout
+         method, so a GraphQL resolver cannot invoke a mutation — it will not
+         compile. Same for providerHealthReader (one method), so admin-api
+         structurally cannot originate provider traffic via Invoke.
+       - NETWORK-UNREACHABLE AUTOMATIC PATH. The reconciler is a plain
+         goroutine with no listener of any kind. There is no port to reach it
+         on, so no network policy is even required to protect it.
+       - PANEL HAS NO DIRECT ACCESS. admin-panel has no database client, no
+         Vault client and no etcd client. Every action goes through admin-api.
+       - ADMIN-API HAS NO VAULT OR ETCD CLIENT either — it cannot sign or
+         publish a manifest even if its own RBAC were bypassed.
+
+--------------------------------------------------------------------------------
+CROSS-PHASE TOUCH — THE PHASE-04 ACTIVATION FIX (STEP H)
+--------------------------------------------------------------------------------
+Recorded explicitly because it modifies a Phase-04 service, and this phase was
+chartered as a consumer of Phase-04.
+
+WHAT CHANGED. control-plane's RegisterModelManifest previously activated every
+newly-registered manifest version unconditionally. That was correct for
+Phase-04, where registration was the only way a version came into existence and
+there was no other mechanism to make one live. It is wrong the moment a canary
+system exists: publishing a new version would have instantly redirected 100% of
+live traffic to it, which is precisely the outage class this entire phase
+exists to eliminate — and would have made EC1, EC2 and EC4 unprovable.
+
+The fix makes activation CONDITIONAL: a manifest for a model_ref with no
+active version yet still bootstraps (first-ever version must become live, or
+nothing could ever serve), but a model_ref that already has an active version
+is published INERT, awaiting a rollout. Extracted as
+registry.Service.ActivateVersion, which is now the single "make this version
+live" path shared by the bootstrap branch and rollout's own promotion
+transition — one implementation, two callers.
+
+WHAT DID NOT CHANGE, and was re-verified afterward:
+  - Manifest immutability. model_manifest is still INSERT-only at the DB role
+    level; nothing about the immutability grant was touched.
+  - Vault Transit signing. Every version is still signed on write, with the
+    identical signed_payload construction.
+  - Independent verification. data-plane and edge-gateway still verify every
+    manifest themselves; unchanged code, re-confirmed live at Step P when both
+    services re-verified all six openai versions after a restart.
+  - The etcd distribution path and the PublishActive envelope shape.
+
+HONEST FRAMING. This is not a Phase-04 defect that went unnoticed. Phase-04
+had no consumer that could distinguish "publish" from "activate", so the two
+were legitimately fused; the seam only becomes visible when the first consumer
+that needs them separated arrives. It IS, however, a real change to a
+previously-completed phase's service, made in this phase, and is recorded as
+such rather than folded silently into Step H.
+
+--------------------------------------------------------------------------------
+SECURITY INCIDENT — ADMIN TOKEN PRINTED TO TRANSCRIPT (STEP U2)
+--------------------------------------------------------------------------------
+WHAT HAPPENED. While verifying the panel's login flow, the full HTTP response
+headers of a successful Server Action POST were printed, including:
+
+  set-cookie: onezox_admin_session=<RAW ADMIN TOKEN>; Path=/; Secure;
+              HttpOnly; SameSite=strict
+
+The intent was to verify the three cookie ATTRIBUTES (Secure, HttpOnly,
+SameSite). The attributes were the only thing that needed to be observed. The
+credential value was printed alongside them because the whole header was
+echoed rather than filtered.
+
+DISCLOSURE AND CONTAINMENT. Disclosed immediately and unprompted in the same
+turn it occurred. Both credentials seeded for that test (the admin and the
+viewer of org phase05-panel-test) were revoked within the same turn via
+admin_user.revoked_at.
+
+PROVEN DEAD, not merely assumed revoked:
+  leaked token -> admin-api GraphQL       HTTP 401
+  leaked token -> panel session cookie    307 -> /login
+Both re-tested after revocation. The revocation path itself is therefore also
+now live-verified, which it had not been before this incident.
+
+BLAST RADIUS: nil. The org (phase05-panel-test) was created solely for this
+verification, held no data, and both of its credentials are revoked. No
+production or long-lived credential was involved.
+
+THIS IS THE THIRD CREDENTIAL-INTO-TRANSCRIPT INCIDENT in this build:
+  1. Phase-04: `kubectl get secret -o yaml` printed base64-encoded provider
+     keys (base64 is encoding, not encryption).
+  2. Phase-04: grpcurl against IssueProviderToken printed the full response,
+     including the Vault-issued token.
+  3. Phase-05 (this): curl printed the full Set-Cookie header, including the
+     admin session token.
+
+ROOT CAUSE IS CONSISTENT ACROSS ALL THREE, and it is not carelessness about
+what is sensitive — in every case the sensitivity was known and the rule was
+known. The pattern is: verification printed a WHOLE RESPONSE when only a
+SHAPE or an ATTRIBUTE needed checking. CLAUDE.md's rule ("verify field NAMES /
+response SHAPE only") is correct and was understood each time; it failed three
+times because it is enforced by discipline at the exact moment attention is on
+something else (here: reverse-engineering an unfamiliar wire format, after
+several failed attempts). See the first TRACKED FINDING for the structural fix
+this warrants.
+
+--------------------------------------------------------------------------------
+TRACKED FINDINGS (CARRIED FORWARD — NOT DONE THIS PHASE)
+--------------------------------------------------------------------------------
+1. LEAK-SAFE VERIFICATION HELPER — highest-value hardening available.
+   "Assert credential attributes, never print the value" has now failed three
+   times on discipline (see SECURITY INCIDENT). Every other invariant of
+   comparable importance in this system has been made STRUCTURAL rather than
+   procedural, and each time that conversion is what actually held:
+     - `import 'server-only'`      -> a Client Component importing the session
+                                      module is a BUILD failure, not a review
+                                      catch.
+     - parameterless PromoteRollout -> a stage jump is unrepresentable, not
+                                      merely rejected.
+     - controlReader as a type      -> a resolver mutation will not compile.
+     - GRANT-based immutability     -> the database refuses, not the app.
+   The equivalent here is a small verification helper that takes a response
+   and a list of expected attributes and prints ONLY pass/fail per attribute,
+   with no code path that can emit the underlying value. This is the one
+   remaining leak class in this build still resting on discipline rather than
+   structure, and the three-strike record is the argument for converting it.
+
+2. AUDIT CHOKEPOINT FOR SUCCESS/FAILURE.
+   Current state is HYBRID, and the two halves differ in strength:
+     - DENIAL audit is CHOKEPOINT-enforced (authz.UnaryInterceptor runs on
+       every gRPC call before any handler body) and, as of Step R, unit-tested
+       across all six methods. A future RPC is covered automatically.
+     - SUCCESS/FAILURE audit is HAND-WIRED per handler. It works — Step R
+       verified all six exhaustively — but it is REINTRODUCIBLE: a future
+       mutating RPC could ship with a handler that omits audit.Write and
+       nothing would fail at compile time. The CreateApiKey gap found in Step R
+       is not hypothetical evidence for this; it is an instance of it.
+   Harden to a response-side interceptor or codegen check so all audit
+   coverage is unskippable by construction, matching denial.
+
+3. BOOT-TIME REGISTRATION RETRY — RECURRING (hit twice).
+   Services that fail their boot-time Vault/manifest registration fail CLOSED
+   and stay broken permanently, with no automatic retry. The fail-closed
+   behaviour is CORRECT and should not change. What is missing is recovery:
+   a service that booted during a transient Vault/DNS outage remains dead
+   until a human restarts it, even after the dependency is healthy again.
+     - Phase-04 Step U: first occurrence.
+     - Phase-05 Step P: data-plane booted during a WSL2-restart DNS/Vault
+       window and marked all six openai manifests permanently untrusted;
+       provider-gateway booted in the same window and registered ZERO provider
+       adapters. Both required a manual `kubectl rollout restart`. This was
+       discovered only because it broke a live proof.
+   Should be retry-with-backoff so the service self-recovers when the
+   dependency returns. Tracked as a resilience-hardening item, not a
+   correctness defect.
+
+4. STATEFUL-LAYER GITOPS ADOPTION — deferred to a cloud phase.
+   The observability stack is now Argo CD-managed with self-heal proven (see
+   PROBLEMS #2). The stateful layer — CockroachDB, etcd, Redis, MinIO, Vault,
+   plus argo-rollouts — remains manually managed. Deferred deliberately:
+   adopting them requires a per-component drift check and a backup/restore
+   story first, because a values mismatch there risks data loss or Raft
+   corruption rather than a briefly-wrong dashboard. To be done per-component,
+   with backups, in a cloud phase.
+
+5. ADMIN-PANEL EXPOSES NO /metrics.
+   Every backend service in this fleet exposes Prometheus metrics; the panel
+   does not. Named here rather than papered over — panel request metrics would
+   be a real addition, and adding an empty endpoint purely for consistency
+   would be worse than the honest gap. Its CiliumNetworkPolicy correspondingly
+   has no Prometheus ingress rule.
+
+6. CARRIED DEFERRALS FROM EARLIER PHASES, still open and unchanged:
+   F13 (Gemini, suspended), F2 (KEDA -> P13), provider-gateway HPA,
+   usd_cost wiring (-> P06), Redis working-memory isolation model
+   (documented), F11 (panel traces/cost/eval inert until P12/P13 — see below).
+
+--------------------------------------------------------------------------------
+F11 — SCAFFOLDED-BUT-INERT PANEL SECTIONS (SCOPE HELD)
+--------------------------------------------------------------------------------
+REAL, consuming live resolvers: dashboard, model-studio, rollouts, keys,
+providers, audit.
+
+INERT, wired to no data source: traces (P13), cost (P13, plus usd_cost wiring
+in P06), playground/eval (P12).
+
+The inert sections render a component that shows NO chart, NO table, NO sample
+numbers and no loading affordance — verified live: all three return HTTP 200
+with exactly 0 `<table>` elements and the text "Not implemented yet" plus the
+naming of the phase that will populate them. They are additionally tagged
+"later" in the navigation so an operator can tell before clicking.
+
+This was a deliberate design decision, not a shortcut: a convincing placeholder
+sitting beside genuinely real rollout and circuit-breaker state is an
+operational hazard, because an operator cannot distinguish a good mock from
+real data. Honest empty beats fabricated complete.
+
+--------------------------------------------------------------------------------
+PROBLEMS ENCOUNTERED AND RESOLVED
+--------------------------------------------------------------------------------
+1. RECONCILER STALLED FOREVER ON "Inconclusive" (Step O, live-caught).
+   With this project's own count:1 AnalysisRun spec, Inconclusive is Argo
+   Rollouts' TERMINAL verdict — status.completedAt is already set and the
+   object never re-evaluates. The reconciler grouped Inconclusive with
+   Pending/Running ("still waiting"), so a rollout that hit a 0/0 NaN once was
+   orphaned at that stage permanently. Fixed: Inconclusive now shares
+   AutoRollback with Failed/Error — an ambiguous SLO verdict must not promote
+   an unvetted canary to more live traffic, and must not hang either. Same
+   fail-safe discipline as the consecutiveErrorLimit fix from Step M.
+   (2bc126e, b9e88a6)
+
+2. NO GRACE PERIOD BEFORE THE FIRST EVALUATION (Step O, live-caught).
+   The reconciler created a stage's AnalysisRun immediately on entering the
+   stage, and Argo evaluated it within ~1 second — structurally before any
+   canary-labelled request could have been recorded. Every stage's query was
+   therefore a deterministic 0/0 (NaN), for every rollout, healthy or not.
+   Not a flaky timing issue: a race the reconciler always lost.
+   Fixed by adding rollout.stage_entered_at (migration 0021) and a 30s
+   stageGracePeriod checked before CreateForStage. DB-persisted rather than an
+   in-memory timer, so it survives a control-plane restart mid-canary exactly
+   like every other piece of rollout state. Without this fix EC1 was
+   unprovable. (98fb5a6, d68e5bb)
+
+3. PROMETHEUS SCRAPE-TARGET DRIFT — live cluster vs git (Step N).
+   data_plane_submit_total was emitted correctly but invisible to Prometheus.
+   The live scrape config still listed `dataplane-stub` — a service removed
+   back in Phase-03 Step J — and never listed `data-plane` at all.
+   IMMEDIATE FIX: `helm upgrade prometheus -f prometheus-values.yaml`, after
+   which all four onezox targets reported up.
+   ROOT CAUSE, which is the more important finding: platform/operators/ was
+   OUTSIDE Argo CD entirely. Only platform/stubs/ had a reconciler. The values
+   file had been correct in git since Phase-03; nothing ever compared it to the
+   live Helm release, so the drift persisted silently for months and was found
+   only by accident while verifying a different thing.
+   PERMANENT FIX: six Argo CD Applications (prometheus, grafana, loki, tempo,
+   promtail, otel-collector) adopting the existing releases via multi-source
+   (remote chart + this repo's values via $values, helm.releaseName pinned for
+   adoption). Every diff was inspected with `argocd app diff` BEFORE enabling
+   automated sync: five were clean no-ops (only Argo's own additive tracking-id
+   annotation); tempo showed one inert extra key traced to an
+   argocd-repo-server Helm v3.19.4 vs local v4.2.3 template-rendering
+   difference, accepted as a single safe restart of a MinIO-backed collector.
+   SELF-HEAL PROVEN, not assumed: the live ConfigMap was hand-edited back to
+   the exact `dataplane-stub` drift that caused the original incident. Argo
+   reverted it in under 30 seconds, with `initiatedBy: {automated: true}` in
+   the operation history.
+   POSITIVE CONTROL: a legitimate git change (adding admin-api's own /metrics
+   as a scrape target — an endpoint that existed since Step E but was never
+   wired) synced through normally and was confirmed `up` in Prometheus's
+   targets API. Self-heal that also blocked real changes would be a different
+   kind of broken. (3c01c49, 8738ef3)
+   SCOPE NOTE ON PRIOR CLAIMS: Phase-03-Complete.txt states dataplane-stub's
+   "Prometheus scrape target" was confirmed gone. That claim was TRUE and
+   remains true — it was about the stub's target being removed from the
+   committed values file. It never claimed data-plane's own target was being
+   scraped, and no prior phase's telemetry claim depended on it. No earlier
+   completion record requires correction.
+
+4. admin_api COULD NOT INSERT INTO api_keys (Step S, live-caught).
+   CreateApiKey failed with "user admin_api does not have SELECT privilege on
+   relation tenants (SQLSTATE 42501)". api_keys.org_id REFERENCES tenants, and
+   CockroachDB/Postgres FK enforcement requires SELECT on the REFERENCED table
+   to validate the constraint — not merely INSERT on the table being written.
+   Fixed by migration 0022 (GRANT SELECT ON tenants TO admin_api). Read-only,
+   and it touches none of the model_manifest/model_active/policy/pricing
+   tables EC4's DB-layer proof depends on. (e5c8f95)
+
+5. STRING[] COLUMN WOULD NOT SCAN (Step S, live-caught).
+   listApiKeys failed with "unsupported Scan, storing driver.Value type string
+   into type *[]string". pgx/v5's database/sql driver returns an array
+   column's raw value before Scan knows the destination Go type, so a bare
+   *[]string destination cannot decode it. Fixed with pgtype.Map.SQLScanner,
+   pgx's own documented workaround. api_keys.scopes is this project's first
+   STRING[] read. (4b1f263)
+
+6. CreateApiKey AUDIT GAP (Step R) — see EC3(a). Found by the exhaustive
+   sweep, not by a test failure, which is the point of doing the sweep by
+   reading every exit path rather than trusting existing coverage.
+
+7. ADMIN TOKEN PRINTED TO TRANSCRIPT (Step U2) — see SECURITY INCIDENT.
+
+8. runAsNonRoot REJECTED THE PANEL'S NAMED USER (Step V).
+   The first admin-panel rollout failed with CreateContainerConfigError:
+   "container has runAsNonRoot and image has non-numeric user (node), cannot
+   verify user is non-root". kubelet cannot verify a NAMED user against
+   runAsNonRoot. Fixed with an explicit numeric runAsUser: 1000. (676b338)
+
+9. TRANSIENT ISSUES, recurring and not treated as defects: CockroachDB
+   "remote wall time is too far ahead" clock-skew errors (a known WSL2
+   artifact, always resolved by a short retry — the reconciler's own error
+   handling tolerates them by design), and stale kubectl port-forwards after
+   pod rollovers.
+
+--------------------------------------------------------------------------------
+SERVICES, CONTRACTS AND SCHEMA ADDED THIS PHASE
+--------------------------------------------------------------------------------
+NEW SERVICES
+  admin-api    (Go)  — gRPC command surface + query-only GraphQL. gRPC client
+                       of control-plane (registry + rollout) and of
+                       provider-gateway (ProviderHealth only). No Vault client,
+                       no etcd client, and zero DB grants on Phase-04's tables.
+  admin-panel  (TS)  — Next.js 16 RSC operator console. No database client, no
+                       Vault client, no etcd client; reaches everything through
+                       admin-api.
+
+CONTRACTS
+  proto/admin/v1/admin.proto     six mutating RPCs (the complete command
+                                 surface; no bypass verb, no stage/percent
+                                 field anywhere)
+  proto/admin/v1/admin.graphql   query-only; zero Mutation types
+  proto/control/v1/control.proto CreateRollout, PromoteRollout, AbortRollout,
+                                 GetRolloutStatus (Step L) + ListRollouts
+                                 (Step U1a, a read)
+
+MIGRATIONS
+  0015 admin_user                 identity + credential_hash + revoked_at
+  0016 rollout
+  0017 audit_log                  immutable append
+  0018 admin_api role             least-privilege grants
+  0019 rollout.stable_version_id  captured at CreateRollout; not derivable later
+  0020 rollout grants             GRANT to control_plane, REVOKE from admin_api
+                                  — a genuine EC4 tightening, not just a fix
+  0021 rollout.stage_entered_at   the Step O grace period, DB-persisted
+  0022 tenants SELECT to admin_api  the FK-validation grant
+
+--------------------------------------------------------------------------------
+FINAL VERIFICATION RESULTS FOR EVERY COMPONENT
+--------------------------------------------------------------------------------
+Argo Rollouts            — installed; AnalysisRun used STANDALONE (no owning
+                           Rollout object), a documented usage pattern. This is
+                           a disclosed ADAPTATION: this system's canary
+                           traffic-shifting is Step K's etcd envelope, because
+                           a "model" is a config row and not a Kubernetes
+                           workload, so Argo's native pod-traffic mechanism
+                           does not apply. Argo Rollouts supplies the analysis
+                           state machine only.
+rollout state machine    — 1/10/50/100 progression, promote, abort, and the
+                           crafted-jump rejection all unit-tested; ListRollouts
+                           limit default AND clamp asserted through the store's
+                           own recorded limit (not just result length, which
+                           would pass with no clamp at all).
+in-process reconciler    — drives real state (verified in etcd and CockroachDB,
+                           not from logs); restart re-attach proven by unit
+                           test AND by three real pod restarts mid-canary, the
+                           last driven through to a genuine stable/promoted
+                           completion.
+data_plane_submit_total  — {model_ref, canary, status}; success AND failure
+                           paths both confirmed emitting live, with the
+                           canary/stable split unambiguous under real traffic.
+                           is_canary captured once at resolve()-time and
+                           threaded unchanged through provider-health
+                           rerouting.
+admin-api authn/RBAC     — 49 Go tests passing; default-deny allow-list;
+                           unknown-method-denied-to-every-role covered.
+control-plane            — 45 Go tests passing.
+data-plane               — 61 Python tests passing; ruff clean.
+admin-panel              — TypeScript build clean; 13 routes; login/session,
+                           auth gate, all functional pages and all three inert
+                           pages verified live against the real cluster.
+Cookie flags             — Path=/; Secure; HttpOnly; SameSite=strict, observed
+                           on the wire (this observation is also the source of
+                           the SECURITY INCIDENT above).
+audit_log                — 24 rows at close-out spanning successes, failures
+                           and denials; UPDATE/DELETE refused at the database.
+Argo CD                  — 7 Applications, all Synced/Healthy: onezox-stubs
+                           plus the six observability operators adopted this
+                           phase.
+Deployed images at close-out
+  control-plane   aa53e21     admin-api      77d05a1     admin-panel  a019489
+  data-plane      bc32e06     edge-gateway   e28ff33     provider-gateway 58a401a
+Final cluster state
+  rollout table: 1 promoted (EC1), 7 rolled_back (EC2 plus the pre-fix
+                 diagnostic runs from Step O)
+  /onezox/active/openai:
+                 {"stable":"0290afa3-...","canary":"","canary_percent":0}
+
+--------------------------------------------------------------------------------
+COMPLETION CHECKLIST (PHASE-05.TXT'S OWN SIX ITEMS, WITH EVIDENCE)
+--------------------------------------------------------------------------------
+[x] Admin panel + Model Studio operational.
+    Next.js RSC panel deployed via Argo CD, 1/1 Running. Model Studio reads the
+    active manifest, edits it, shows a byte-exact diff, publishes a signed
+    version, and drives canary start/promote/abort. Diff compares the EXACT
+    bytes to be published (no normalising) because control-plane signs those
+    bytes and every consumer re-verifies them independently.
+[x] admin-api (gRPC + GraphQL) bridging panel <-> control-plane.
+    All six commands and all nine queries implemented and live-verified.
+[x] Canary rollout with staged traffic + metric gates.
+    EC1: 1 -> 10 -> 50 -> 100 automatically, on real AnalysisRun evaluations of
+    a real Prometheus metric.
+[x] Automatic rollback on SLO regression.
+    EC2: phase=Failed, measured value [1], with the regression isolated to the
+    canary cohort.
+[x] audit_log captures every admin action.
+    EC3(a): exhaustive contract-derived sweep; one gap found and fixed;
+    immutability proven separately at the storage layer.
+[x] API-key management (hashed) in the panel.
+    create/revoke/list live-verified. Raw key returned exactly once and never
+    persisted; listApiKeys exposes neither the raw key NOR the hash — the SQL
+    never selects the hash column and the GraphQL type has no field that could
+    hold one (two independent layers).
+
+--------------------------------------------------------------------------------
+EXIT CRITERIA SUMMARY  [GATES MILESTONE M2]
+--------------------------------------------------------------------------------
+EC1 (authored, published, canaried to 100%)  — MET. Signal-driven: three
+    AnalysisRuns, all phase=Successful, all measured value [0]. Two real
+    reconciler bugs found and fixed to get here; without them EC1 was
+    unprovable.
+EC2 (induced regression -> automatic rollback) — MET. Signal-driven:
+    phase=Failed with measured value [1], distinguishable from both the
+    empty-data (Error) and NaN (Inconclusive) fail-safes. Canary 27err/6ok vs
+    stable 4491ok/1err.
+EC3 (all admin actions audited; RBAC enforced) — MET. Exhaustive sweep with one
+    real gap found and fixed; RBAC proven on both boundaries (within-admin
+    viewer denial, positive-controlled; and cross-system tenant-key refusal);
+    audit_log immutability proven at the storage layer with a positive control.
+EC4 (no path to mutate a live model outside signed manifests + rollout) — MET.
+    Proven adversarially at the DB layer (42501, including a bare SELECT), the
+    network layer (Cilium drop with a positive control from the same pod), and
+    the API-parameter layer (the crafted request is unrepresentable in the
+    contract), on top of six structural properties.
+
+MILESTONE M2 — SAFE MODEL OPS: all four exit criteria met and adversarially
+verified. An operator can author a virtual-model version in Model Studio,
+publish it as a signed immutable manifest, and roll it out by staged canary
+with automatic rollback on real SLO regression — with every action audited, RBAC
+enforced, and no path to mutate live traffic outside that flow.
+
+================================================================================
+END OF PHASE-05-COMPLETE.TXT
+================================================================================
