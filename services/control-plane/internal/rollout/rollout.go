@@ -97,6 +97,12 @@ type Rollout struct {
 	StableVersionID string
 	StartedAt       time.Time
 	EndedAt         *time.Time
+	// StageEnteredAt is when the CURRENT stage began (distinct from
+	// StartedAt, the whole rollout's start) — data/migrations/0021, Step
+	// O fix. UpdateRollout refreshes it on every write; the reconciler
+	// uses it to withhold a stage's AnalysisRun until real traffic has
+	// had a chance to land, see analysis.stageGracePeriod.
+	StageEnteredAt time.Time
 }
 
 // Store is rollout's own persistence boundary — CockroachStore

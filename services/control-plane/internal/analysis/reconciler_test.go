@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/onezox/OneZox/services/control-plane/internal/rollout"
 )
@@ -34,7 +35,40 @@ func testSetup(t *testing.T) (*Reconciler, *FakeDriver, *FakeClient, *rollout.Fa
 	driver := NewFakeDriver(svc)
 	client := NewFakeClient()
 	r := NewReconciler(driver, client, log)
+	// Tests exercise reconcileOne's phase handling directly and don't
+	// care about the stageGracePeriod race Step O's live proof caught —
+	// zero it out so CreateForStage fires on the very next reconcileAll
+	// call, same as before that fix existed.
+	r.stageGrace = 0
 	return r, driver, client, reg, rolloutID
+}
+
+// TestReconcilerWithholdsAnalysisRunDuringStageGrace is the Step O fix's
+// own proof: a stage that JUST started (StageEnteredAt ~= now) must NOT
+// get an AnalysisRun yet, and one that has been active longer than
+// stageGrace must. Live-caught as a real stall/false-negative — without
+// this gate, every stage's single measurement raced against real
+// traffic and lost, deterministically.
+func TestReconcilerWithholdsAnalysisRunDuringStageGrace(t *testing.T) {
+	r, _, client, _, _ := testSetup(t)
+	r.stageGrace = 30 * time.Second // undo testSetup's own override
+	ctx := context.Background()
+
+	r.reconcileAll(ctx)
+	if len(client.CreateCalls) != 0 {
+		t.Fatalf("got %d CreateForStage calls before stageGrace elapsed, want 0", len(client.CreateCalls))
+	}
+
+	// FakeStore.UpdateRollout always stamps StageEnteredAt = time.Now(),
+	// so rather than sleeping the real 30s default, shrink stageGrace to
+	// something a short real sleep can clear — same comparison
+	// (time.Since(StageEnteredAt) < r.stageGrace), just a faster clock.
+	r.stageGrace = 1 * time.Millisecond
+	time.Sleep(2 * time.Millisecond)
+	r.reconcileAll(ctx)
+	if len(client.CreateCalls) != 1 {
+		t.Fatalf("got %d CreateForStage calls after stageGrace elapsed, want 1", len(client.CreateCalls))
+	}
 }
 
 func TestReconcilerCreatesAnalysisRunForNewRollout(t *testing.T) {
@@ -241,6 +275,7 @@ func TestReconcilerRestartReattach(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	driver2 := NewFakeDriver(r1.driver.(*FakeDriver).svc)
 	r2 := NewReconciler(driver2, client, log)
+	r2.stageGrace = 0
 
 	// Argo Rollouts itself completed the analysis while "control-plane"
 	// was down — this is the missed-window case, the harder half of R's

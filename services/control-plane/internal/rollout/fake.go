@@ -90,6 +90,7 @@ func (f *FakeStore) UpdateRollout(ctx context.Context, rolloutID, stage, status 
 	r.Stage = stage
 	r.Status = status
 	r.EndedAt = endedAt
+	r.StageEnteredAt = time.Now()
 	return nil
 }
 

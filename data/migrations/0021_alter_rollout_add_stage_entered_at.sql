@@ -1,0 +1,15 @@
+-- Phase-05 Step O fix: stage_entered_at tracks when the CURRENT stage
+-- began, distinct from started_at (the whole rollout's own start). The
+-- in-process reconciler (internal/analysis/reconciler.go) needs this to
+-- withhold creating a stage's AnalysisRun until real canary traffic has
+-- had a chance to land — live-caught during Step O's healthy-canary
+-- proof: without a grace period, the reconciler created (and Argo
+-- Rollouts immediately evaluated) each stage's AnalysisRun within ~1
+-- second of the stage starting, before any canary-labeled request could
+-- possibly have been recorded, making every stage's query a
+-- deterministic 0/0 (NaN) regardless of the canary's true health.
+--
+-- DB-persisted (not an in-memory reconciler timer) so the grace period
+-- survives a control-plane restart mid-canary the same way every other
+-- piece of rollout state already does (Step M's restart re-attach).
+ALTER TABLE rollout ADD COLUMN IF NOT EXISTS stage_entered_at TIMESTAMPTZ NOT NULL DEFAULT now();

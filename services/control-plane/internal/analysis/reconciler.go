@@ -43,14 +43,28 @@ type RolloutDriver interface {
 // the new process comes up — never orphaned waiting for a watch stream
 // that was never re-established.
 type Reconciler struct {
-	driver   RolloutDriver
-	runs     Client
-	log      *slog.Logger
-	interval time.Duration
+	driver       RolloutDriver
+	runs         Client
+	log          *slog.Logger
+	interval     time.Duration
+	stageGrace time.Duration
 }
 
+// stageGracePeriod is how long a stage must have been active (Rollout.
+// StageEnteredAt, data/migrations/0021) before the reconciler will
+// create its AnalysisRun. Live-caught during Step O's healthy-canary
+// proof: with no grace period, the AnalysisRun's own single measurement
+// fired within ~1 second of the stage starting — before any canary-
+// labeled request could possibly exist yet, making the query a
+// deterministic 0/0 (NaN) regardless of the canary's true health, every
+// time, for every stage. 30s covers at least two Prometheus scrape
+// intervals (15s default) plus buffer for real traffic to land, so the
+// eventual single measurement reflects genuine canary behavior instead
+// of a structural race.
+const stageGracePeriod = 30 * time.Second
+
 func NewReconciler(driver RolloutDriver, runs Client, log *slog.Logger) *Reconciler {
-	return &Reconciler{driver: driver, runs: runs, log: log, interval: 5 * time.Second}
+	return &Reconciler{driver: driver, runs: runs, log: log, interval: 5 * time.Second, stageGrace: stageGracePeriod}
 }
 
 // Run blocks until ctx is cancelled. Calls reconcileAll immediately, on
@@ -105,6 +119,14 @@ func (r *Reconciler) reconcileOne(ctx context.Context, ro rollout.Rollout) {
 	}
 
 	if run == nil {
+		// Withhold creation until the stage has been active for at least
+		// stageGrace (data/migrations/0021's stage_entered_at) — see the
+		// constant's own doc comment. Not an error, just not yet time;
+		// the next tick re-checks the same DB-persisted timestamp, so
+		// this survives a restart exactly like everything else here.
+		if time.Since(ro.StageEnteredAt) < r.stageGrace {
+			return
+		}
 		// No analysis in flight for this stage. Covers three cases with
 		// the SAME code path, deliberately: a rollout that just entered
 		// this stage and has no AnalysisRun yet; a previous tick that

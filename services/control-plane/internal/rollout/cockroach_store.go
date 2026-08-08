@@ -29,7 +29,7 @@ func (c *CockroachStore) InsertRollout(ctx context.Context, r Rollout) error {
 
 func (c *CockroachStore) GetRollout(ctx context.Context, rolloutID string) (*Rollout, error) {
 	row := c.db.QueryRowContext(ctx, `
-		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at
+		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at, stage_entered_at
 		FROM rollout WHERE rollout_id = $1
 	`, rolloutID)
 	return scanRollout(row)
@@ -37,7 +37,7 @@ func (c *CockroachStore) GetRollout(ctx context.Context, rolloutID string) (*Rol
 
 func (c *CockroachStore) GetRunningRolloutByModelRef(ctx context.Context, modelRef string) (*Rollout, error) {
 	row := c.db.QueryRowContext(ctx, `
-		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at
+		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at, stage_entered_at
 		FROM rollout WHERE model_ref = $1 AND status = 'running'
 		ORDER BY started_at DESC LIMIT 1
 	`, modelRef)
@@ -46,7 +46,7 @@ func (c *CockroachStore) GetRunningRolloutByModelRef(ctx context.Context, modelR
 
 func (c *CockroachStore) ListRunningRollouts(ctx context.Context) ([]Rollout, error) {
 	rows, err := c.db.QueryContext(ctx, `
-		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at
+		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at, stage_entered_at
 		FROM rollout WHERE status = 'running'
 	`)
 	if err != nil {
@@ -67,16 +67,21 @@ func (c *CockroachStore) ListRunningRollouts(ctx context.Context) ([]Rollout, er
 
 func (c *CockroachStore) GetMostRecentRolloutByModelRef(ctx context.Context, modelRef string) (*Rollout, error) {
 	row := c.db.QueryRowContext(ctx, `
-		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at
+		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at, stage_entered_at
 		FROM rollout WHERE model_ref = $1
 		ORDER BY started_at DESC LIMIT 1
 	`, modelRef)
 	return scanRollout(row)
 }
 
+// UpdateRollout always refreshes stage_entered_at to now() — every call
+// site either genuinely changes the stage (advanceStage) or terminalizes
+// the rollout (revertCanary, which the reconciler never reconciles again
+// since ListRunningRollouts only returns status='running'), so there is
+// no call site where refreshing it unconditionally is wrong.
 func (c *CockroachStore) UpdateRollout(ctx context.Context, rolloutID, stage, status string, endedAt *time.Time) error {
 	_, err := c.db.ExecContext(ctx, `
-		UPDATE rollout SET stage = $2, status = $3, ended_at = $4 WHERE rollout_id = $1
+		UPDATE rollout SET stage = $2, status = $3, ended_at = $4, stage_entered_at = now() WHERE rollout_id = $1
 	`, rolloutID, stage, status, endedAt)
 	return err
 }
@@ -99,7 +104,7 @@ func scanRollout(row scanRow) (*Rollout, error) {
 	var r Rollout
 	if err := row.Scan(
 		&r.RolloutID, &r.ModelRef, &r.VersionID, &r.StrategyJSON,
-		&r.Stage, &r.Status, &r.StableVersionID, &r.StartedAt, &r.EndedAt,
+		&r.Stage, &r.Status, &r.StableVersionID, &r.StartedAt, &r.EndedAt, &r.StageEnteredAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
