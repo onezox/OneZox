@@ -120,6 +120,12 @@ type Store interface {
 	// property of the reconcile loop's own normal operation, not a
 	// special-cased "recovery" code path run once at startup.
 	ListRunningRollouts(ctx context.Context) ([]Rollout, error)
+	// ListRollouts is Step U1a's own addition — the read backing the
+	// ListRollouts RPC (control.proto), which exists because admin-api
+	// deliberately has NO DB grant on this table (migration 0020).
+	// modelRef empty means every model; limit is always non-zero by the
+	// time it reaches here (Service.ListRollouts applies the default).
+	ListRollouts(ctx context.Context, modelRef string, limit int) ([]Rollout, error)
 	UpdateRollout(ctx context.Context, rolloutID, stage, status string, endedAt *time.Time) error
 }
 
@@ -285,6 +291,28 @@ func (s *Service) GetRolloutStatus(ctx context.Context, rolloutID, modelRef stri
 		return nil, ErrNotFound
 	}
 	return r, nil
+}
+
+// DefaultRolloutListLimit bounds ListRollouts when a caller passes 0 —
+// a panel list view never needs the whole table, and defaulting to
+// unbounded would make an accidental full scan the path of least
+// resistance.
+const DefaultRolloutListLimit = 50
+
+// maxRolloutListLimit caps what a caller can ask for, so a crafted
+// limit can't turn this read into a full-table scan either.
+const maxRolloutListLimit = 500
+
+// ListRollouts is a READ (the query side, same as GetRolloutStatus) —
+// no state changes here. modelRef empty lists every model.
+func (s *Service) ListRollouts(ctx context.Context, modelRef string, limit int) ([]Rollout, error) {
+	if limit <= 0 {
+		limit = DefaultRolloutListLimit
+	}
+	if limit > maxRolloutListLimit {
+		limit = maxRolloutListLimit
+	}
+	return s.store.ListRollouts(ctx, modelRef, limit)
 }
 
 // advanceStage is THE one implementation of "move this rollout to its

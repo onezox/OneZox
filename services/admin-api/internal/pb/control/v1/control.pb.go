@@ -899,6 +899,119 @@ func (x *GetRolloutStatusResponse) GetEndedAt() string {
 	return ""
 }
 
+// ListRollouts — Phase-05 Step U1a. A READ, the plural companion to
+// GetRolloutStatus above (same query half of this file's own
+// commands-vs-queries split); adds NO mutation surface, so EC4's
+// "no bypass verb exists" property is untouched.
+//
+// Exists because admin-api genuinely CANNOT read the rollout table
+// itself: migration 0020 revoked its SELECT/INSERT/UPDATE grants there
+// deliberately, so control_plane is the table's only DB-level reader
+// (proven adversarially at Step T). The panel's rollout history view and
+// getDashboardMetrics()'s own active-rollout count both need that data,
+// and routing them through this RPC keeps the DB boundary intact rather
+// than re-granting admin_api the access Step T just proved it lacks.
+type ListRolloutsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Empty model_ref lists every rollout; set it to scope to one model.
+	ModelRef string `protobuf:"bytes,1,opt,name=model_ref,json=modelRef,proto3" json:"model_ref,omitempty"`
+	// 0 means "this service's own default" (50) rather than unbounded —
+	// a panel list view never needs the full table, and an unbounded
+	// default would make an accidental full scan the easy path.
+	Limit         int32 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListRolloutsRequest) Reset() {
+	*x = ListRolloutsRequest{}
+	mi := &file_control_v1_control_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListRolloutsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListRolloutsRequest) ProtoMessage() {}
+
+func (x *ListRolloutsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v1_control_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListRolloutsRequest.ProtoReflect.Descriptor instead.
+func (*ListRolloutsRequest) Descriptor() ([]byte, []int) {
+	return file_control_v1_control_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ListRolloutsRequest) GetModelRef() string {
+	if x != nil {
+		return x.ModelRef
+	}
+	return ""
+}
+
+func (x *ListRolloutsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type ListRolloutsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Most recent first (started_at DESC).
+	Rollouts      []*GetRolloutStatusResponse `protobuf:"bytes,1,rep,name=rollouts,proto3" json:"rollouts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListRolloutsResponse) Reset() {
+	*x = ListRolloutsResponse{}
+	mi := &file_control_v1_control_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListRolloutsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListRolloutsResponse) ProtoMessage() {}
+
+func (x *ListRolloutsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_control_v1_control_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListRolloutsResponse.ProtoReflect.Descriptor instead.
+func (*ListRolloutsResponse) Descriptor() ([]byte, []int) {
+	return file_control_v1_control_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ListRolloutsResponse) GetRollouts() []*GetRolloutStatusResponse {
+	if x != nil {
+		return x.Rollouts
+	}
+	return nil
+}
+
 type ListModelsResponse_Entry struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ModelRef        string                 `protobuf:"bytes,1,opt,name=model_ref,json=modelRef,proto3" json:"model_ref,omitempty"`
@@ -909,7 +1022,7 @@ type ListModelsResponse_Entry struct {
 
 func (x *ListModelsResponse_Entry) Reset() {
 	*x = ListModelsResponse_Entry{}
-	mi := &file_control_v1_control_proto_msgTypes[16]
+	mi := &file_control_v1_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -921,7 +1034,7 @@ func (x *ListModelsResponse_Entry) String() string {
 func (*ListModelsResponse_Entry) ProtoMessage() {}
 
 func (x *ListModelsResponse_Entry) ProtoReflect() protoreflect.Message {
-	mi := &file_control_v1_control_proto_msgTypes[16]
+	mi := &file_control_v1_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1025,7 +1138,12 @@ const file_control_v1_control_proto_rawDesc = "" +
 	"\x0ecanary_percent\x18\x06 \x01(\x05R\rcanaryPercent\x12\x1d\n" +
 	"\n" +
 	"started_at\x18\a \x01(\tR\tstartedAt\x12\x19\n" +
-	"\bended_at\x18\b \x01(\tR\aendedAt2\xf0\x05\n" +
+	"\bended_at\x18\b \x01(\tR\aendedAt\"H\n" +
+	"\x13ListRolloutsRequest\x12\x1b\n" +
+	"\tmodel_ref\x18\x01 \x01(\tR\bmodelRef\x12\x14\n" +
+	"\x05limit\x18\x02 \x01(\x05R\x05limit\"X\n" +
+	"\x14ListRolloutsResponse\x12@\n" +
+	"\brollouts\x18\x01 \x03(\v2$.control.v1.GetRolloutStatusResponseR\brollouts2\xc3\x06\n" +
 	"\x0eControlService\x12l\n" +
 	"\x15RegisterModelManifest\x12(.control.v1.RegisterModelManifestRequest\x1a).control.v1.RegisterModelManifestResponse\x12]\n" +
 	"\x10GetModelManifest\x12#.control.v1.GetModelManifestRequest\x1a$.control.v1.GetModelManifestResponse\x12K\n" +
@@ -1035,7 +1153,8 @@ const file_control_v1_control_proto_rawDesc = "" +
 	"\rCreateRollout\x12 .control.v1.CreateRolloutRequest\x1a!.control.v1.CreateRolloutResponse\x12W\n" +
 	"\x0ePromoteRollout\x12!.control.v1.PromoteRolloutRequest\x1a\".control.v1.PromoteRolloutResponse\x12Q\n" +
 	"\fAbortRollout\x12\x1f.control.v1.AbortRolloutRequest\x1a .control.v1.AbortRolloutResponse\x12]\n" +
-	"\x10GetRolloutStatus\x12#.control.v1.GetRolloutStatusRequest\x1a$.control.v1.GetRolloutStatusResponseBRZPgithub.com/onezox/OneZox/services/control-plane/internal/pb/control/v1;controlv1b\x06proto3"
+	"\x10GetRolloutStatus\x12#.control.v1.GetRolloutStatusRequest\x1a$.control.v1.GetRolloutStatusResponse\x12Q\n" +
+	"\fListRollouts\x12\x1f.control.v1.ListRolloutsRequest\x1a .control.v1.ListRolloutsResponseBRZPgithub.com/onezox/OneZox/services/control-plane/internal/pb/control/v1;controlv1b\x06proto3"
 
 var (
 	file_control_v1_control_proto_rawDescOnce sync.Once
@@ -1049,7 +1168,7 @@ func file_control_v1_control_proto_rawDescGZIP() []byte {
 	return file_control_v1_control_proto_rawDescData
 }
 
-var file_control_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_control_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_control_v1_control_proto_goTypes = []any{
 	(*RegisterModelManifestRequest)(nil),  // 0: control.v1.RegisterModelManifestRequest
 	(*RegisterModelManifestResponse)(nil), // 1: control.v1.RegisterModelManifestResponse
@@ -1067,31 +1186,36 @@ var file_control_v1_control_proto_goTypes = []any{
 	(*AbortRolloutResponse)(nil),          // 13: control.v1.AbortRolloutResponse
 	(*GetRolloutStatusRequest)(nil),       // 14: control.v1.GetRolloutStatusRequest
 	(*GetRolloutStatusResponse)(nil),      // 15: control.v1.GetRolloutStatusResponse
-	(*ListModelsResponse_Entry)(nil),      // 16: control.v1.ListModelsResponse.Entry
+	(*ListRolloutsRequest)(nil),           // 16: control.v1.ListRolloutsRequest
+	(*ListRolloutsResponse)(nil),          // 17: control.v1.ListRolloutsResponse
+	(*ListModelsResponse_Entry)(nil),      // 18: control.v1.ListModelsResponse.Entry
 }
 var file_control_v1_control_proto_depIdxs = []int32{
-	16, // 0: control.v1.ListModelsResponse.models:type_name -> control.v1.ListModelsResponse.Entry
-	0,  // 1: control.v1.ControlService.RegisterModelManifest:input_type -> control.v1.RegisterModelManifestRequest
-	2,  // 2: control.v1.ControlService.GetModelManifest:input_type -> control.v1.GetModelManifestRequest
-	4,  // 3: control.v1.ControlService.ListModels:input_type -> control.v1.ListModelsRequest
-	6,  // 4: control.v1.ControlService.IssueProviderToken:input_type -> control.v1.IssueProviderTokenRequest
-	8,  // 5: control.v1.ControlService.CreateRollout:input_type -> control.v1.CreateRolloutRequest
-	10, // 6: control.v1.ControlService.PromoteRollout:input_type -> control.v1.PromoteRolloutRequest
-	12, // 7: control.v1.ControlService.AbortRollout:input_type -> control.v1.AbortRolloutRequest
-	14, // 8: control.v1.ControlService.GetRolloutStatus:input_type -> control.v1.GetRolloutStatusRequest
-	1,  // 9: control.v1.ControlService.RegisterModelManifest:output_type -> control.v1.RegisterModelManifestResponse
-	3,  // 10: control.v1.ControlService.GetModelManifest:output_type -> control.v1.GetModelManifestResponse
-	5,  // 11: control.v1.ControlService.ListModels:output_type -> control.v1.ListModelsResponse
-	7,  // 12: control.v1.ControlService.IssueProviderToken:output_type -> control.v1.IssueProviderTokenResponse
-	9,  // 13: control.v1.ControlService.CreateRollout:output_type -> control.v1.CreateRolloutResponse
-	11, // 14: control.v1.ControlService.PromoteRollout:output_type -> control.v1.PromoteRolloutResponse
-	13, // 15: control.v1.ControlService.AbortRollout:output_type -> control.v1.AbortRolloutResponse
-	15, // 16: control.v1.ControlService.GetRolloutStatus:output_type -> control.v1.GetRolloutStatusResponse
-	9,  // [9:17] is the sub-list for method output_type
-	1,  // [1:9] is the sub-list for method input_type
-	1,  // [1:1] is the sub-list for extension type_name
-	1,  // [1:1] is the sub-list for extension extendee
-	0,  // [0:1] is the sub-list for field type_name
+	18, // 0: control.v1.ListModelsResponse.models:type_name -> control.v1.ListModelsResponse.Entry
+	15, // 1: control.v1.ListRolloutsResponse.rollouts:type_name -> control.v1.GetRolloutStatusResponse
+	0,  // 2: control.v1.ControlService.RegisterModelManifest:input_type -> control.v1.RegisterModelManifestRequest
+	2,  // 3: control.v1.ControlService.GetModelManifest:input_type -> control.v1.GetModelManifestRequest
+	4,  // 4: control.v1.ControlService.ListModels:input_type -> control.v1.ListModelsRequest
+	6,  // 5: control.v1.ControlService.IssueProviderToken:input_type -> control.v1.IssueProviderTokenRequest
+	8,  // 6: control.v1.ControlService.CreateRollout:input_type -> control.v1.CreateRolloutRequest
+	10, // 7: control.v1.ControlService.PromoteRollout:input_type -> control.v1.PromoteRolloutRequest
+	12, // 8: control.v1.ControlService.AbortRollout:input_type -> control.v1.AbortRolloutRequest
+	14, // 9: control.v1.ControlService.GetRolloutStatus:input_type -> control.v1.GetRolloutStatusRequest
+	16, // 10: control.v1.ControlService.ListRollouts:input_type -> control.v1.ListRolloutsRequest
+	1,  // 11: control.v1.ControlService.RegisterModelManifest:output_type -> control.v1.RegisterModelManifestResponse
+	3,  // 12: control.v1.ControlService.GetModelManifest:output_type -> control.v1.GetModelManifestResponse
+	5,  // 13: control.v1.ControlService.ListModels:output_type -> control.v1.ListModelsResponse
+	7,  // 14: control.v1.ControlService.IssueProviderToken:output_type -> control.v1.IssueProviderTokenResponse
+	9,  // 15: control.v1.ControlService.CreateRollout:output_type -> control.v1.CreateRolloutResponse
+	11, // 16: control.v1.ControlService.PromoteRollout:output_type -> control.v1.PromoteRolloutResponse
+	13, // 17: control.v1.ControlService.AbortRollout:output_type -> control.v1.AbortRolloutResponse
+	15, // 18: control.v1.ControlService.GetRolloutStatus:output_type -> control.v1.GetRolloutStatusResponse
+	17, // 19: control.v1.ControlService.ListRollouts:output_type -> control.v1.ListRolloutsResponse
+	11, // [11:20] is the sub-list for method output_type
+	2,  // [2:11] is the sub-list for method input_type
+	2,  // [2:2] is the sub-list for extension type_name
+	2,  // [2:2] is the sub-list for extension extendee
+	0,  // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_control_v1_control_proto_init() }
@@ -1105,7 +1229,7 @@ func file_control_v1_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_control_v1_control_proto_rawDesc), len(file_control_v1_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   17,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

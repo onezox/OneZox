@@ -65,6 +65,34 @@ func (c *CockroachStore) ListRunningRollouts(ctx context.Context) ([]Rollout, er
 	return out, rows.Err()
 }
 
+// ListRollouts — Step U1a's own backing read. modelRef empty means
+// every model; limit is always applied (Service.ListRollouts supplies
+// the default), so this can never issue an unbounded scan.
+func (c *CockroachStore) ListRollouts(ctx context.Context, modelRef string, limit int) ([]Rollout, error) {
+	const cols = `rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at, stage_entered_at`
+	var rows *sql.Rows
+	var err error
+	if modelRef == "" {
+		rows, err = c.db.QueryContext(ctx, `SELECT `+cols+` FROM rollout ORDER BY started_at DESC LIMIT $1`, limit)
+	} else {
+		rows, err = c.db.QueryContext(ctx, `SELECT `+cols+` FROM rollout WHERE model_ref = $1 ORDER BY started_at DESC LIMIT $2`, modelRef, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Rollout
+	for rows.Next() {
+		r, err := scanRollout(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
+}
+
 func (c *CockroachStore) GetMostRecentRolloutByModelRef(ctx context.Context, modelRef string) (*Rollout, error) {
 	row := c.db.QueryRowContext(ctx, `
 		SELECT rollout_id, model_ref, version_id, strategy_json, stage, status, stable_version_id, started_at, ended_at, stage_entered_at

@@ -291,6 +291,81 @@ func TestGetRolloutStatusNotFound(t *testing.T) {
 	}
 }
 
+// TestListRolloutsFiltersAndBounds — Step U1a. ListRollouts is the read
+// admin-api uses INSTEAD of querying the rollout table directly (it has
+// no grant there, migration 0020 / Step T), so its filtering and its
+// limit behaviour are the whole contract.
+func TestListRolloutsFiltersAndBounds(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, reg := testService()
+	reg.SeedActive("openai", "openai-stable")
+	reg.Seed("openai", "openai-canary")
+	reg.SeedActive("anthropic", "anthropic-stable")
+	reg.Seed("anthropic", "anthropic-canary")
+
+	openaiID, err := svc.CreateRollout(ctx, "openai", "openai-canary", `{}`)
+	if err != nil {
+		t.Fatalf("CreateRollout(openai): %v", err)
+	}
+	if _, err := svc.CreateRollout(ctx, "anthropic", "anthropic-canary", `{}`); err != nil {
+		t.Fatalf("CreateRollout(anthropic): %v", err)
+	}
+
+	all, err := svc.ListRollouts(ctx, "", 0)
+	if err != nil {
+		t.Fatalf("ListRollouts(all): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("got %d rollouts, want 2 (empty model_ref lists every model)", len(all))
+	}
+
+	scoped, err := svc.ListRollouts(ctx, "openai", 0)
+	if err != nil {
+		t.Fatalf("ListRollouts(openai): %v", err)
+	}
+	if len(scoped) != 1 || scoped[0].RolloutID != openaiID {
+		t.Fatalf("scoped list = %+v, want exactly the openai rollout %s", scoped, openaiID)
+	}
+
+	// A limit smaller than the result set must genuinely truncate — this
+	// is what keeps a panel list view from ever pulling the whole table.
+	bounded, err := svc.ListRollouts(ctx, "", 1)
+	if err != nil {
+		t.Fatalf("ListRollouts(limit=1): %v", err)
+	}
+	if len(bounded) != 1 {
+		t.Fatalf("got %d rollouts with limit=1, want 1", len(bounded))
+	}
+}
+
+// TestListRolloutsClampsAnOversizedLimit — a crafted limit must not turn
+// this read into an unbounded scan, the same "client input never widens
+// what the server will do" posture PromoteRollout's own no-target-stage
+// contract takes.
+func TestListRolloutsClampsAnOversizedLimit(t *testing.T) {
+	ctx := context.Background()
+	svc, store, _, reg := testService()
+	reg.SeedActive("openai", "stable-v1")
+	reg.Seed("openai", "canary-v2")
+	if _, err := svc.CreateRollout(ctx, "openai", "canary-v2", `{}`); err != nil {
+		t.Fatalf("CreateRollout: %v", err)
+	}
+
+	if _, err := svc.ListRollouts(ctx, "", 99999); err != nil {
+		t.Fatalf("ListRollouts(huge limit): %v", err)
+	}
+	if store.LastListLimit != maxRolloutListLimit {
+		t.Fatalf("limit reaching the store = %d, want it clamped to %d", store.LastListLimit, maxRolloutListLimit)
+	}
+
+	if _, err := svc.ListRollouts(ctx, "", 0); err != nil {
+		t.Fatalf("ListRollouts(0): %v", err)
+	}
+	if store.LastListLimit != DefaultRolloutListLimit {
+		t.Fatalf("limit reaching the store for 0 = %d, want the default %d", store.LastListLimit, DefaultRolloutListLimit)
+	}
+}
+
 func TestStagePercentMapping(t *testing.T) {
 	cases := map[string]int32{
 		"pending": 0, "canary_1": 1, "canary_10": 10, "canary_50": 50, "stable": 100,

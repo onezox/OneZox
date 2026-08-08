@@ -27,6 +27,7 @@ const (
 	ControlService_PromoteRollout_FullMethodName        = "/control.v1.ControlService/PromoteRollout"
 	ControlService_AbortRollout_FullMethodName          = "/control.v1.ControlService/AbortRollout"
 	ControlService_GetRolloutStatus_FullMethodName      = "/control.v1.ControlService/GetRolloutStatus"
+	ControlService_ListRollouts_FullMethodName          = "/control.v1.ControlService/ListRollouts"
 )
 
 // ControlServiceClient is the client API for ControlService service.
@@ -41,6 +42,7 @@ type ControlServiceClient interface {
 	PromoteRollout(ctx context.Context, in *PromoteRolloutRequest, opts ...grpc.CallOption) (*PromoteRolloutResponse, error)
 	AbortRollout(ctx context.Context, in *AbortRolloutRequest, opts ...grpc.CallOption) (*AbortRolloutResponse, error)
 	GetRolloutStatus(ctx context.Context, in *GetRolloutStatusRequest, opts ...grpc.CallOption) (*GetRolloutStatusResponse, error)
+	ListRollouts(ctx context.Context, in *ListRolloutsRequest, opts ...grpc.CallOption) (*ListRolloutsResponse, error)
 }
 
 type controlServiceClient struct {
@@ -131,6 +133,16 @@ func (c *controlServiceClient) GetRolloutStatus(ctx context.Context, in *GetRoll
 	return out, nil
 }
 
+func (c *controlServiceClient) ListRollouts(ctx context.Context, in *ListRolloutsRequest, opts ...grpc.CallOption) (*ListRolloutsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListRolloutsResponse)
+	err := c.cc.Invoke(ctx, ControlService_ListRollouts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServiceServer is the server API for ControlService service.
 // All implementations must embed UnimplementedControlServiceServer
 // for forward compatibility.
@@ -143,6 +155,7 @@ type ControlServiceServer interface {
 	PromoteRollout(context.Context, *PromoteRolloutRequest) (*PromoteRolloutResponse, error)
 	AbortRollout(context.Context, *AbortRolloutRequest) (*AbortRolloutResponse, error)
 	GetRolloutStatus(context.Context, *GetRolloutStatusRequest) (*GetRolloutStatusResponse, error)
+	ListRollouts(context.Context, *ListRolloutsRequest) (*ListRolloutsResponse, error)
 	mustEmbedUnimplementedControlServiceServer()
 }
 
@@ -176,6 +189,9 @@ func (UnimplementedControlServiceServer) AbortRollout(context.Context, *AbortRol
 }
 func (UnimplementedControlServiceServer) GetRolloutStatus(context.Context, *GetRolloutStatusRequest) (*GetRolloutStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRolloutStatus not implemented")
+}
+func (UnimplementedControlServiceServer) ListRollouts(context.Context, *ListRolloutsRequest) (*ListRolloutsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListRollouts not implemented")
 }
 func (UnimplementedControlServiceServer) mustEmbedUnimplementedControlServiceServer() {}
 func (UnimplementedControlServiceServer) testEmbeddedByValue()                        {}
@@ -342,6 +358,24 @@ func _ControlService_GetRolloutStatus_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlService_ListRollouts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListRolloutsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServiceServer).ListRollouts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlService_ListRollouts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServiceServer).ListRollouts(ctx, req.(*ListRolloutsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlService_ServiceDesc is the grpc.ServiceDesc for ControlService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -380,6 +414,10 @@ var ControlService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetRolloutStatus",
 			Handler:    _ControlService_GetRolloutStatus_Handler,
+		},
+		{
+			MethodName: "ListRollouts",
+			Handler:    _ControlService_ListRollouts_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

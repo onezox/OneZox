@@ -43,10 +43,10 @@ type RolloutDriver interface {
 // the new process comes up — never orphaned waiting for a watch stream
 // that was never re-established.
 type Reconciler struct {
-	driver       RolloutDriver
-	runs         Client
-	log          *slog.Logger
-	interval     time.Duration
+	driver     RolloutDriver
+	runs       Client
+	log        *slog.Logger
+	interval   time.Duration
 	stageGrace time.Duration
 }
 

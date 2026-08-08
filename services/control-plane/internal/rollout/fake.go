@@ -2,6 +2,7 @@ package rollout
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -12,6 +13,11 @@ import (
 type FakeStore struct {
 	mu       sync.Mutex
 	rollouts map[string]*Rollout
+
+	// LastListLimit is the limit the most recent ListRollouts call
+	// actually reached the store with — lets a test prove Service's own
+	// default/clamp ran, which asserting on result length alone cannot.
+	LastListLimit int
 }
 
 func NewFakeStore() *FakeStore {
@@ -57,6 +63,28 @@ func (f *FakeStore) ListRunningRollouts(ctx context.Context) ([]Rollout, error) 
 		if r.Status == "running" {
 			out = append(out, *r)
 		}
+	}
+	return out, nil
+}
+
+func (f *FakeStore) ListRollouts(ctx context.Context, modelRef string, limit int) ([]Rollout, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Recorded so a test can assert Service.ListRollouts applied its own
+	// default/clamp BEFORE the store ever saw the limit — the clamping is
+	// the point, and asserting only on the returned slice length would
+	// pass even if no clamp existed.
+	f.LastListLimit = limit
+	var out []Rollout
+	for _, r := range f.rollouts {
+		if modelRef != "" && r.ModelRef != modelRef {
+			continue
+		}
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

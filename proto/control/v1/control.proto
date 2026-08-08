@@ -41,6 +41,7 @@ service ControlService {
   rpc PromoteRollout(PromoteRolloutRequest) returns (PromoteRolloutResponse);
   rpc AbortRollout(AbortRolloutRequest) returns (AbortRolloutResponse);
   rpc GetRolloutStatus(GetRolloutStatusRequest) returns (GetRolloutStatusResponse);
+  rpc ListRollouts(ListRolloutsRequest) returns (ListRolloutsResponse);
 }
 
 // spec_json carries the manifest body as a JSON-encoded string (mirrors
@@ -148,4 +149,30 @@ message GetRolloutStatusResponse {
   int32 canary_percent = 6;
   string started_at = 7;
   string ended_at = 8;
+}
+
+// ListRollouts — Phase-05 Step U1a. A READ, the plural companion to
+// GetRolloutStatus above (same query half of this file's own
+// commands-vs-queries split); adds NO mutation surface, so EC4's
+// "no bypass verb exists" property is untouched.
+//
+// Exists because admin-api genuinely CANNOT read the rollout table
+// itself: migration 0020 revoked its SELECT/INSERT/UPDATE grants there
+// deliberately, so control_plane is the table's only DB-level reader
+// (proven adversarially at Step T). The panel's rollout history view and
+// getDashboardMetrics()'s own active-rollout count both need that data,
+// and routing them through this RPC keeps the DB boundary intact rather
+// than re-granting admin_api the access Step T just proved it lacks.
+message ListRolloutsRequest {
+  // Empty model_ref lists every rollout; set it to scope to one model.
+  string model_ref = 1;
+  // 0 means "this service's own default" (50) rather than unbounded —
+  // a panel list view never needs the full table, and an unbounded
+  // default would make an accidental full scan the easy path.
+  int32 limit = 2;
+}
+
+message ListRolloutsResponse {
+  // Most recent first (started_at DESC).
+  repeated GetRolloutStatusResponse rollouts = 1;
 }

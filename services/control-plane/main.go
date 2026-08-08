@@ -210,7 +210,34 @@ func (s *server) GetRolloutStatus(ctx context.Context, req *pb.GetRolloutStatusR
 		s.log.Error("GetRolloutStatus failed", "rollout_id", req.GetRolloutId(), "model_ref", req.GetModelRef(), "error", err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	resp := &pb.GetRolloutStatusResponse{
+	return rolloutToProto(r), nil
+}
+
+// ListRollouts — Step U1a. A READ; exists because admin-api genuinely
+// cannot query the rollout table itself (migration 0020 revoked those
+// grants deliberately, proven adversarially at Step T), so the panel's
+// history view and getDashboardMetrics()'s own active-rollout count
+// reach it through control-plane rather than through a re-granted DB
+// path. Adds no mutation surface.
+func (s *server) ListRollouts(ctx context.Context, req *pb.ListRolloutsRequest) (*pb.ListRolloutsResponse, error) {
+	rs, err := s.rollout.ListRollouts(ctx, req.GetModelRef(), int(req.GetLimit()))
+	if err != nil {
+		s.log.Error("ListRollouts failed", "model_ref", req.GetModelRef(), "error", err)
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	resp := &pb.ListRolloutsResponse{Rollouts: make([]*pb.GetRolloutStatusResponse, 0, len(rs))}
+	for i := range rs {
+		resp.Rollouts = append(resp.Rollouts, rolloutToProto(&rs[i]))
+	}
+	return resp, nil
+}
+
+// rolloutToProto is the ONE place a rollout.Rollout becomes its wire
+// shape — shared by GetRolloutStatus and ListRollouts so a single
+// rollout and the same rollout inside a list can never disagree about
+// canary_percent or timestamp formatting.
+func rolloutToProto(r *rollout.Rollout) *pb.GetRolloutStatusResponse {
+	out := &pb.GetRolloutStatusResponse{
 		RolloutId:     r.RolloutID,
 		ModelRef:      r.ModelRef,
 		VersionId:     r.VersionID,
@@ -220,9 +247,9 @@ func (s *server) GetRolloutStatus(ctx context.Context, req *pb.GetRolloutStatusR
 		StartedAt:     r.StartedAt.Format(time.RFC3339),
 	}
 	if r.EndedAt != nil {
-		resp.EndedAt = r.EndedAt.Format(time.RFC3339)
+		out.EndedAt = r.EndedAt.Format(time.RFC3339)
 	}
-	return resp, nil
+	return out
 }
 
 // mapRolloutError translates rollout package sentinel errors to the
