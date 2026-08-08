@@ -75,9 +75,33 @@ type Client interface {
 // dividing, dividing raw counters directly would be wrong once either
 // side resets (a pod restart zeroes a counter, rate() handles that
 // correctly, a raw division would not).
+// `or vector(0)` on the NUMERATOR is load-bearing, not defensive noise.
+//
+// A canary that has never produced a single error has no time series
+// matching status="error" at all — not a series whose value is zero, but
+// NO SERIES. sum() over an empty selector returns an EMPTY instant
+// vector, empty/anything is empty, and Argo Rollouts' Prometheus
+// provider then evaluates `result[0]` against nothing and fails with
+// "reflect: slice index out of range". That counts toward
+// consecutiveErrorLimit, the AnalysisRun terminalizes as Error, and the
+// reconciler's no-data fail-safe ROLLS THE CANARY BACK.
+//
+// The consequence is the exact inverse of what the check is for: a
+// PERFECTLY HEALTHY canary could never be promoted automatically, while
+// one that had already produced at least one error would evaluate fine.
+// Found live, not by inspection — a zero-error canary on the fake
+// provider rolled back at canary_10 with measurements [None, None, None,
+// None] while the denominator was a healthy 0.049/s.
+//
+// `or vector(0)` substitutes a literal 0 when the numerator is empty, so
+// zero errors reads as an error rate of 0 and satisfies
+// successCondition. The 0/0 case (no canary traffic AT ALL) still yields
+// NaN, so the existing Inconclusive fail-safe for a genuinely
+// unmeasurable window is deliberately preserved — this makes "no errors"
+// distinguishable from "no data", which it previously was not.
 func queryFor(modelRef string) string {
 	return fmt.Sprintf(
-		`sum(rate(data_plane_submit_total{model_ref=%q,canary="true",status="error"}[2m])) `+
+		`(sum(rate(data_plane_submit_total{model_ref=%q,canary="true",status="error"}[2m])) or vector(0)) `+
 			`/ sum(rate(data_plane_submit_total{model_ref=%q,canary="true"}[2m]))`,
 		modelRef, modelRef,
 	)
