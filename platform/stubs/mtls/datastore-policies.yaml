@@ -1,0 +1,280 @@
+# Post-M2 audit fix C2 — CiliumNetworkPolicies for the DATASTORE layer.
+#
+# Until now, policies existed only for the six application services. The
+# datastores holding the state those policies protect — CockroachDB,
+# etcd, Vault, Redis and MinIO — had NO policy at all. In Cilium an
+# endpoint only becomes default-deny once some policy selects it, so all
+# five were default-ALLOW.
+#
+# The audit demonstrated the consequence live: an unlabelled, credential-
+# less pod in this namespace connected to CockroachDB as root
+# (rolsuper=t), read model_active and audit_log, and opened TCP to etcd,
+# Vault and Redis. Meanwhile control-plane, which HAS a policy, correctly
+# refused the same pod — the positive control proving this is an absence
+# of policy, not a broken test.
+#
+# This file closes that. Migration 0023 (audit fix C1) is the necessary
+# companion but is NOT sufficient on its own: CockroachDB runs --insecure
+# here, so any client that can REACH port 26257 connects as whatever user
+# it names, including root, with no credential. C1 constrains what each
+# SERVICE can do; C2 constrains WHO CAN REACH the datastore at all. The
+# finding is closed only by both.
+#
+# THREE THINGS EVERY POLICY BELOW MUST PRESERVE, or it takes the cluster
+# down rather than securing it:
+#   1. PEER TRAFFIC. Every one of these is clustered — CockroachDB Raft
+#      (26258), etcd Raft (2380), Vault Raft (8201), Redis cluster bus
+#      (16379). Each policy allows its own pods to talk to each other on
+#      those ports. Omitting this would break quorum, not just access.
+#   2. HOST. kubelet liveness/readiness probes and kubectl port-forward
+#      both authenticate as the `host` entity — the same allowance every
+#      existing policy in ciliumnetworkpolicy.yaml already makes, and the
+#      reason migrations and live verification keep working.
+#      (kubectl exec is NOT affected by these policies at all: it enters
+#      the container through the kubelet, not across the pod network.)
+#   3. PROMETHEUS. CockroachDB's /_status/vars on :8080 is a live scrape
+#      target; blocking it would silently blind the dashboards — exactly
+#      the drift class the Phase-05 Step N scrape-target bug already cost
+#      this project once.
+#
+# Caller lists below were derived by grepping the actual service code for
+# each datastore's host/port, not from assumption. Two results worth
+# recording: provider-gateway does NOT talk to Vault directly (it obtains
+# provider credentials through control-plane's IssueProviderToken RPC),
+# and no application service uses MinIO at all — its only clients are
+# Loki, Tempo and their bucket-init Jobs.
+
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: cockroachdb-datastore
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: cockroachdb
+  ingress:
+    # kubelet probes + kubectl port-forward (migrations, live verification).
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "26257"
+              protocol: TCP
+            - port: "8080"
+              protocol: TCP
+    # Raft/RPC + SQL between CockroachDB nodes. Required for quorum.
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: cockroachdb
+      toPorts:
+        - ports:
+            - port: "26257"
+              protocol: TCP
+            - port: "26258"
+              protocol: TCP
+    # /_status/vars metrics scrape.
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    # The four services that genuinely hold a SQL connection, each as its
+    # own least-privilege role (migrations 0012, 0018, 0023).
+    - fromEndpoints:
+        - matchLabels:
+            app: edge-gateway
+        - matchLabels:
+            app: data-plane
+        - matchLabels:
+            app: control-plane
+        - matchLabels:
+            app: admin-api
+      toPorts:
+        - ports:
+            - port: "26257"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: etcd-datastore
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: etcd
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "2379"
+              protocol: TCP
+    # etcd Raft peer traffic. Required for quorum.
+    - fromEndpoints:
+        - matchLabels:
+            app: etcd
+      toPorts:
+        - ports:
+            - port: "2379"
+              protocol: TCP
+            - port: "2380"
+              protocol: TCP
+    # control-plane WRITES manifests/active pointers; data-plane and
+    # edge-gateway READ and watch them. This is the second bypass path
+    # the audit exposed: /onezox/active/{model_ref} lives here, so a
+    # direct write would change what data-plane resolves without ever
+    # touching the database.
+    - fromEndpoints:
+        - matchLabels:
+            app: control-plane
+        - matchLabels:
+            app: data-plane
+        - matchLabels:
+            app: edge-gateway
+      toPorts:
+        - ports:
+            - port: "2379"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: vault-datastore
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: vault
+  ingress:
+    # host: kubelet probes, plus the unseal workflow after a WSL2 restart.
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "8200"
+              protocol: TCP
+    # Vault Raft peer traffic (8201) + request forwarding between standby
+    # and active nodes (8200). Required for HA; blocking this would leave
+    # the cluster unable to elect or forward.
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: vault
+      toPorts:
+        - ports:
+            - port: "8200"
+              protocol: TCP
+            - port: "8201"
+              protocol: TCP
+    # The three services that authenticate via K8s-auth: control-plane
+    # (Transit signing), data-plane and edge-gateway (independent
+    # signature verification). provider-gateway is deliberately absent —
+    # it never calls Vault directly, only control-plane's
+    # IssueProviderToken RPC.
+    - fromEndpoints:
+        - matchLabels:
+            app: control-plane
+        - matchLabels:
+            app: data-plane
+        - matchLabels:
+            app: edge-gateway
+      toPorts:
+        - ports:
+            - port: "8200"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: redis-datastore
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: redis-cluster
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+    # Redis Cluster gossip bus (16379) + client port between nodes.
+    # Required for cluster state; this is the traffic
+    # scripts/recover-redis-cluster.sh exists to repair after a host
+    # restart, and blocking it would make that unrecoverable.
+    - fromEndpoints:
+        - matchLabels:
+            app: redis-cluster
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+            - port: "16379"
+              protocol: TCP
+    # edge-gateway (rate limiting), data-plane (working memory),
+    # provider-gateway (quota + coalescing).
+    - fromEndpoints:
+        - matchLabels:
+            app: edge-gateway
+        - matchLabels:
+            app: data-plane
+        - matchLabels:
+            app: provider-gateway
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+    # The cluster-init Job, so a re-run after a host restart still works.
+    - fromEndpoints:
+        - matchLabels:
+            job-name: redis-cluster-init
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: minio-datastore
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: minio
+  ingress:
+    - fromEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+            - port: "9001"
+              protocol: TCP
+    # No application service uses MinIO. Its only clients are the
+    # observability stores that keep their chunks/traces there, plus the
+    # bucket-init Jobs that create those buckets.
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: loki
+        - matchLabels:
+            app.kubernetes.io/name: tempo
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            job-name: minio-bucket-init
+        - matchLabels:
+            job-name: loki-bucket-init
+        - matchLabels:
+            job-name: tempo-bucket-init
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
