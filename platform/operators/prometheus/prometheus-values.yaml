@@ -54,6 +54,13 @@ server:
 # dataplane-stub's target was removed in Phase-03 Step J (cutover to
 # data-plane), replaced by data-plane's own /metrics (main.py's
 # prometheus_client endpoint) below.
+#
+# admin-api added here (Phase-05 Step E: promhttp.Handler() on GET
+# /metrics, port 8080) — same "added once each actually existed" timing
+# this list has followed since Phase-00, and also this GitOps adoption's
+# own positive control: proves a legitimate git change still syncs
+# through the operator-prometheus Application normally, distinct from
+# the self-heal proof (an out-of-band kubectl edit getting reverted).
 extraScrapeConfigs: |
   - job_name: 'otel-collector'
     scrape_interval: 15s
@@ -66,3 +73,4 @@ extraScrapeConfigs: |
           - 'data-plane.default.svc.cluster.local:8080'
           - 'edge-gateway.default.svc.cluster.local:8080'
           - 'provider-gateway.default.svc.cluster.local:8080'
+          - 'admin-api.default.svc.cluster.local:8080'
