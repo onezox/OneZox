@@ -236,8 +236,48 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Explicit per-service dockerfile AND context (post-M2 audit fixes
+      # H3 + H4). The old form assumed both could be derived from the
+      # service name — `-f services/$s/Dockerfile services/$s` — which is
+      # wrong for two of the six:
+      #   edge-gateway builds from the REPO ROOT, because this is a Cargo
+      #     workspace and Cargo.lock lives there. Building from the service
+      #     directory is what let the old `COPY Cargo.lock*` glob match
+      #     nothing and produce unreproducible images (H4).
+      #   admin-panel does not live under services/ at all — the phase file
+      #     and the architecture both place it at the repo root.
+      #
+      # H3: admin-api and admin-panel added. Until now the two services
+      # holding the admin credential surface and the operator console were
+      # the only ones with no CI build, no SBOM and no signature, while
+      # four older services had all three.
+      #
+      # provider-fake is deliberately EXCLUDED. It is a test-only,
+      # zero-dependency HTTP stand-in used to make providers fail on
+      # demand; it never runs outside test scenarios, so an SBOM and a
+      # sigstore signature for it would assert a supply-chain guarantee
+      # about something that is not part of the product. It is still
+      # compiled and vetted by the test-go job, so a break in it fails CI.
       matrix:
-        service: [edge-gateway, data-plane, provider-gateway, control-plane]
+        include:
+          - service: edge-gateway
+            dockerfile: services/edge-gateway/Dockerfile
+            context: .
+          - service: data-plane
+            dockerfile: services/data-plane/Dockerfile
+            context: services/data-plane
+          - service: provider-gateway
+            dockerfile: services/provider-gateway/Dockerfile
+            context: services/provider-gateway
+          - service: control-plane
+            dockerfile: services/control-plane/Dockerfile
+            context: services/control-plane
+          - service: admin-api
+            dockerfile: services/admin-api/Dockerfile
+            context: services/admin-api
+          - service: admin-panel
+            dockerfile: admin-panel/Dockerfile
+            context: admin-panel
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -254,8 +294,8 @@ jobs:
         run: |
           docker build --provenance=false --sbom=false \
             -t "onezox/${{ matrix.service }}:${{ github.sha }}" \
-            -f "services/${{ matrix.service }}/Dockerfile" \
-            "services/${{ matrix.service }}"
+            -f "${{ matrix.dockerfile }}" \
+            "${{ matrix.context }}"
 
       - name: Install Syft ${{ env.SYFT_VERSION }}
         run: |
