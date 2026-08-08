@@ -41,4 +41,16 @@ protoc \
   --go-grpc_out="$OUT_DIR" --go-grpc_opt=paths=source_relative \
   proto/control/v1/control.proto
 
+# Step U1b: admin-api is also a gRPC client of provider-gateway, for
+# ProviderHealth ONLY (the panel's Provider Console, Part R — breaker
+# state + quota headroom). Same client-side-only note as control.proto
+# above; Invoke/InvokeEmbedding are generated but never called from here
+# (admin-api's own narrow providerHealthReader interface is what makes
+# that structural rather than a matter of discipline).
+protoc \
+  -I proto \
+  --go_out="$OUT_DIR" --go_opt=paths=source_relative \
+  --go-grpc_out="$OUT_DIR" --go-grpc_opt=paths=source_relative \
+  proto/provider/v1/provider.proto
+
 echo "Regenerated $OUT_DIR/"

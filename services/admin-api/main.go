@@ -56,6 +56,8 @@ import (
 	"github.com/onezox/OneZox/services/admin-api/internal/graph"
 	pb "github.com/onezox/OneZox/services/admin-api/internal/pb/admin/v1"
 	controlpb "github.com/onezox/OneZox/services/admin-api/internal/pb/control/v1"
+	providerpb "github.com/onezox/OneZox/services/admin-api/internal/pb/provider/v1"
+	"github.com/onezox/OneZox/services/admin-api/internal/promclient"
 )
 
 const serviceName = "admin-api"
@@ -132,6 +134,31 @@ func main() {
 	// control-plane (admin.proto's own header comment).
 	keyStore := apikeys.NewCockroachStore(db)
 
+	// Step U1b: the panel's read-side backends.
+	//
+	// provider-gateway for ProviderHealth ONLY (the Provider Console) —
+	// same insecure app-layer credentials as the control-plane dial
+	// above, for the same reason: Cilium's SPIFFE/SPIRE mTLS enforces
+	// transport security at the mesh layer (provider-gateway-mtls's own
+	// admin-api ingress rule, added this same step).
+	providerGatewayAddr := envOr("PROVIDER_GATEWAY_ADDR", "provider-gateway.default.svc.cluster.local:50051")
+	providerConn, err := grpc.NewClient(providerGatewayAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Error("failed to create provider-gateway gRPC client", "error", err, "addr", providerGatewayAddr)
+		os.Exit(1)
+	}
+	defer func() { _ = providerConn.Close() }()
+	providerClient := providerpb.NewProviderServiceClient(providerConn)
+
+	// Prometheus for the dashboard's three SLO numbers. Not fatal if
+	// unreachable at boot — promclient degrades a failed query to 0 and
+	// logs, so the rest of the dashboard still renders (see its own
+	// QueryScalar comment for why that degradation is correct here and
+	// deliberately NOT correct for the canary SLO gate).
+	prometheusAddr := envOr("PROMETHEUS_ADDR", "http://prometheus-server.default.svc.cluster.local")
+	metricsClient := promclient.New(prometheusAddr)
+	log.Info("read backends configured", "provider_gateway", providerGatewayAddr, "prometheus", prometheusAddr)
+
 	grpcPort := envOr("GRPC_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+grpcPort)
 	if err != nil {
@@ -169,7 +196,14 @@ func main() {
 	// queries against a security-critical service — live verification
 	// uses a raw POST body instead, the same way every other RPC in this
 	// project has been verified via grpcurl.
-	graphqlSrv := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: &graph.Resolver{Keys: keyStore}}))
+	graphqlSrv := handler.NewDefaultServer(graph.NewExecutableSchema(graph.Config{Resolvers: &graph.Resolver{
+		Keys:      keyStore,
+		Control:   controlClient,
+		Providers: providerClient,
+		Audit:     audit.NewCockroachReader(db),
+		Metrics:   metricsClient,
+		Log:       log,
+	}}))
 
 	mux := http.NewServeMux()
 	// Step F: every /graphql request requires a verified admin credential

@@ -2,8 +2,13 @@
 // or denied, written to audit_log (data/migrations/0017) as an immutable
 // append — the admin_api DB role has SELECT+INSERT only there (migration
 // 0018), no UPDATE/DELETE, the same mechanism model_manifest's own
-// immutability uses (Phase-04 migrations 0008/0012). This package issues
-// exactly that one INSERT and nothing else.
+// immutability uses (Phase-04 migrations 0008/0012).
+//
+// Two operations, matching that grant exactly: the one INSERT (Writer,
+// below) and — since Step U1b — the SELECT backing the panel's own Audit
+// section (Reader, reader.go). No UPDATE or DELETE statement exists
+// anywhere in this package, because no grant exists that could run one;
+// Step Q proved that adversarially at the database itself.
 //
 // Ordering (Step H's own explicit design question): before_json/after_json
 // for a mutation aren't knowable until the mutation's own result comes

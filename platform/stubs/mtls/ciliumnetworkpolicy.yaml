@@ -131,6 +131,30 @@ spec:
               protocol: TCP
       authentication:
         mode: "required"
+    # Phase-05 Step U1b: admin-api's own peer rule, added the same step
+    # its ProviderHealth client dial first ships — the same "no window
+    # where a real service is live without mesh identity" sequencing
+    # every prior rule in this file used (Step E did exactly this for
+    # admin-api -> control-plane).
+    #
+    # ProviderHealth ONLY — a read: breaker state and quota headroom for
+    # the panel's Provider Console (Part R). admin-api never calls
+    # Invoke/InvokeEmbedding; those are data-plane's own path, and
+    # nothing in the admin surface should ever originate provider
+    # traffic. That restriction is by construction in admin-api's own
+    # narrow client interface (providerHealthReader, server.go), not
+    # enforced here — L7 gRPC-method authorization isn't this project's
+    # established pattern, the same note control-plane-mtls's own
+    # admin-api rule already makes.
+    - fromEndpoints:
+        - matchLabels:
+            app: admin-api
+      toPorts:
+        - ports:
+            - port: "50051"
+              protocol: TCP
+      authentication:
+        mode: "required"
 ---
 # Phase-03 Step J: data-plane's own mTLS ingress policy, added and
 # confirmed healthy (SPIRE identity established, VALID:true) BEFORE
